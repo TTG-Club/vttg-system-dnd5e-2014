@@ -73,30 +73,6 @@
         </span>
 
         <span v-if="data.skillGrant?.skills?.length"> 2 навыка </span>
-
-        <span
-          v-if="
-            data.skillGrant?.skills?.length
-            && (data.featGrant?.featName || data.featGrant?.featChoices?.length)
-          "
-          class="text-dimmed"
-        >
-          &bull;
-        </span>
-
-        <span
-          v-if="data.featGrant?.featName"
-          class="truncate"
-        >
-          {{ data.featGrant.featName }}
-        </span>
-
-        <span
-          v-else-if="data.featGrant?.featChoices?.length"
-          class="truncate"
-        >
-          Черта на выбор
-        </span>
       </div>
     </div>
   </div>

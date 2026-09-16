@@ -9,7 +9,7 @@
  *   выводятся из `level` каждой особенности при сборке ({@link buildLevelTable}).
  * - ASI на уровне — это чекбокс строки; на сборке вставляется синтетический
  *   ключ `asi-<level>` + синтетическая особенность (детектор мастера —
- *   `key.startsWith('asi-') || key === 'epic-boon'`).
+ *   `key.startsWith('asi-')`).
  * - Динамические колонки таблицы (ячейки заклинаний, приёмы и т.п.) — значения
  *   `string | number`, разрежённые (пустая ячейка не пишется → рендер «—»).
  */
@@ -189,7 +189,7 @@ export function defaultProficiencyBonus(level: number): number {
 
 /** Является ли ключ особенности маркером ASI (как у мастера класса). */
 export function isAsiFeatureKey(featureKey: string): boolean {
-  return featureKey.startsWith('asi-') || featureKey === 'epic-boon';
+  return featureKey.startsWith('asi-');
 }
 
 /** Канонические названия обычного повышения характеристик (генерик ASI). */

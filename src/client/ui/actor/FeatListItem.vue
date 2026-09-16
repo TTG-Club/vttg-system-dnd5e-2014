@@ -13,7 +13,6 @@
     name: string;
     nameEn?: string;
     source?: string;
-    repeatable?: boolean;
   }
 
   const props = defineProps<{

@@ -1,5 +1,4 @@
 <script setup lang="ts">
-  import type { Feature } from '@vtt/shared';
   import type { BackgroundDefinition } from '@vtt/shared/system/dnd.js';
 
   import {
@@ -10,12 +9,9 @@
   } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
-  import { loadCompendiumKind } from '@/core/compendiumDataClient';
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
   import SendToChatButton from '@/shared_ui/components/SendToChatButton.vue';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
-  import { useModalManager } from '@/shared_ui/composables/useModalManager';
-  import { useChatStore } from '@/stores/chatStore';
   import { useSourceLabels } from '@/systems/dnd5e/composables/useSourceLabel';
 
   const props = defineProps<{
@@ -92,56 +88,8 @@
     data.value ? buildFeatGrantsSummary(data.value) : '',
   );
 
-  const { openModal } = useModalManager();
   const { getSourceLabel } = useSourceLabels();
-  const chatStore = useChatStore();
 
-  /**
-   * Проверяет, что запись компендиума — черта.
-   *
-   * @param value - запись компендиума
-   * @returns true, если запись имеет форму черты
-   */
-  function isFeatureEntry(value: unknown): value is Feature {
-    return (
-      typeof value === 'object'
-      && value !== null
-      && 'id' in value
-      && 'name' in value
-    );
-  }
-
-  async function openFeatDescription(featIdOrFallback?: string): Promise<void> {
-    if (!featIdOrFallback && !data.value?.featGrant?.featId) {
-      return;
-    }
-
-    const featId = data.value?.featGrant?.featId || featIdOrFallback;
-
-    const socket = chatStore.getSocket();
-
-    if (!socket) {
-      return;
-    }
-
-    const feats = (await loadCompendiumKind(socket, 'feat')).filter(
-      isFeatureEntry,
-    );
-
-    const feat = feats.find((entry) => entry.id === featId);
-
-    if (!feat) {
-      return;
-    }
-
-    openModal('ActorDescriptionModal', {
-      _modalKey: feat.id,
-      title: feat.name,
-      subtitle: feat.nameEn || '',
-      sourceKey: feat.sourceKey,
-      description: feat.description || '',
-    });
-  }
 </script>
 
 <template>
@@ -253,57 +201,6 @@
           </div>
         </div>
 
-        <!-- Черта от предыстории -->
-        <div
-          v-if="data.featGrant"
-          class="rounded-lg border border-default/50 p-4"
-        >
-          <h3 class="mb-3 text-sm font-semibold tracking-wider text-primary">
-            ЧЕРТА
-          </h3>
-
-          <!-- Конкретная черта -->
-          <div
-            v-if="data.featGrant.featId"
-            class="flex items-center justify-between rounded bg-elevated/50 px-3 py-2 transition-colors hover:bg-elevated"
-          >
-            <span class="text-sm font-medium text-highlighted">
-              {{ data.featGrant.featName }}
-              <span class="text-xs text-dimmed"
-                >({{ data.featGrant.featNameEn }})</span
-              >
-            </span>
-
-            <UButton
-              icon="tabler:info-circle"
-              color="primary"
-              variant="ghost"
-              size="2xs"
-              @click="openFeatDescription()"
-            />
-          </div>
-
-          <!-- Выбор черты -->
-          <div
-            v-else-if="data.featGrant.featChoices?.length"
-            class="space-y-2"
-          >
-            <p class="text-xs text-muted">На выбор одна из черт:</p>
-
-            <div class="flex flex-wrap gap-2">
-              <UBadge
-                v-for="choice in data.featGrant.featChoices"
-                :key="choice"
-                color="neutral"
-                variant="soft"
-                class="cursor-pointer transition-colors hover:bg-accented"
-                @click="openFeatDescription(choice)"
-              >
-                {{ choice }}
-              </UBadge>
-            </div>
-          </div>
-        </div>
 
         <!-- Дополнительные дары (featData / activeEffects) -->
         <div

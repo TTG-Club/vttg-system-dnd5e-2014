@@ -22,11 +22,6 @@
       "thieves-tools"
     ]
   },
-  "featGrant": {
-    "featId": "alert-phb",
-    "featName": "Бдительный",
-    "featNameEn": "Alert"
-  },
   "equipmentOptions": [
     {
       "description": "2 кинжала, Воровские инструменты, Лом, 2 сумки, Одежда путешественника, 16 зм"

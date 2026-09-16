@@ -5,7 +5,6 @@
     nameEn?: string;
     /** Происхождение выданной особенности (класс/вид) — для бейджа */
     grantedBy?: string;
-    repeatable?: boolean;
   }
 
   defineProps<{
@@ -36,16 +35,6 @@
     <span class="truncate text-sm text-highlighted">
       {{ item.name }}
     </span>
-
-    <UBadge
-      v-if="item.repeatable"
-      color="warning"
-      variant="subtle"
-      size="sm"
-      class="ml-auto shrink-0"
-    >
-      Повторяемая
-    </UBadge>
   </div>
 
   <div

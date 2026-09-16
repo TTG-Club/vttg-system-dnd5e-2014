@@ -7,7 +7,6 @@
     nameEn?: string;
     /** Ключ источника-книги (sources.json) */
     sourceKey?: string;
-    repeatable?: boolean;
   }
 
   const props = defineProps<{
@@ -32,15 +31,6 @@
       >
         {{ sourceLabel }}
       </span>
-
-      <UBadge
-        v-if="item.repeatable"
-        color="warning"
-        variant="subtle"
-        size="sm"
-      >
-        Повторяемая
-      </UBadge>
     </div>
   </div>
 </template>

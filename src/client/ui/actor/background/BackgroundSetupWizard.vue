@@ -1,5 +1,5 @@
 <script setup lang="ts">
-  import type { Feature, TypedWebSocketClient } from '@vtt/shared';
+  import type { TypedWebSocketClient } from '@vtt/shared';
   import type {
     Actor,
     BackgroundDefinition,
@@ -7,13 +7,9 @@
   } from '@vtt/shared/system/dnd.js';
   import type { ComponentPublicInstance } from 'vue';
 
-  import {
-    collectFeatGrantedSpellSources,
-    collectGrantedSpellSources,
-  } from '@vtt/shared/system/dnd.js';
-  import { computed, ref, toRef, watch } from 'vue';
+  import { collectFeatGrantedSpellSources } from '@vtt/shared/system/dnd.js';
+  import { computed, ref, toRef } from 'vue';
 
-  import { loadCompendiumKind } from '@/core/compendiumDataClient';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
 
   import { useGrantedSpellsResolver } from '../../../composables/useGrantedSpellsResolver';
@@ -46,17 +42,12 @@
 
   const { getSourceLabel } = useSourceLabels();
 
-  // Для фитов из SRD
-  const featsData = ref<Feature[]>([]);
-  const isLoadingFeats = ref(false);
-
   // Композабл мастера
   const {
     currentStepInfo,
     selectedScheme,
     abilityAllocation,
     toolSelections,
-    selectedFeatId,
     wizardSteps: wizardStepKeys,
     canProceed,
     nextStep,
@@ -94,68 +85,13 @@
     }
   }
 
-  function isFeature(value: unknown): value is Feature {
-    return (
-      typeof value === 'object'
-      && value !== null
-      && 'id' in value
-      && 'name' in value
-      && 'source' in value
-      && 'description' in value
-    );
-  }
-
   /**
-   * Загружает черты компендиума с сервера (агрегировано по всем пакам: бандл +
-   * скачиваемые + модули) в `featsData`.
-   */
-  async function loadFeats(): Promise<void> {
-    if (!props.socket) {
-      return;
-    }
-
-    isLoadingFeats.value = true;
-
-    const entries = await loadCompendiumKind(props.socket, 'feat');
-
-    featsData.value = entries.filter(isFeature);
-    isLoadingFeats.value = false;
-  }
-
-  // Запрашиваем черты с сервера при открытии модалки, если их ещё нет
-  watch(
-    () => props.open,
-    (isOpen) => {
-      if (
-        !isOpen
-        || featsData.value.length > 0
-        || !props.backgroundDefinition
-        || !props.socket
-      ) {
-        return;
-      }
-
-      void loadFeats();
-    },
-    { immediate: true },
-  );
-
-  /**
-   * Заклинания, автоматически предоставляемые предысторией: от выбранной
-   * черты-происхождения (`grantedSpells` черты) И от СОБСТВЕННОГО `featData`
-   * предыстории. Источники последних помечаются отдельным именем
-   * (`backgroundSpellSource`), чтобы откат снимал их раздельно от черты.
+   * Заклинания, автоматически предоставляемые предысторией — из её
+   * собственного `featData`. Origin-черту предыстория не выдаёт — это механика
+   * PHB 2024, — поэтому второго источника здесь нет.
    */
   const grantedSpellSources = computed((): GrantedSpellSource[] => {
     const sources: GrantedSpellSource[] = [];
-
-    const selectedFeat = featsData.value.find(
-      (feat) => feat.id === selectedFeatId.value,
-    );
-
-    if (selectedFeat) {
-      sources.push(...collectGrantedSpellSources([selectedFeat]));
-    }
 
     const def = props.backgroundDefinition;
 
@@ -176,7 +112,7 @@
     return sources;
   });
 
-  /** Granted-заклинания выбранной черты с данными из компендиума */
+  /** Granted-заклинания предыстории с данными из компендиума */
   const { resolvedGrantedSpells } = useGrantedSpellsResolver(
     toRef(props, 'socket'),
     grantedSpellSources,
@@ -184,7 +120,6 @@
 
   function handleApply() {
     const { systemUpdates, rootUpdates } = buildUpdates(
-      featsData.value,
       resolvedGrantedSpells.value,
     );
 
@@ -285,47 +220,33 @@
 
         <!-- Контент текущего шага -->
         <div class="min-h-[200px]">
-          <div
-            v-if="isLoadingFeats"
-            class="flex h-full items-center justify-center p-20"
-          >
-            <UIcon
-              name="tabler:loader-2"
-              class="animate-spin text-3xl text-dimmed"
-            />
-          </div>
+          <!-- Шаг 1: Обзор -->
+          <WizardStepOverview
+            v-if="currentStepInfo.stepGroup === 'overview'"
+            :background-definition="backgroundDefinition"
+          />
 
-          <template v-else>
-            <!-- Шаг 1: Обзор -->
-            <WizardStepOverview
-              v-if="currentStepInfo.stepGroup === 'overview'"
-              v-model:selected-feat-id="selectedFeatId"
-              :background-definition="backgroundDefinition"
-              :feats-data="featsData"
-            />
+          <!-- Шаг 1.5: Инструменты (условно) -->
+          <WizardStepTools
+            v-else-if="currentStepInfo.stepGroup === 'tools'"
+            v-model:tool-selections="toolSelections"
+            :background-definition="backgroundDefinition"
+          />
 
-            <!-- Шаг 1.5: Инструменты (условно) -->
-            <WizardStepTools
-              v-else-if="currentStepInfo.stepGroup === 'tools'"
-              v-model:tool-selections="toolSelections"
-              :background-definition="backgroundDefinition"
-            />
+          <!-- Шаг 2: Характеристики -->
+          <WizardStepAbilities
+            v-else-if="currentStepInfo.stepGroup === 'abilities'"
+            v-model:selected-scheme="selectedScheme"
+            v-model:ability-allocation="abilityAllocation"
+            :background-definition="backgroundDefinition"
+            :current-abilities="actor.system.abilities"
+          />
 
-            <!-- Шаг 2: Характеристики -->
-            <WizardStepAbilities
-              v-else-if="currentStepInfo.stepGroup === 'abilities'"
-              v-model:selected-scheme="selectedScheme"
-              v-model:ability-allocation="abilityAllocation"
-              :background-definition="backgroundDefinition"
-              :current-abilities="actor.system.abilities"
-            />
-
-            <!-- Шаг 3: Снаряжение -->
-            <WizardStepEquipment
-              v-else-if="currentStepInfo.stepGroup === 'equipment'"
-              :equipment-options="backgroundDefinition.equipmentOptions"
-            />
-          </template>
+          <!-- Шаг 3: Снаряжение -->
+          <WizardStepEquipment
+            v-else-if="currentStepInfo.stepGroup === 'equipment'"
+            :equipment-options="backgroundDefinition.equipmentOptions"
+          />
         </div>
       </div>
     </template>
@@ -359,7 +280,7 @@
           <UButton
             v-if="currentStepInfo.index < currentStepInfo.total"
             color="primary"
-            :disabled="!canProceed || isLoadingFeats"
+            :disabled="!canProceed"
             @click.left.exact.prevent="nextStep"
           >
             Далее
@@ -371,7 +292,6 @@
           <UButton
             v-else
             color="primary"
-            :disabled="isLoadingFeats"
             @click.left.exact.prevent="handleApply"
           >
             Применить

@@ -43,7 +43,6 @@ import type { ActiveEffect } from './activeEffectTypes.js';
 import type {
   BackgroundAbilityGrant,
   BackgroundEquipmentOption,
-  BackgroundFeatGrant,
   BackgroundSkillGrant,
   BackgroundToolGrant,
 } from './backgroundTypes.js';
@@ -160,10 +159,6 @@ export interface DnDGameItem extends BaseGameItem {
   /** Магический бонус (+1, +2, +3...) — к атаке/урону для оружия, к КД для брони */
   magicBonus?: number;
   // --- Feature-specific (только для type === 'feat') ---
-  /** Можно ли выбрать черту повторно */
-  repeatable?: boolean;
-  /** Текст с пояснением условий повторного выбора */
-  repeatableText?: string;
   /**
    * Полные «грант»-данные черты (владения, языки, защиты, повышение
    * характеристик, предусловия, выдаваемые заклинания). Хранится во вложенном
@@ -196,8 +191,6 @@ export interface DnDGameItem extends BaseGameItem {
   skillGrant?: BackgroundSkillGrant;
   /** Владение инструментами от предыстории */
   toolGrant?: BackgroundToolGrant;
-  /** Черта, даруемая предысторией */
-  featGrant?: BackgroundFeatGrant;
   /** Стартовое снаряжение предыстории */
   equipmentOptions?: BackgroundEquipmentOption[];
   // --- Spell-specific (только для type === 'spell') ---

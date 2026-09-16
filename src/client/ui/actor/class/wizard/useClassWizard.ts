@@ -111,13 +111,13 @@ const STEP_DEFINITIONS: Record<WizardStepKey, Omit<WizardStepItem, 'value'>> = {
 
 /**
  * Проверяет, является ли ключ особенности класса обозначением ASI
- * (повышением характеристик или эпическим даром).
+ * (повышения характеристик).
  *
  * @param featureKey - ключ особенности
  * @returns `true`, если особенность является ASI
  */
 function isAsiFeatureKey(featureKey: string): boolean {
-  return featureKey.startsWith('asi-') || featureKey === 'epic-boon';
+  return featureKey.startsWith('asi-');
 }
 
 // ── Composable ────────────────────────────────────────────────

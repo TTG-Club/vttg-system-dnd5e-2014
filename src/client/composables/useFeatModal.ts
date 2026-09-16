@@ -25,24 +25,6 @@ export function useFeatModal() {
     feat: Feature | GameItem,
     options?: { showCopyButton?: boolean; onCopy?: () => void },
   ) {
-    const badges: Array<{ text: string; color: string }> = [];
-
-    let alertConfig:
-      | { title?: string; description: string; color: 'warning'; icon?: string }
-      | undefined;
-
-    if (feat.repeatable) {
-      badges.push({ text: 'Повторяемая', color: 'warning' });
-
-      alertConfig = {
-        title: 'Повторяемая черта',
-        description:
-          'Вы можете выбирать эту черту больше 1 раза, но каждый раз вы должны выбирать другой список заклинаний.',
-        color: 'warning',
-        icon: 'tabler:repeat',
-      };
-    }
-
     const nameEn = 'nameEn' in feat ? feat.nameEn : undefined;
 
     // Описание остаётся чистой прозой; механические дары выводятся отдельным
@@ -59,8 +41,7 @@ export function useFeatModal() {
       automation: automation || undefined,
       sourceKey: feat.sourceKey,
       isSRD: feat.isSRD ?? false,
-      fields: badges.length > 0 ? [{ badges }] : [],
-      alert: alertConfig,
+      fields: [],
       showCopyButton: options?.showCopyButton,
       onCopy: options?.onCopy,
       shareCard: {

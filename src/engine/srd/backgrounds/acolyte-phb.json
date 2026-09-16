@@ -22,11 +22,6 @@
       "calligraphers-supplies"
     ]
   },
-  "featGrant": {
-    "featId": "magic-initiate-phb",
-    "featName": "Посвящённый в магию",
-    "featNameEn": "Magic Initiate"
-  },
   "equipmentOptions": [
     {
       "description": "Инструменты каллиграфа, Книга (молитвенник), Священный символ, Пергамент (10 листов), Роба, 8 зм"

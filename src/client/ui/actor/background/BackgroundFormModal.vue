@@ -1,7 +1,6 @@
 <script setup lang="ts">
   import type {
     AbilityType,
-    Feature,
     SkillType,
     TypedWebSocketClient,
   } from '@vtt/shared';
@@ -24,7 +23,6 @@
   } from '@vtt/shared/system/dnd.js';
   import { computed, ref, watch } from 'vue';
 
-  import { loadCompendiumKind } from '@/core/compendiumDataClient';
   import RichTextEditor from '@/shared_ui/components/RichTextEditor.vue';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { useModalManager } from '@/shared_ui/composables/useModalManager';
@@ -126,10 +124,6 @@
   const choicesToolsCount = ref(0);
   const selectedChoicesTools = ref<string[]>([]);
 
-  const featSelectionType = ref<'fixed' | 'choice'>('fixed');
-  const selectedFeatId = ref<string>('');
-  const selectedFeatChoices = ref<string[]>([]);
-
   const equipmentDescription = ref('');
   const equipmentGold = ref(50);
 
@@ -181,58 +175,6 @@
   const keyPreview = computed(
     () => existingKey.value ?? generateBackgroundKey(),
   );
-
-  // ── Черты компендиума (для выбора черты-происхождения) ───────
-  const compendiumFeats = ref<Feature[]>([]);
-
-  function isFeature(value: unknown): value is Feature {
-    return (
-      typeof value === 'object'
-      && value !== null
-      && 'id' in value
-      && 'name' in value
-      && 'description' in value
-    );
-  }
-
-  /** Загружает черты компендиума (бандл + скачиваемые + модули). */
-  async function loadCompendiumFeats(): Promise<void> {
-    if (!props.socket) {
-      return;
-    }
-
-    const entries = await loadCompendiumKind(props.socket, 'feat');
-
-    compendiumFeats.value = entries.filter(isFeature);
-  }
-
-  /** Опции выбора черт: пользовательские из items.db + черты компендиума. */
-  const featOptions = computed(() => {
-    const featsMap = new Map<string, string>();
-
-    for (const feat of itemsStore.itemsByType('feat')) {
-      featsMap.set(feat.id, feat.name || feat.id);
-    }
-
-    for (const feat of compendiumFeats.value) {
-      if (!featsMap.has(feat.id)) {
-        featsMap.set(feat.id, feat.name || feat.id);
-      }
-    }
-
-    return Array.from(featsMap.entries())
-      .map(([value, label]) => ({ value, label }))
-      .sort((a, b) => a.label.localeCompare(b.label));
-  });
-
-  /** Находит черту по id (сначала в items.db, затем в компендиуме). */
-  function findFeat(featId: string): { name: string; nameEn?: string } | null {
-    return (
-      itemsStore.itemsByType('feat').find((feat) => feat.id === featId)
-      ?? compendiumFeats.value.find((feat) => feat.id === featId)
-      ?? null
-    );
-  }
 
   // ── Заклинания компендиума (подсказки связывания + просмотр) ─
   const availableSpells = ref<SpellOption[]>([]);
@@ -312,9 +254,6 @@
     selectedFixedTools.value = [];
     choicesToolsCount.value = 0;
     selectedChoicesTools.value = [];
-    featSelectionType.value = 'fixed';
-    selectedFeatId.value = '';
-    selectedFeatChoices.value = [];
     equipmentDescription.value = '';
     equipmentGold.value = 50;
     grants.value = createEmptyFeatGrants();
@@ -338,14 +277,6 @@
     if (bg.toolGrant?.choices) {
       choicesToolsCount.value = bg.toolGrant.choices.count || 0;
       selectedChoicesTools.value = [...(bg.toolGrant.choices.from ?? [])];
-    }
-
-    if (bg.featGrant?.featChoices?.length) {
-      featSelectionType.value = 'choice';
-      selectedFeatChoices.value = [...bg.featGrant.featChoices];
-    } else {
-      featSelectionType.value = 'fixed';
-      selectedFeatId.value = bg.featGrant?.featId ?? '';
     }
 
     if (bg.equipmentOptions?.length) {
@@ -387,36 +318,16 @@
         hydrateFromBackground(bg);
       }
 
-      if (compendiumFeats.value.length === 0) {
-        void loadCompendiumFeats();
-      }
-
       void loadAvailableSpells();
     },
     { immediate: true },
   );
-
-  /** Резолвит выбранную черту-происхождение в имя для записи. */
-  function resolveFeatNames(): { featName: string; featNameEn: string } {
-    const featId =
-      featSelectionType.value === 'fixed'
-        ? selectedFeatId.value
-        : selectedFeatChoices.value[0];
-
-    const feat = featId ? findFeat(featId) : null;
-
-    return {
-      featName: feat?.name ?? '',
-      featNameEn: feat?.nameEn ?? '',
-    };
-  }
 
   function handleSave(): void {
     if (!canSave.value) {
       return;
     }
 
-    const { featName, featNameEn } = resolveFeatNames();
     const featData = buildFeatData(grants.value, grantedSpells.value);
 
     const bg: GameItem = {
@@ -451,18 +362,6 @@
                 from: [...selectedChoicesTools.value],
               }
             : undefined,
-      },
-      featGrant: {
-        featId:
-          featSelectionType.value === 'fixed'
-            ? selectedFeatId.value || undefined
-            : undefined,
-        featChoices:
-          featSelectionType.value === 'choice'
-            ? [...selectedFeatChoices.value]
-            : undefined,
-        featName,
-        featNameEn,
       },
       equipmentOptions: [
         { description: equipmentDescription.value.trim() },
@@ -650,48 +549,6 @@
               </div>
             </FormSection>
 
-            <FormSection
-              title="Черта-происхождение"
-              title-color="healing"
-            >
-              <URadioGroup
-                v-model="featSelectionType"
-                :items="[
-                  { value: 'fixed', label: 'Фиксированная черта' },
-                  { value: 'choice', label: 'Выбор из нескольких' },
-                ]"
-                class="mb-3"
-              />
-
-              <UFormField
-                v-if="featSelectionType === 'fixed'"
-                label="Черта (необязательно)"
-              >
-                <USelectMenu
-                  v-model="selectedFeatId"
-                  :items="featOptions"
-                  value-key="value"
-                  label-key="label"
-                  placeholder="Выберите черту..."
-                  class="w-full"
-                />
-              </UFormField>
-
-              <UFormField
-                v-else
-                label="Связка черт (для выбора)"
-              >
-                <USelectMenu
-                  v-model="selectedFeatChoices"
-                  :items="featOptions"
-                  value-key="value"
-                  label-key="label"
-                  multiple
-                  placeholder="Отметьте черты для выбора..."
-                  class="w-full"
-                />
-              </UFormField>
-            </FormSection>
           </div>
         </template>
 

@@ -22,11 +22,6 @@
       "calligraphers-supplies"
     ]
   },
-  "featGrant": {
-    "featId": "magic-initiate-phb",
-    "featName": "Посвящённый в магию",
-    "featNameEn": "Magic Initiate"
-  },
   "equipmentOptions": [
     {
       "description": "Боевой посох, Книга (история), Инструменты каллиграфа, Роба, Пергамент (8 листов), 8 зм"

@@ -177,8 +177,6 @@ export function applyFeatToActor(
     featureType: 'feat',
     sourceKey: droppedFeat.sourceKey,
     isSRD: droppedFeat.isSRD,
-    repeatable: droppedFeat.repeatable,
-    repeatableText: droppedFeat.repeatableText,
     ...(featData ? { featData } : {}),
     ...(droppedFeat.activeEffects
       ? { activeEffects: droppedFeat.activeEffects }

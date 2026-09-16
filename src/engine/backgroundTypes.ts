@@ -32,18 +32,6 @@ export interface BackgroundToolGrant {
   choices?: { count: number; from: string[] };
 }
 
-/** Грант черты предыстории */
-export interface BackgroundFeatGrant {
-  /** ID черты в feats.json (фиксированная черта, если нет выбора) */
-  featId?: string;
-  /** Список ID черт для выбора (если предыстория допускает альтернативы) */
-  featChoices?: string[];
-  /** Русское название черты (для отображения, когда featId единственный до выбора) */
-  featName: string;
-  /** Англ. название (для отображения) */
-  featNameEn?: string;
-}
-
 /** Вариант стартового снаряжения */
 export interface BackgroundEquipmentOption {
   /** Описание варианта снаряжения (текст) */
@@ -75,8 +63,6 @@ export interface BackgroundDefinition {
   skillGrant: BackgroundSkillGrant;
   /** Владение инструментами */
   toolGrant: BackgroundToolGrant;
-  /** Черта */
-  featGrant: BackgroundFeatGrant;
   /** Варианты стартового снаряжения */
   equipmentOptions: BackgroundEquipmentOption[];
 
@@ -107,10 +93,6 @@ export interface ActorBackgroundEntry {
   skillChoices: SkillType[];
   /** Выбранные инструменты (если был выбор) */
   toolChoices: string[];
-  /** ID присвоенной черты на акторе (для удаления при замене) */
-  grantedFeatId?: string;
-  /** Название присвоенной черты (для отображения на листе) */
-  grantedFeatName?: string;
 
   // --- Применённые расширенные дары (`featData`) — для ТОЧНОГО отката ---
   // Хранятся именно применённые значения, а не пере-выводятся из определения
@@ -128,8 +110,8 @@ export interface ActorBackgroundEntry {
   /** Языки от `featData`. */
   languages?: string[];
   /**
-   * Синтетическое имя-источник заклинаний, выданных СОБСТВЕННЫМ `featData`
-   * предыстории (отличное от имени черты-происхождения) — для снятия на откате.
+   * Синтетическое имя-источник заклинаний, выданных `featData` предыстории —
+   * для снятия ровно её заклинаний на откате.
    */
   ownGrantedSpellSource?: string;
   /** Тёмное зрение, поднятое предысторией (футы) — справочно (не понижается). */

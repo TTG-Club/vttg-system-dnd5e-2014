@@ -315,8 +315,6 @@
       isReadOnly: false,
       sourceKey: feature.sourceKey,
       isSRD: feature.isSRD,
-      repeatable: feature.repeatable,
-      repeatableText: feature.repeatableText,
       activeEffects: feature.activeEffects,
       featData: feature.featData,
     };
@@ -347,8 +345,6 @@
             description: data.description,
             sourceKey: data.sourceKey,
             isSRD: data.isSRD,
-            repeatable: data.repeatable,
-            repeatableText: data.repeatableText,
             featureType: 'feat',
             activeEffects: data.activeEffects,
             featData: data.featData,

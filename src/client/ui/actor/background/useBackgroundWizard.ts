@@ -1,4 +1,4 @@
-import type { AbilityType, Feature } from '@vtt/shared';
+import type { AbilityType } from '@vtt/shared';
 import type {
   Actor,
   ActorBackgroundEntry,
@@ -31,9 +31,9 @@ export type BackgroundWizardStep =
   | 'equipment';
 
 /**
- * Имя-источник заклинаний, выданных СОБСТВЕННЫМ `featData` предыстории —
- * отличное от имени черты-происхождения, чтобы откат снимал их раздельно. Тот же
- * формат используется при резолве источников в `BackgroundSetupWizard`.
+ * Имя-источник заклинаний, выданных `featData` предыстории — по нему откат
+ * снимает ровно её заклинания, не трогая чужие. Тот же формат используется при
+ * резолве источников в `BackgroundSetupWizard`.
  *
  * @param backgroundName - название предыстории
  */
@@ -93,7 +93,6 @@ export function useBackgroundWizard(
   const selectedScheme = ref<'+2/+1' | '+1/+1/+1'>('+2/+1');
   const abilityAllocation = ref<Partial<Record<AbilityType, number>>>({});
   const toolSelections = ref<string[]>([]);
-  const selectedFeatId = ref<string>('');
 
   const wizardSteps = computed<BackgroundWizardStep[]>(() => {
     const def = backgroundDefinitionRef.value;
@@ -117,20 +116,11 @@ export function useBackgroundWizard(
     selectedScheme.value = '+2/+1';
     abilityAllocation.value = {};
     toolSelections.value = [];
-    selectedFeatId.value = '';
 
     const def = backgroundDefinitionRef.value;
 
-    if (def) {
-      if (def.toolGrant.items.length) {
-        toolSelections.value = [...def.toolGrant.items];
-      }
-
-      if (def.featGrant.featId) {
-        selectedFeatId.value = def.featGrant.featId;
-      } else if (def.featGrant.featChoices?.length) {
-        selectedFeatId.value = def.featGrant.featChoices[0];
-      }
+    if (def?.toolGrant.items.length) {
+      toolSelections.value = [...def.toolGrant.items];
     }
 
     currentStepInfo.value = {
@@ -165,12 +155,6 @@ export function useBackgroundWizard(
 
     if (!def) {
       return false;
-    }
-
-    if (currentStepInfo.value.stepGroup === 'overview') {
-      if (def.featGrant.featChoices?.length && !selectedFeatId.value) {
-        return false;
-      }
     }
 
     if (currentStepInfo.value.stepGroup === 'tools') {
@@ -250,17 +234,13 @@ export function useBackgroundWizard(
   /**
    * Применяет выбранные данные и формирует updates для актора.
    * Если у актора уже есть предыстория — откатывает все её бонусы
-   * (характеристики, навыки, инструменты, черту, granted-заклинания черты)
-   * перед применением новой.
+   * (характеристики, навыки, инструменты, granted-заклинания) перед
+   * применением новой.
    *
-   * @param srdFeats Полный список черт из SRD feats.json
-   * @param resolvedGrantedSpells granted-заклинания выбранной черты,
+   * @param resolvedGrantedSpells granted-заклинания предыстории,
    * сопоставленные с данными компендиума
    */
-  function buildUpdates(
-    srdFeats: Feature[],
-    resolvedGrantedSpells: ResolvedGrantedSpell[] = [],
-  ) {
+  function buildUpdates(resolvedGrantedSpells: ResolvedGrantedSpell[] = []) {
     const def = backgroundDefinitionRef.value;
 
     if (!def) {
@@ -278,8 +258,6 @@ export function useBackgroundWizard(
     const baseArmor = [...(system.proficiencies?.armor ?? [])];
     const baseWeapons = [...(system.proficiencies?.weapons ?? [])];
     const baseLanguages = [...(system.proficiencies?.languages ?? [])];
-
-    let baseFeatures = [...(actorRef.value.features || [])];
 
     // Убираем старые эффекты предыстории (по префиксу провенанса background:) —
     // это и бонус характеристик, и синтетический эффект даров, и перенесённые.
@@ -310,13 +288,6 @@ export function useBackgroundWizard(
       removeItems(baseArmor, previousBackground.armorProficiencies ?? []);
       removeItems(baseWeapons, previousBackground.weaponProficiencies ?? []);
       removeItems(baseLanguages, previousBackground.languages ?? []);
-
-      // Откат черты
-      if (previousBackground.grantedFeatId) {
-        baseFeatures = baseFeatures.filter(
-          (feat) => feat.id !== previousBackground.grantedFeatId,
-        );
-      }
     }
 
     // --- Применение новой предыстории ---
@@ -335,35 +306,7 @@ export function useBackgroundWizard(
       }
     }
 
-    // 3. Добавляем черту
-    const grantedFeatId = generateId('feat');
-
-    const srdFeat = srdFeats.find((feat) => feat.id === selectedFeatId.value);
-
-    let grantedFeatName = def.featGrant.featName;
-
-    if (srdFeat) {
-      grantedFeatName = srdFeat.name;
-
-      baseFeatures.push({
-        ...srdFeat,
-        id: grantedFeatId,
-        featureType: 'feat',
-      });
-    } else {
-      const fallbackFeat: Partial<Feature> = {
-        id: grantedFeatId,
-        name: def.featGrant.featName,
-        nameEn: def.featGrant.featNameEn || '',
-        description: '', // Больше не храним fallback описание
-        featureType: 'feat',
-        isSRD: !!def.isSRD,
-      };
-
-      baseFeatures.push(fallbackFeat as Feature);
-    }
-
-    // 4. Создаём Active Effect для бонусов характеристик от предыстории
+    // 3. Создаём Active Effect для бонусов характеристик от предыстории
     const abilityChanges: import('@vtt/shared/system/dnd.js').EffectChange[] =
       [];
 
@@ -448,7 +391,7 @@ export function useBackgroundWizard(
         ? backgroundSpellSource(def.name)
         : undefined;
 
-    // 5. Формируем запись предыстории (с применёнными расширенными дарами —
+    // 4. Формируем запись предыстории (с применёнными расширенными дарами —
     // для точного отката при замене/удалении).
     const entry: ActorBackgroundEntry = {
       backgroundKey: def.key,
@@ -456,8 +399,6 @@ export function useBackgroundWizard(
       abilityChoices: { ...abilityAllocation.value },
       skillChoices: [...def.skillGrant.skills],
       toolChoices: [...toolSelections.value],
-      grantedFeatId,
-      grantedFeatName,
     };
 
     if (extraSkills.length > 0) {
@@ -492,17 +433,13 @@ export function useBackgroundWizard(
       entry.darkvisionApplied = featData.darkvision;
     }
 
-    // 6. Granted-заклинания: откатываем заклинания предыдущей предыстории
-    // (и черты-происхождения, и собственного featData) и добавляем новые.
+    // 5. Granted-заклинания: откатываем заклинания предыдущей предыстории
+    // (её собственный `featData`) и добавляем новые.
     const originalSpells = actorRef.value.spells ?? [];
 
     let updatedSpells = [...originalSpells];
 
     const previousSpellSources: string[] = [];
-
-    if (previousBackground?.grantedFeatName) {
-      previousSpellSources.push(previousBackground.grantedFeatName);
-    }
 
     if (previousBackground?.ownGrantedSpellSource) {
       previousSpellSources.push(previousBackground.ownGrantedSpellSource);
@@ -523,7 +460,7 @@ export function useBackgroundWizard(
       updatedSpells.length !== originalSpells.length
       || updatedSpells.some((spell, index) => spell !== originalSpells[index]);
 
-    // 7. Формируем финальный объект updates
+    // 6. Формируем финальный объект updates
     const systemUpdates: Partial<Actor['system']> = {
       background: entry,
       proficiencies: {
@@ -537,8 +474,10 @@ export function useBackgroundWizard(
       },
     };
 
+    // Особенности предыстория не трогает: в редакции 2014 она не даёт черту, а
+    // свои расширенные дары применяет эффектами. Ключ `features` не пишется
+    // вовсе — иначе патч перезаписывал бы список тем же значением.
     const rootUpdates: Partial<Actor> = {
-      features: baseFeatures,
       activeEffects: baseEffects,
     };
 
@@ -561,7 +500,6 @@ export function useBackgroundWizard(
     selectedScheme,
     abilityAllocation,
     toolSelections,
-    selectedFeatId,
     wizardSteps,
     canProceed,
     nextStep,

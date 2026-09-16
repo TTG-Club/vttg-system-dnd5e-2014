@@ -1162,13 +1162,13 @@
         const droppedFeat = parsedFeat;
 
         if (localActor.value) {
-          const alreadyExists =
-            !droppedFeat.repeatable
-            && localActor.value.features.some(
-              (feature) =>
-                feature.featureType === 'feat'
-                && feature.name === droppedFeat.name,
-            );
+          // Повторяемых черт в редакции 2014 нет: одноимённая черта может быть
+          // у персонажа только одна.
+          const alreadyExists = localActor.value.features.some(
+            (feature) =>
+              feature.featureType === 'feat'
+              && feature.name === droppedFeat.name,
+          );
 
           if (!alreadyExists) {
             void applyDroppedFeat(droppedFeat);

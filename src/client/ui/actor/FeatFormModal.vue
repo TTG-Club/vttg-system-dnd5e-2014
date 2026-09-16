@@ -87,8 +87,6 @@
   const description = ref('');
   const sourceKey = ref('local');
   const isSRD = ref(false);
-  const repeatable = ref(false);
-  const repeatableText = ref('');
 
   /** Выдаваемые заклинания (имя + опц. связь с компендиумом). */
   const grantedSpells = ref<GrantedSpellRef[]>([]);
@@ -152,8 +150,6 @@
     description.value = '';
     sourceKey.value = 'local';
     isSRD.value = false;
-    repeatable.value = false;
-    repeatableText.value = '';
     grantedSpells.value = [];
     effects.value = [];
     grants.value = createEmptyFeatGrants();
@@ -165,8 +161,6 @@
     description.value = feat.description || '';
     sourceKey.value = feat.sourceKey || 'local';
     isSRD.value = feat.isSRD || false;
-    repeatable.value = feat.repeatable || false;
-    repeatableText.value = feat.repeatableText || '';
 
     grantedSpells.value = (feat.featData?.grantedSpells ?? []).map((spell) => ({
       name: spell.name,
@@ -249,8 +243,6 @@
       description: description.value.trim(),
       sourceKey: sourceKey.value,
       isSRD: isSRD.value,
-      repeatable: repeatable.value,
-      repeatableText: repeatableText.value.trim() || undefined,
       quantity: 1,
       weight: 0,
       cost: '',
@@ -330,27 +322,6 @@
                 placeholder="Выберите класс..."
               />
             </UFormField>
-
-            <FormSection>
-              <UCheckbox
-                v-model="repeatable"
-                label="Повторяемая черта"
-              />
-
-              <UFormField
-                v-if="repeatable"
-                label="Условия повторного выбора"
-                class="mt-2"
-              >
-                <UTextarea
-                  v-model="repeatableText"
-                  :rows="2"
-                  autoresize
-                  class="w-full"
-                  placeholder="Напр. «нельзя выбрать одну характеристику дважды»"
-                />
-              </UFormField>
-            </FormSection>
 
             <FormSection
               title="Источник"
