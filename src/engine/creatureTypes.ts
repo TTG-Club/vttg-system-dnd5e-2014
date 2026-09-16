@@ -8,6 +8,8 @@
 
 import type {
   AbilityType,
+  ActorArmorClass,
+  ActorMovement,
   DamagePart,
   DistanceUnit,
   ProficiencyLevel,
@@ -15,6 +17,7 @@ import type {
   SpellAreaOfEffect,
   SpellSaveType,
 } from '@vtt/shared';
+import type { ActiveEffect } from './activeEffectTypes.js';
 import type { CreatureSize, DnDAbilityScores } from './types.js';
 
 // ── Категория существа ─────────────────────────────────────────────────────
@@ -107,7 +110,7 @@ export interface CreatureAction {
    * `effectTarget: 'target'` накладываются на цель (опционально через свой
    * `applySave`); с `effectTarget: 'self'` — на само существо.
    */
-  activeEffects?: import('../dnd/activeEffectTypes.js').ActiveEffect[];
+  activeEffects?: ActiveEffect[];
 }
 
 // ── Заклинательство ───────────────────────────────────────────────────────
@@ -241,18 +244,18 @@ export interface CreatureSystem {
   // ── Боевые параметры ────────────────────────────────────────────────────
 
   /** Класс доспеха (теперь структурированный объект) */
-  armorClass: import('../../types/base.js').ActorArmorClass;
+  armorClass: ActorArmorClass;
   /** Хиты */
   hitPoints: CreatureHitPoints;
   /** Структурированное передвижение (аналог ActorMovement) */
-  movement: import('../../types/base.js').ActorMovement;
+  movement: ActorMovement;
 
   // ── Инициатива ──────────────────────────────────────────────────────────
 
   /** Бонус к инициативе (опционально, по умолчанию используется модификатор Ловкости) */
   initiativeBonus?: number;
   /** Какая характеристика используется для инициативы (обычно dexterity) */
-  initiativeAbility?: import('../../types/base.js').AbilityType;
+  initiativeAbility?: AbilityType;
 
   // ── Характеристики ──────────────────────────────────────────────────────
 

@@ -54,6 +54,10 @@
     | CompendiumEntry
     | Spell
     | Feature
+    // Определение класса — такой же полноправный вид записи, как заклинание или
+    // черта. Без него `isClassDefinition` не мог быть предикатом: `ClassDefinition`
+    // не подходит и под `Record<string, unknown>` (нет индексной сигнатуры).
+    | ClassDefinition
     | CompendiumCreatureEntry
     | Record<string, unknown>;
 
@@ -268,7 +272,12 @@
       // При лимите = 1 автоматически отменяем предыдущий выбор той же категории
       if (limit === 1) {
         for (const selectedId of newSet) {
-          const found = items.value.find((item) => item.id === selectedId);
+          // Не у всякой записи компендиума есть `id`: разделитель и определение
+          // класса (ключ там — `key`) его не имеют, поэтому сначала проверка
+          // наличия поля, а уже потом сравнение.
+          const found = items.value.find(
+            (item) => 'id' in item && item.id === selectedId,
+          );
 
           if (
             found
@@ -723,10 +732,7 @@
    * Открывает детальный просмотр класса.
    * @param classDef - определение класса
    */
-  function openClassDetail(classDef: {
-    key: string;
-    [key: string]: unknown;
-  }): void {
+  function openClassDetail(classDef: ClassDefinition): void {
     openModal('ClassDetailModal', { classDefinition: classDef });
   }
 
@@ -778,6 +784,10 @@
   ): import('@vtt/shared/system/dnd.js').Creature {
     const creature: import('@vtt/shared/system/dnd.js').Creature = {
       id: generateId('creature'),
+      // Дискриминатор сущности проставляется здесь, а не оставляется на
+      // `normalizeCreature`: нормализатор системы опционален, и без него
+      // существо уезжало на сервер без `entityType`.
+      entityType: 'creature',
       name: creatureEntry.name,
       nameEn: creatureEntry.nameEn,
       description: creatureEntry.description,

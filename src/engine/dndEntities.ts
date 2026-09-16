@@ -85,6 +85,15 @@ export type Creature = DnDCreature;
  * встроенной системы через колонки).
  */
 export interface DnDGameItem extends BaseGameItem {
+  /**
+   * Активные эффекты предмета в D&D-форме (`changes: EffectChange[]`).
+   *
+   * Сужает нейтральное `BaseGameItem.activeEffects?: BaseActiveEffect[]` —
+   * симметрично `DnDActor` и `DnDCreature`, которые сужали его и раньше. Без
+   * этого эффекты предмета приезжали в компоненты системы как база с
+   * `changes: unknown[]`, и D&D-поля читались вслепую.
+   */
+  activeEffects?: ActiveEffect[];
   /** Универсальное оружие держится двумя руками (только для versatile) */
   twoHandedGrip?: boolean;
   // --- Weapon-specific (только для type === 'weapon') ---

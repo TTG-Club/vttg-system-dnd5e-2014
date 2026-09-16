@@ -10,7 +10,7 @@
  * @module systems/dnd5e/composables/dnd5eItemTypes
  */
 
-import type { BaseGameItem, TypedWebSocketClient } from '@vtt/shared';
+import type { TypedWebSocketClient } from '@vtt/shared';
 import type { DnDGameItem, GameItem, Spell } from '@vtt/shared/system/dnd.js';
 
 import type {
@@ -117,11 +117,17 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
     (openModal as (n: string, p: Record<string, unknown>) => void)(name, props);
   };
 
-  const openDetail = (baseItem: BaseGameItem): void => {
-    // Доверенное сужение: ядро отдаёт нейтральный предмет, но в мире D&D он всегда
-    // D&D-формы (все D&D-поля опциональны → присваивание без каста).
-    const item: DnDGameItem = baseItem;
-
+  /*
+   * Предмет объявлен сразу в D&D-форме, а не как нейтральный `BaseGameItem`.
+   *
+   * Ядро вызывает провайдер с нейтральным предметом, но провайдер этот —
+   * системный, и в мире на D&D предмет всегда D&D-формы. Раньше это выражалось
+   * присваиванием `const item: DnDGameItem = baseItem`, которое проходило лишь
+   * потому, что все D&D-поля были опциональны и ни одно не сужало базу. Стоило
+   * `DnDGameItem` сузить `activeEffects` до D&D-эффектов — и присваивание стало
+   * ложью, которую компилятор поймал. Место стыка одно, здесь оно и объявлено.
+   */
+  const openDetail = (item: DnDGameItem): void => {
     // Заклинание: SpellDetailModal ожидает prop `spell` (плоский Spell из spellData).
     if (item.type === 'spell') {
       openByName(getModalName('spell', 'DetailModal'), {
@@ -163,11 +169,9 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
 
   const openForm = (
     type: string,
-    baseItem: BaseGameItem | null,
+    item: DnDGameItem | null,
     ctx: ItemFormContext,
   ): void => {
-    // Доверенное сужение к D&D-форме (см. openDetail).
-    const item: DnDGameItem | null = baseItem;
     const socket: TypedWebSocketClient | null = ctx.socket;
     const onSave = ctx.onSave;
     const modalName = getModalName(type, 'FormModal');
@@ -249,10 +253,7 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
    * Отправляет карточку предмета в чат. Пока share только у заклинаний: метаданные
    * верхнего уровня сливаются со spellData (карточка чата ждёт объект Spell).
    */
-  const shareToChat = (baseItem: BaseGameItem): void => {
-    // Доверенное сужение к D&D-форме (см. openDetail).
-    const item: DnDGameItem = baseItem;
-
+  const shareToChat = (item: DnDGameItem): void => {
     if (item.type !== 'spell' || !item.spellData) {
       return;
     }

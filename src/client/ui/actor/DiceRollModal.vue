@@ -242,7 +242,7 @@
       }));
     }
 
-    const items = [];
+    const items: Array<{ label: string; value: number }> = [];
     const baseLevel = props.spellLevel;
 
     for (let idx = baseLevel; idx <= 9; idx++) {

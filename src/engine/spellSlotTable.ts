@@ -318,7 +318,7 @@ export function getAvailableSpellLevels(
   // Если у актора вообще нет ячеек - считаем, что это NPC / Врождённый каст,
   // разрешаем каст на любом доступном круге.
   if (!hasAnyMaxSlots) {
-    const levels = [];
+    const levels: number[] = [];
 
     for (let i = minLevel; i <= maxAvailableLevel; i++) {
       levels.push(i);

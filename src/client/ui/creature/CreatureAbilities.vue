@@ -37,7 +37,7 @@
 
   function getAbilityBonusSources(abilityKey: AbilityType) {
     const targetKey = `ability.${abilityKey}`;
-    const sources = [];
+    const sources: Array<{ name: string; value: number }> = [];
 
     for (const effect of combinedEffects.value) {
       for (const change of effect.changes) {

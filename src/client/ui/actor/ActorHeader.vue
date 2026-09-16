@@ -42,7 +42,7 @@
       data: {
         queue: Array<{ classKey: string; targetLevel: number }>;
         experience: number;
-        forceApplies: import('@vtt/shared').ActorClassEntry[];
+        forceApplies: import('@vtt/shared/system/dnd.js').ActorClassEntry[];
       },
     ];
     'remove-class': [classKey: string];
@@ -234,7 +234,7 @@
    * Применяет изменения уровня (по классам) и опыта
    */
   function onLevelUpApply(data: {
-    classes: import('@vtt/shared').ActorClassEntry[];
+    classes: import('@vtt/shared/system/dnd.js').ActorClassEntry[];
     experience: number;
   }) {
     emit('update:actor', {

@@ -241,7 +241,7 @@
       return;
     }
 
-    const badges = [];
+    const badges: Array<{ text: string; color: string }> = [];
 
     if (feature.featureType === 'species') {
       badges.push({

@@ -453,7 +453,7 @@
     temp: number;
     classes?: typeof props.actor.system.classes;
     manualHitDice?: Array<{
-      die: import('@vtt/shared').HitDie;
+      die: import('@vtt/shared/system/dnd.js').HitDie;
       total: number;
       used: number;
     }>;

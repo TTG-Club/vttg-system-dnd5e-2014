@@ -25,7 +25,7 @@ export function useFeatModal() {
     feat: Feature | GameItem,
     options?: { showCopyButton?: boolean; onCopy?: () => void },
   ) {
-    const badges = [];
+    const badges: Array<{ text: string; color: string }> = [];
 
     let alertConfig:
       | { title?: string; description: string; color: 'warning'; icon?: string }

@@ -1262,7 +1262,7 @@
   function handleStartWizardSequence(data: {
     queue: Array<{ classKey: string; targetLevel: number }>;
     experience: number;
-    forceApplies: import('@vtt/shared').ActorClassEntry[];
+    forceApplies: import('@vtt/shared/system/dnd.js').ActorClassEntry[];
   }) {
     if (!localActor.value) {
       return;

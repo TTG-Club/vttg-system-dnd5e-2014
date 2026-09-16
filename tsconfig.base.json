@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "jsx": "preserve",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "useDefineForClassFields": true,
+    "baseUrl": ".",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // Алиасы повторяют `resolve.alias` из `vite.config.ts`. Расходиться им
+    // нельзя: тогда проверка типов и сборка увидят разные файлы.
+    "paths": {
+      "@vtt/shared": ["./sdk/index.ts"],
+      "@vtt/shared/system/dnd.js": ["./src/engine/index.ts"],
+      "@/systems/dnd5e/*": ["./src/client/*"]
+    },
+    "resolveJsonModule": true,
+    "types": ["vite/client"],
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "skipLibCheck": true
+  }
+}

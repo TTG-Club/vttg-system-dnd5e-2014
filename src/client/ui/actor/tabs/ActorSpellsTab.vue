@@ -313,7 +313,7 @@
 
   /** Карта casterType для computeSpellSlots */
   const casterTypeMap = computed(() => {
-    const typeMap = new Map<string, import('@vtt/shared').CasterType>();
+    const typeMap = new Map<string, import('@vtt/shared/system/dnd.js').CasterType>();
     const classes = props.actor.system?.classes ?? [];
 
     for (const entry of classes) {

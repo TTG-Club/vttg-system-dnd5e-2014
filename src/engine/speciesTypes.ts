@@ -1,3 +1,11 @@
+import type {
+  AbilityType,
+  DefensibleDamageType,
+  SkillType,
+} from '@vtt/shared';
+
+import type { CreatureSize } from './types.js';
+
 /**
  * Ключ вида (открытый тип, как и `BackgroundKey`).
  *
@@ -38,7 +46,7 @@ export type SpeciesGrant =
 export interface SkillProficiencyGrant {
   type: 'skillProficiency';
   count: number;
-  from: import('../../types/base.js').SkillType[];
+  from: SkillType[];
 }
 
 export interface WeaponProficiencyGrant {
@@ -61,7 +69,7 @@ export interface ToolProficiencyGrant {
 
 export interface SavingThrowProficiencyGrant {
   type: 'savingThrowProficiency';
-  abilities: import('../../types/base.js').AbilityType[];
+  abilities: AbilityType[];
 }
 
 export interface LanguageGrant {
@@ -75,7 +83,7 @@ export interface LanguageGrant {
  * иммунитет или уязвимость (гибко, в отличие от прежнего «только сопротивление»).
  */
 export interface DamageDefenseEntry {
-  damageType: import('../../types/base.js').DefensibleDamageType;
+  damageType: DefensibleDamageType;
   kind: import('./damageConstants.js').DamageDefenseKind;
 }
 
@@ -189,7 +197,7 @@ export interface SpeciesDefinition {
   isSRD?: boolean;
 
   creatureType: CreatureType;
-  size: import('../../types/base.js').CreatureSize[];
+  size: CreatureSize[];
   speed: {
     walk: number;
     fly?: number;
@@ -207,7 +215,7 @@ export interface ActorSpeciesEntry {
   speciesKey: string;
   speciesName: string;
   creatureType: CreatureType;
-  size: import('../../types/base.js').CreatureSize;
+  size: CreatureSize;
   featureChoices: Record<string, string>;
   grantChoices: Record<number, string[]>;
 }

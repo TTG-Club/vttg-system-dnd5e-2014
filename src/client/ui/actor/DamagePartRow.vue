@@ -126,7 +126,7 @@
 
   /** Кнопки модификаторов (@mod.spell — только для заклинаний) */
   const modifierButtons = computed(() => {
-    const buttons = [];
+    const buttons: Array<{ label: string; value: string }> = [];
 
     if (props.includeSpellModifier) {
       buttons.push({ label: 'Заклинание (@mod.spell)', value: '@mod.spell' });
