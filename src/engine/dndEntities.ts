@@ -92,8 +92,6 @@ export interface DnDGameItem extends BaseGameItem {
   baseType?: string;
   /** Категория оружия */
   weaponCategory?: WeaponCategory;
-  /** Оружейный приём (weapon mastery) */
-  mastery?: string;
   /** Тип дальности */
   rangeType?: WeaponRangeType;
   /**

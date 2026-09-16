@@ -74,14 +74,12 @@
     attackBonus,
     special,
     ammunitionType,
-    mastery,
     categoryOptions,
     damageTypeOptions,
     propertyOptions,
     baseTypeOptions,
     ammunitionTypeOptions,
     proficiencyModeOptions,
-    masteryOptions,
     sourceOptions,
     saveTypeOptions,
     saveEffectOptions,
@@ -376,21 +374,6 @@
                     v-model="weaponCategory"
                     :items="categoryOptions"
                     value-key="value"
-                    class="flex-1"
-                  />
-                </div>
-
-                <!-- Оружейный приём (inline label) -->
-                <div class="flex items-center gap-3">
-                  <span class="min-w-[120px] shrink-0 text-sm text-muted"
-                    >Приём (Mastery)</span
-                  >
-
-                  <USelect
-                    v-model="mastery"
-                    :items="masteryOptions"
-                    value-key="value"
-                    placeholder="Нет"
                     class="flex-1"
                   />
                 </div>

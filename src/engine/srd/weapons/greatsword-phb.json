@@ -23,7 +23,6 @@
     "two-handed"
   ],
   "reach": 5,
-  "mastery": "graze",
   "proficiencyMode": "auto",
   "sourceKey": "phb",
   "isSRD": true,

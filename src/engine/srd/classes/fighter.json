@@ -101,13 +101,6 @@
         "type": "class"
       },
       {
-        "key": "weapon-mastery",
-        "name": "Оружейные приёмы",
-        "description": "Ваши тренировки с оружием позволяют вам использовать оружейные приёмы 3 типов простого или воинского оружия по вашему выбору. Когда вы заканчиваете продолжительный отдых, вы можете попрактиковать упражнения с оружием и поменять 1 из этих типов оружия.\n\nКогда вы достигаете определённых уровней воина, вы получаете возможность использовать оружейные приёмы большего количества типов оружия, как показано в столбце «Оружейные приёмы» в таблице «Умения воина».",
-        "level": 1,
-        "type": "class"
-      },
-      {
         "key": "action-surge",
         "name": "Всплеск действий",
         "description": "Вы можете на мгновение преодолеть свои обычные возможности. В свой ход вы можете выполнить одно дополнительное действие, кроме действия магия.\n\nКак только вы используете эту способность, то вы не можете сделать это снова, пока не закончите короткий отдых или продолжительный отдых.\n\nНачиная с 17 уровня, вы можете использовать её дважды перед отдыхом, но только 1 раз в ход.",
@@ -963,10 +956,8 @@
         "proficiencyBonus": 2,
         "featureKeys": [
           "fighting-style",
-          "second-wind",
-          "weapon-mastery"
+          "second-wind"
         ],
-        "weaponMasteries": 3,
         "secondWindUses": 2
       },
       {
@@ -976,7 +967,6 @@
           "action-surge",
           "tactical-mind"
         ],
-        "weaponMasteries": 3,
         "secondWindUses": 2
       },
       {
@@ -985,7 +975,6 @@
         "featureKeys": [
           "martial-archetype"
         ],
-        "weaponMasteries": 3,
         "secondWindUses": 2
       },
       {
@@ -994,7 +983,6 @@
         "featureKeys": [
           "asi-4"
         ],
-        "weaponMasteries": 4,
         "secondWindUses": 3
       },
       {
@@ -1005,7 +993,6 @@
           "tactical-shift"
         ],
         "extraAttacks": 2,
-        "weaponMasteries": 4,
         "secondWindUses": 3
       },
       {
@@ -1014,7 +1001,6 @@
         "featureKeys": [
           "asi-6"
         ],
-        "weaponMasteries": 4,
         "secondWindUses": 3
       },
       {
@@ -1023,7 +1009,6 @@
         "featureKeys": [
           "subclass-feature-7"
         ],
-        "weaponMasteries": 4,
         "secondWindUses": 3
       },
       {
@@ -1032,7 +1017,6 @@
         "featureKeys": [
           "asi-8"
         ],
-        "weaponMasteries": 4,
         "secondWindUses": 3
       },
       {
@@ -1042,7 +1026,6 @@
           "indomitable",
           "tactical-master"
         ],
-        "weaponMasteries": 4,
         "secondWindUses": 3
       },
       {
@@ -1051,7 +1034,6 @@
         "featureKeys": [
           "subclass-feature-10"
         ],
-        "weaponMasteries": 5,
         "secondWindUses": 4
       },
       {
@@ -1061,7 +1043,6 @@
           "extra-attack-2"
         ],
         "extraAttacks": 3,
-        "weaponMasteries": 5,
         "secondWindUses": 4
       },
       {
@@ -1070,7 +1051,6 @@
         "featureKeys": [
           "asi-12"
         ],
-        "weaponMasteries": 5,
         "secondWindUses": 4
       },
       {
@@ -1080,7 +1060,6 @@
           "indomitable-2",
           "studied-attacks"
         ],
-        "weaponMasteries": 5,
         "secondWindUses": 4
       },
       {
@@ -1089,7 +1068,6 @@
         "featureKeys": [
           "asi-14"
         ],
-        "weaponMasteries": 5,
         "secondWindUses": 4
       },
       {
@@ -1098,7 +1076,6 @@
         "featureKeys": [
           "subclass-feature-15"
         ],
-        "weaponMasteries": 5,
         "secondWindUses": 4
       },
       {
@@ -1107,7 +1084,6 @@
         "featureKeys": [
           "asi-16"
         ],
-        "weaponMasteries": 6,
         "secondWindUses": 4
       },
       {
@@ -1117,7 +1093,6 @@
           "action-surge-2",
           "indomitable-3"
         ],
-        "weaponMasteries": 6,
         "secondWindUses": 4
       },
       {
@@ -1126,7 +1101,6 @@
         "featureKeys": [
           "subclass-feature-18"
         ],
-        "weaponMasteries": 6,
         "secondWindUses": 4
       },
       {
@@ -1135,7 +1109,6 @@
         "featureKeys": [
           "epic-boon"
         ],
-        "weaponMasteries": 6,
         "secondWindUses": 4
       },
       {
@@ -1145,16 +1118,10 @@
           "extra-attack-3"
         ],
         "extraAttacks": 4,
-        "weaponMasteries": 6,
         "secondWindUses": 4
       }
     ],
     "tableColumns": [
-      {
-        "type": "class",
-        "key": "weaponMasteries",
-        "label": "Оружейные приёмы"
-      },
       {
         "key": "secondWindUses",
         "label": "Второе дыхание"

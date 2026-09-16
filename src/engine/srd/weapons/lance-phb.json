@@ -25,7 +25,6 @@
   ],
   "special": "Вы совершаете атаку с помехой, если цель в пределах 5 футов от вас. Также это оружие требует обе руки, если вы не верхом.",
   "reach": 10,
-  "mastery": "topple",
   "proficiencyMode": "auto",
   "sourceKey": "phb",
   "isSRD": true,

@@ -520,7 +520,6 @@ export function normalizeActor(actor: DnDActor): DnDActor {
       (raw.proficiencies as DnDActor['system']['proficiencies']) ?? {
         armor: [],
         weapons: [],
-        weaponMasteries: [],
         tools: [],
         languages: ['Общий'],
         savingThrows: [],

@@ -963,7 +963,6 @@ export function useClassWizard(
       const proficiencies = {
         armor: [...(existingProf?.armor ?? [])],
         weapons: [...(existingProf?.weapons ?? [])],
-        weaponMasteries: [...(existingProf?.weaponMasteries ?? [])],
         tools: [...(existingProf?.tools ?? [])],
         languages: [...(existingProf?.languages ?? [])],
         savingThrows: [...(existingProf?.savingThrows ?? [])],

@@ -1017,12 +1017,6 @@ export const COLUMN_PRESETS: ColumnPreset[] = [
     key: 'sneakAttackDice',
   },
   {
-    id: 'weaponMasteries',
-    button: 'Оруж. приёмы',
-    columnLabel: 'Оружейные приёмы',
-    key: 'weaponMasteries',
-  },
-  {
     id: 'secondWindUses',
     button: 'Второе дыхание',
     columnLabel: 'Второе дыхание',

@@ -23,14 +23,13 @@ import {
   parseCost,
   SAVE_EFFECT_OPTIONS,
   SAVE_TYPE_OPTIONS,
-  WEAPON_MASTERIES,
 } from '@vtt/shared/system/dnd.js';
 import { computed, ref, watch } from 'vue';
 
 import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
 
 /**
- * Значение опции «не выбрано» в селектах базового типа/категории/приёма.
+ * Значение опции «не выбрано» в селектах базового типа и категории.
  * Не пустая строка: Nuxt UI `USelect` резервирует `''` под очистку выбора и
  * запрещает её как значение пункта.
  */
@@ -75,7 +74,6 @@ export function useWeaponForm(
   const attackBonus = ref(0);
   const special = ref('');
   const ammunitionType = ref<AmmunitionType | ''>('');
-  const mastery = ref<string>(NO_SELECTION);
   const distanceUnit = ref<DistanceUnit>('ft');
   const sourceKey = ref('hb');
   const isSRD = ref(false);
@@ -153,16 +151,6 @@ export function useWeaponForm(
     { label: 'Не учитывать', value: 'never' as const },
   ];
 
-  /** Опции оружейных приёмов (с пунктом «Без приёма») */
-  const masteryOptions = computed(() => [
-    { label: 'Без приёма', value: NO_SELECTION, description: '' },
-    ...WEAPON_MASTERIES.map((masteryEntry) => ({
-      label: `${masteryEntry.name.ru} (${masteryEntry.name.en})`,
-      value: masteryEntry.key,
-      description: masteryEntry.description.ru,
-    })),
-  ]);
-
   /** Опции источников контента */
   const sourceOptions = computed(() =>
     systemDataStore.sources.map((src) => ({
@@ -211,7 +199,6 @@ export function useWeaponForm(
         attackBonus.value = weapon.attackBonus ?? 0;
         special.value = weapon.special ?? '';
         ammunitionType.value = weapon.ammunitionType ?? '';
-        mastery.value = weapon.mastery ?? NO_SELECTION;
         distanceUnit.value = weapon.distanceUnit ?? 'ft';
         sourceKey.value = weapon.sourceKey ?? 'hb';
         isSRD.value = weapon.isSRD ?? false;
@@ -263,7 +250,6 @@ export function useWeaponForm(
         attackBonus.value = 0;
         special.value = '';
         ammunitionType.value = '';
-        mastery.value = NO_SELECTION;
         distanceUnit.value = 'ft';
         sourceKey.value = 'hb';
         isSRD.value = false;
@@ -402,7 +388,6 @@ export function useWeaponForm(
       rangeType: rangeType.value,
       baseType: baseType.value !== NO_SELECTION ? baseType.value : undefined,
       reach: reach.value !== 5 ? reach.value : undefined,
-      mastery: mastery.value !== NO_SELECTION ? mastery.value : undefined,
       damageParts: buildDamageParts(),
       weaponProperties: selectedProperties.value,
       range:
@@ -462,7 +447,6 @@ export function useWeaponForm(
     attackBonus,
     special,
     ammunitionType,
-    mastery,
     distanceUnit,
     sourceKey,
     isSRD,
@@ -481,7 +465,6 @@ export function useWeaponForm(
     baseTypeOptions,
     ammunitionTypeOptions,
     proficiencyModeOptions,
-    masteryOptions,
     sourceOptions,
     saveTypeOptions: SAVE_TYPE_OPTIONS,
     saveEffectOptions: SAVE_EFFECT_OPTIONS,

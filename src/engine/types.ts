@@ -149,8 +149,6 @@ export interface DnDHitPoints {
 export interface DnDProficiencies {
   armor: string[];
   weapons: string[];
-  /** Мастерство оружия (D&D 5.5e Weapon Mastery) — подмножество weapons */
-  weaponMasteries: string[];
   tools: string[];
   languages: string[];
   savingThrows: AbilityType[];

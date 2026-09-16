@@ -4,10 +4,7 @@
   import type { ItemPropertyBadge } from './ItemPropertyBadges.vue';
 
   import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
-  import {
-    getWeaponDamageParts,
-    WEAPON_MASTERY_MAP,
-  } from '@vtt/shared/system/dnd.js';
+  import { getWeaponDamageParts } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
@@ -114,17 +111,6 @@
 
     return map;
   });
-
-  /** Детали оружейного приёма текущего оружия */
-  const masteryDetail = computed(() => {
-    const key = props.item?.mastery;
-
-    if (!key) {
-      return undefined;
-    }
-
-    return WEAPON_MASTERY_MAP.get(key);
-  });
 </script>
 
 <template>
@@ -215,31 +201,6 @@
                       ?? item.ammunitionType
                     }}
                   </p>
-                </div>
-
-                <!-- Приём (Mastery) -->
-                <div v-if="item.mastery && masteryDetail">
-                  <span class="block text-xs text-dimmed">Приём (Mastery)</span>
-
-                  <UPopover
-                    mode="hover"
-                    :ui="{ content: 'max-w-xs p-3' }"
-                  >
-                    <UBadge
-                      color="warning"
-                      variant="subtle"
-                      size="sm"
-                      class="mt-1 cursor-help"
-                    >
-                      {{ masteryDetail.name.ru }} ({{ masteryDetail.name.en }})
-                    </UBadge>
-
-                    <template #content>
-                      <p class="text-xs leading-relaxed text-toned">
-                        {{ masteryDetail.description.ru }}
-                      </p>
-                    </template>
-                  </UPopover>
                 </div>
               </div>
             </div>

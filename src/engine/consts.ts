@@ -472,7 +472,6 @@ export const DEFAULT_ACTOR: Omit<DnDActor, 'id'> = {
       languages: ['Общий'],
       savingThrows: [],
       skills: {},
-      weaponMasteries: [],
     },
 
     currency: {
