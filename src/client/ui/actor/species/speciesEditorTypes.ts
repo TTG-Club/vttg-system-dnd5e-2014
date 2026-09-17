@@ -9,6 +9,7 @@ import type {
   ConditionKey,
   DamageDefenseEntry,
   GrantedSpellRef,
+  SpeciesAbilityGrant,
 } from '@vtt/shared/system/dnd.js';
 
 /** Оси скорости движения, редактируемые у особенности вида. */
@@ -41,6 +42,8 @@ export interface EditableChoice {
   name: string;
   description: string;
   features: EditableFeatureFields[];
+  /** Повышение характеристик подвида — складывается с повышением вида. */
+  abilityGrant: SpeciesAbilityGrant | null;
   /** Защиты от урона, которые даёт этот подвид (как у драконорождённых). */
   damageDefenses: DamageDefenseEntry[];
   /** Иммунитеты к состояниям, которые даёт этот подвид. */

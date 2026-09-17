@@ -1,5 +1,5 @@
 <script setup lang="ts">
-  import type { TypedWebSocketClient } from '@vtt/shared';
+  import type { AbilityType, TypedWebSocketClient } from '@vtt/shared';
   import type { Actor, SpeciesDefinition } from '@vtt/shared/system/dnd.js';
 
   import { computed, toRef, watch } from 'vue';
@@ -9,6 +9,7 @@
 
   import { useSpeciesGrantedSpellsResolver } from '../../../composables/useSpeciesGrantedSpellsResolver';
   import { useSpeciesWizard } from './useSpeciesWizard';
+  import WizardStepAbilities from './WizardStepAbilities.vue';
   import WizardStepFeatures from './WizardStepFeatures.vue';
   import WizardStepGrants from './WizardStepGrants.vue';
   import WizardStepOverview from './WizardStepOverview.vue';
@@ -48,8 +49,20 @@
     canProceed,
     isFinalStep,
     grantedSpellSources,
+    abilityIncreases,
     buildUpdates,
   } = useSpeciesWizard(actorRef, speciesDefRef);
+
+  /**
+   * Записывает выбор характеристик обратно в состояние мастера.
+   *
+   * @param selections - выбор по каждой группе (индекс группы → характеристики)
+   */
+  function handleAbilitySelections(
+    selections: Record<number, AbilityType[]>,
+  ): void {
+    state.value = { ...state.value, abilitySelections: selections };
+  }
 
   /** Granted-заклинания особенностей вида с данными из компендиума (по пакам) */
   const { resolvedGrantedSpells } = useSpeciesGrantedSpellsResolver(
@@ -186,6 +199,13 @@
             v-model:state="state"
             :species-definition="speciesDefinition"
             :granted-spells="resolvedGrantedSpells"
+          />
+
+          <WizardStepAbilities
+            v-if="activeStepKey === 'abilities'"
+            :increases="abilityIncreases"
+            :selections="state.abilitySelections"
+            @update:selections="handleAbilitySelections"
           />
         </div>
       </div>

@@ -1,12 +1,9 @@
 <script setup lang="ts">
-  import type {
-    AbilityType,
-    SkillType,
-    TypedWebSocketClient,
-  } from '@vtt/shared';
+  import type { SkillType, TypedWebSocketClient } from '@vtt/shared';
   import type {
     ActiveEffect,
     BackgroundDefinition,
+    BackgroundPersonality,
     GameItem,
     GrantedSpellRef,
     Spell,
@@ -17,7 +14,6 @@
 
   import { generateId } from '@vtt/shared';
   import {
-    ABILITY_OPTIONS,
     SKILLS_LIST,
     TOOLS_LABELS,
   } from '@vtt/shared/system/dnd.js';
@@ -78,11 +74,6 @@
   const systemDataStore = useSystemDataStore();
   const { openModal, getNextZIndex } = useModalManager();
 
-  const abilitiesOptions = ABILITY_OPTIONS.map((ability) => ({
-    value: ability.value,
-    label: ability.label,
-  }));
-
   const skillsOptions = SKILLS_LIST.map((skill) => ({
     value: skill.key,
     label: skill.label,
@@ -117,8 +108,71 @@
   const sourceKey = ref('local');
   const isSRD = ref(false);
 
-  // Канонические дары предыстории (2024).
-  const selectedAbilities = ref<AbilityType[]>([]);
+  // Канонические дары предыстории.
+  const featureName = ref('');
+  const featureDescription = ref('');
+
+  /** Ключ таблицы характера — он же поле {@link BackgroundPersonality}. */
+  type PersonalityKey = 'traits' | 'ideals' | 'bonds' | 'flaws';
+
+  const personality = ref<Record<PersonalityKey, string[]>>({
+    traits: [],
+    ideals: [],
+    bonds: [],
+    flaws: [],
+  });
+
+  /** Подписи таблиц характера в порядке их вывода. */
+  const PERSONALITY_TABLES: ReadonlyArray<{
+    key: PersonalityKey;
+    label: string;
+  }> = [
+    { key: 'traits', label: 'Черты характера' },
+    { key: 'ideals', label: 'Идеалы' },
+    { key: 'bonds', label: 'Привязанности' },
+    { key: 'flaws', label: 'Слабости' },
+  ];
+
+  /**
+   * Переписывает таблицу характера из текста редактора: строка текста — пункт
+   * таблицы, пустые строки отбрасываются.
+   *
+   * @param key - какая таблица правится
+   * @param raw - содержимое текстового поля
+   */
+  function setPersonalityTable(key: PersonalityKey, raw: string): void {
+    const entries = raw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    personality.value = { ...personality.value, [key]: entries };
+  }
+
+  /**
+   * Собирает таблицы характера для сохранения. Полностью пустой блок не
+   * пишется — чтобы не плодить `{}` у предысторий без таблиц.
+   *
+   * @returns таблицы характера или `undefined`, если не заполнено ничего
+   */
+  function buildPersonality(): BackgroundPersonality | undefined {
+    const filled = PERSONALITY_TABLES.filter(
+      (table) => personality.value[table.key].length > 0,
+    );
+
+    if (filled.length === 0) {
+      return undefined;
+    }
+
+    const result: BackgroundPersonality = {};
+
+    for (const table of filled) {
+      result[table.key] = [...personality.value[table.key]];
+    }
+
+    return result;
+  }
+
   const selectedSkills = ref<SkillType[]>([]);
   const selectedFixedTools = ref<string[]>([]);
   const choicesToolsCount = ref(0);
@@ -249,7 +303,9 @@
     description.value = '';
     sourceKey.value = 'local';
     isSRD.value = false;
-    selectedAbilities.value = [];
+    featureName.value = '';
+    featureDescription.value = '';
+    personality.value = { traits: [], ideals: [], bonds: [], flaws: [] };
     selectedSkills.value = [];
     selectedFixedTools.value = [];
     choicesToolsCount.value = 0;
@@ -270,7 +326,15 @@
     sourceKey.value = bg.sourceKey ?? 'local';
     isSRD.value = bg.isSRD || false;
 
-    selectedAbilities.value = [...(bg.abilityGrant?.abilities ?? [])];
+    featureName.value = bg.feature?.name ?? '';
+    featureDescription.value = bg.feature?.description ?? '';
+    personality.value = {
+      traits: [...(bg.personality?.traits ?? [])],
+      ideals: [...(bg.personality?.ideals ?? [])],
+      bonds: [...(bg.personality?.bonds ?? [])],
+      flaws: [...(bg.personality?.flaws ?? [])],
+    };
+
     selectedSkills.value = [...(bg.skillGrant?.skills ?? [])];
     selectedFixedTools.value = [...(bg.toolGrant?.items ?? [])];
 
@@ -347,12 +411,14 @@
       equipped: false,
       isReadOnly: false,
 
-      abilityGrant: {
-        abilities: [...selectedAbilities.value],
-      },
       skillGrant: {
         skills: [...selectedSkills.value],
       },
+      feature: {
+        name: featureName.value.trim(),
+        description: featureDescription.value.trim(),
+      },
+      personality: buildPersonality(),
       toolGrant: {
         items: [...selectedFixedTools.value],
         choices:
@@ -464,42 +530,80 @@
           </div>
         </template>
 
-        <!-- ПАРАМЕТРЫ (канонические дары 2024) -->
+        <!-- ПАРАМЕТРЫ (канонические дары предыстории) -->
         <template #params>
           <div class="flex flex-col gap-4">
             <FormSection
-              title="Характеристики и навыки"
+              title="Навыки"
+              title-color="healing"
+            >
+              <UFormField label="Навыки (обычно 2)">
+                <USelectMenu
+                  v-model="selectedSkills"
+                  :items="skillsOptions"
+                  value-key="value"
+                  label-key="label"
+                  multiple
+                  class="w-full"
+                  placeholder="Выберите навыки..."
+                />
+              </UFormField>
+
+              <p class="mt-2 text-xs text-dimmed">
+                Характеристики предыстория не повышает — в редакции 2014 это
+                делает вид.
+              </p>
+            </FormSection>
+
+            <FormSection
+              title="Особенность"
+              title-color="healing"
+            >
+              <UFormField label="Название">
+                <UInput
+                  v-model="featureName"
+                  class="w-full"
+                  placeholder="Напр. «Приют верующего»"
+                />
+              </UFormField>
+
+              <UFormField
+                label="Описание"
+                class="mt-2"
+              >
+                <RichTextEditor
+                  v-model="featureDescription"
+                  placeholder="Что даёт особенность..."
+                />
+              </UFormField>
+            </FormSection>
+
+            <FormSection
+              title="Характер"
               title-color="healing"
             >
               <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <UFormField label="Повышение характеристик (обычно 3)">
-                  <USelectMenu
-                    v-model="selectedAbilities"
-                    :items="abilitiesOptions"
-                    value-key="value"
-                    label-key="label"
-                    multiple
+                <UFormField
+                  v-for="table in PERSONALITY_TABLES"
+                  :key="table.key"
+                  :label="table.label"
+                >
+                  <UTextarea
+                    :model-value="personality[table.key].join('\n')"
+                    :rows="4"
+                    autoresize
                     class="w-full"
-                    placeholder="Выберите характеристики..."
-                  />
-                </UFormField>
-
-                <UFormField label="Навыки (обычно 2)">
-                  <USelectMenu
-                    v-model="selectedSkills"
-                    :items="skillsOptions"
-                    value-key="value"
-                    label-key="label"
-                    multiple
-                    class="w-full"
-                    placeholder="Выберите навыки..."
+                    placeholder="По одному пункту в строке"
+                    @update:model-value="
+                      (raw: string) => setPersonalityTable(table.key, raw)
+                    "
                   />
                 </UFormField>
               </div>
 
               <p class="mt-2 text-xs text-dimmed">
-                Игрок распределяет +2/+1 или +1/+1/+1 между этими тремя
-                характеристиками в мастере применения.
+                Каждая строка — отдельный пункт таблицы; нумерация выводится
+                автоматически.
               </p>
             </FormSection>
 

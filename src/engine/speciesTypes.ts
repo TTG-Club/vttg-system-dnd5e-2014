@@ -104,10 +104,39 @@ export interface DarkvisionGrant {
   range: number;
 }
 
+/**
+ * Повышение характеристик, выдаваемое видом или подвидом (редакция 2014).
+ *
+ * В 2014 характеристики поднимает именно вид, а не предыстория: дварф даёт
+ * +2 Телосложения, горный дварф сверху +2 Силы, полуэльф — +2 Харизмы и по +1
+ * к двум характеристикам на выбор. Поэтому нужны обе формы:
+ *
+ * - `fixed` — жёсткие прибавки (`{ constitution: 2 }`);
+ * - `choice` — `+amount` к `count` характеристикам из набора `from`
+ *   (пусто = любая, кроме уже поднятых фиксированно). Выбор делает игрок в
+ *   мастере вида.
+ *
+ * Форма намеренно повторяет {@link FeatAbilityScoreIncrease}: и черта, и вид
+ * решают одну задачу, и редакторы у них общие.
+ */
+export interface SpeciesAbilityGrant {
+  fixed?: Partial<Record<AbilityType, number>>;
+  choice?: {
+    amount: number;
+    count: number;
+    from?: AbilityType[];
+  };
+}
+
 export interface SpeciesFeatureChoice {
   key: string;
   name: string;
   description: string;
+  /**
+   * Повышение характеристик подвида — складывается с повышением основного вида
+   * (холмовой дварф: +2 Телосложения от вида и +1 Мудрости от подвида).
+   */
+  abilityGrant?: SpeciesAbilityGrant;
   /**
    * Особенности, которые даёт этот вариант (подвид) — со своими уровнями,
    * скоростью, тёмным зрением и заклинаниями. Применяются и появляются только
@@ -206,6 +235,12 @@ export interface SpeciesDefinition {
     burrow?: number;
   };
 
+  /**
+   * Повышение характеристик вида. В редакции 2014 его даёт вид, а не
+   * предыстория; подвид может добавить своё (см. `SpeciesFeatureChoice`).
+   */
+  abilityGrant?: SpeciesAbilityGrant;
+
   grants: SpeciesGrant[];
 
   features: SpeciesFeature[];
@@ -218,4 +253,11 @@ export interface ActorSpeciesEntry {
   size: CreatureSize;
   featureChoices: Record<string, string>;
   grantChoices: Record<number, string[]>;
+  /**
+   * Итоговые прибавки характеристик, которые вид применил к актору
+   * (фиксированные вида и подвида плюс выбранные игроком). Хранятся ИМЕННО
+   * применённые значения — чтобы откат при смене вида снимал ровно их, а не
+   * пере-выводил из определения, которое могло измениться.
+   */
+  abilityChoices?: Partial<Record<AbilityType, number>>;
 }

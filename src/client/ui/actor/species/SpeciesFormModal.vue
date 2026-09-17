@@ -10,6 +10,7 @@
     CreatureType,
     DamageDefenseEntry,
     GameItem,
+    SpeciesAbilityGrant,
     SpeciesDefinition,
     SpeciesFeature,
     SpeciesGrant,
@@ -51,6 +52,7 @@
   import FormSection from '../FormSection.vue';
   import { slugify } from '../utils/slugify';
   import DamageDefenseEditor from './DamageDefenseEditor.vue';
+  import SpeciesAbilityGrantFields from './SpeciesAbilityGrantFields.vue';
   import { createEmptyMovement, MOVEMENT_AXES } from './speciesEditorTypes';
   import SpeciesFeatureFields from './SpeciesFeatureFields.vue';
 
@@ -158,6 +160,9 @@
   const isSRD = ref(false);
   const creatureType = ref<CreatureType>('humanoid');
   const selectedSizes = ref<CreatureSize[]>(['medium']);
+
+  /** Повышение характеристик вида (в редакции 2014 его даёт именно вид). */
+  const abilityGrant = ref<SpeciesAbilityGrant | null>(null);
 
   const speedWalk = ref(30);
   const speedFly = ref(0);
@@ -360,6 +365,7 @@
     languageChoiceCount.value = 0;
     languageChoiceFrom.value = [];
     preservedGrants.value = [];
+    abilityGrant.value = null;
     features.value = [];
     isNodeEditorOpen.value = false;
     existingKey.value = null;
@@ -452,6 +458,10 @@
       }
     }
 
+    abilityGrant.value = definition.abilityGrant
+      ? JSON.parse(JSON.stringify(definition.abilityGrant))
+      : null;
+
     features.value = (definition.features ?? []).map((feature) => ({
       ...toEditableFields(feature),
       choices: (feature.choices ?? []).map((choice) => ({
@@ -459,6 +469,9 @@
         name: choice.name || '',
         description: choice.description || '',
         features: (choice.features ?? []).map(toEditableFields),
+        abilityGrant: choice.abilityGrant
+          ? JSON.parse(JSON.stringify(choice.abilityGrant))
+          : null,
         damageDefenses: (choice.damageDefenses ?? []).map((entry) => ({
           ...entry,
         })),
@@ -724,6 +737,7 @@
         name: 'Вариант',
         description: '',
         features: [],
+        abilityGrant: null,
         damageDefenses: [],
         conditionImmunities: [],
       };
@@ -897,6 +911,9 @@
               ...(choiceFeatures.length > 0
                 ? { features: choiceFeatures }
                 : {}),
+              ...(choice.abilityGrant
+                ? { abilityGrant: choice.abilityGrant }
+                : {}),
               ...(choice.damageDefenses.length > 0
                 ? {
                     damageDefenses: choice.damageDefenses.map((entry) => ({
@@ -956,6 +973,7 @@
       creatureType: creatureType.value,
       size: [...selectedSizes.value],
       speed,
+      ...(abilityGrant.value ? { abilityGrant: abilityGrant.value } : {}),
       grants: buildGrants(),
       features: buildFeatures(),
     };
@@ -1185,6 +1203,13 @@
                   />
                 </UFormField>
               </div>
+            </FormSection>
+
+            <FormSection
+              title="Повышение характеристик"
+              title-color="healing"
+            >
+              <SpeciesAbilityGrantFields v-model="abilityGrant" />
             </FormSection>
 
             <FormSection
@@ -1600,6 +1625,15 @@
               :rows="2"
               autoresize
               class="w-full"
+            />
+          </UFormField>
+
+          <UFormField label="Повышение характеристик (этого подвида)">
+            <SpeciesAbilityGrantFields
+              v-model="
+                features[editorFeatureIndex].choices[editorChoiceIndex]
+                  .abilityGrant
+              "
             />
           </UFormField>
 

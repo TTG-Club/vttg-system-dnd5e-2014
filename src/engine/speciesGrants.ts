@@ -1,6 +1,12 @@
-import type { CreatureSize, MovementType } from '@vtt/shared';
+import type { AbilityType, CreatureSize, MovementType } from '@vtt/shared';
 import type { GrantedSpellSource } from './grantedSpells.js';
-import type { SpeciesDefinition, SpeciesFeature } from './speciesTypes.js';
+import type {
+  SpeciesAbilityGrant,
+  SpeciesDefinition,
+  SpeciesFeature,
+} from './speciesTypes.js';
+
+import { typedObjectEntries } from '@vtt/shared';
 
 /**
  * Хелперы расчёта уровне-зависимых даров вида.
@@ -191,6 +197,67 @@ export function collectSpeciesGrantedSpellSources(
   }
 
   return sources;
+}
+
+/**
+ * Повышения характеристик вида, собранные с учётом выбранных подвидов.
+ *
+ * `fixed` уже просуммировано (вид + подвиды), `choices` — оставшиеся выборы
+ * игрока в том порядке, в каком их объявили: сначала вид, потом подвиды.
+ */
+export interface SpeciesAbilityIncreases {
+  fixed: Partial<Record<AbilityType, number>>;
+  choices: NonNullable<SpeciesAbilityGrant['choice']>[];
+}
+
+/**
+ * Собирает повышения характеристик вида и выбранных подвидов.
+ *
+ * Фиксированные прибавки складываются (вид даёт +2 Телосложения, подвид ещё
+ * +1 Мудрости), выборы остаются списком — каждый разрешает игрок отдельно.
+ *
+ * @param definition - определение вида
+ * @param chosenSubspecies - выбранные ключи вариантов-подвидов
+ * @returns просуммированные фиксированные прибавки и список выборов
+ */
+export function collectSpeciesAbilityIncreases(
+  definition: SpeciesDefinition,
+  chosenSubspecies: ReadonlyArray<string>,
+): SpeciesAbilityIncreases {
+  const fixed: Partial<Record<AbilityType, number>> = {};
+  const choices: NonNullable<SpeciesAbilityGrant['choice']>[] = [];
+
+  const addGrant = (grant: SpeciesAbilityGrant | undefined): void => {
+    if (!grant) {
+      return;
+    }
+
+    for (const [ability, bonus] of typedObjectEntries<AbilityType, number>(
+      grant.fixed ?? {},
+    )) {
+      if (!bonus) {
+        continue;
+      }
+
+      fixed[ability] = (fixed[ability] ?? 0) + bonus;
+    }
+
+    if (grant.choice && grant.choice.count > 0) {
+      choices.push(grant.choice);
+    }
+  };
+
+  addGrant(definition.abilityGrant);
+
+  for (const feature of definition.features) {
+    for (const choice of feature.choices ?? []) {
+      if (chosenSubspecies.includes(choice.key)) {
+        addGrant(choice.abilityGrant);
+      }
+    }
+  }
+
+  return { fixed, choices };
 }
 
 /** Карта размера существа в масштаб токена. */

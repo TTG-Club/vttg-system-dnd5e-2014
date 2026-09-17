@@ -1,4 +1,4 @@
-import type { DefensibleDamageType } from '@vtt/shared';
+import type { AbilityType, DefensibleDamageType } from '@vtt/shared';
 import type {
   ActiveEffect,
   Actor,
@@ -7,15 +7,19 @@ import type {
   CreatureSize,
   DamageDefenseEntry,
   DamageDefenseKind,
+  EffectChange,
   EffectFlagKey,
+  EffectTargetKey,
   GrantedSpellSource,
   ResolvedGrantedSpell,
   SpeciesDefinition,
   SpeciesFeature,
 } from '@vtt/shared/system/dnd.js';
 
+import { typedObjectEntries } from '@vtt/shared';
 import {
   appendGrantedSpells,
+  collectSpeciesAbilityIncreases,
   collectSpeciesGrantedSpellSources,
   computeSpeciesDarkvision,
   computeSpeciesMovement,
@@ -32,6 +36,12 @@ export interface SpeciesWizardState {
   selectedSize: CreatureSize | null;
   grantSelections: Record<number, string[]>;
   featureChoices: Record<string, string>;
+  /**
+   * Характеристики, выбранные игроком по каждой группе выбора вида
+   * (`abilityGrant.choice` самого вида и выбранных подвидов) — по индексу
+   * группы в порядке из `collectSpeciesAbilityIncreases`.
+   */
+  abilitySelections: Record<number, AbilityType[]>;
 }
 
 /**
@@ -42,6 +52,64 @@ export interface SpeciesWizardState {
  */
 const SPECIES_DEFENSE_EFFECT_PREFIX = 'species-defenses:';
 const SPECIES_LEGACY_RESISTANCE_EFFECT_PREFIX = 'species-resistance:';
+
+/**
+ * Префикс id эффекта с повышением характеристик вида. Отдельный от защит:
+ * вид может давать одно без другого, и снимать их нужно независимо.
+ */
+const SPECIES_ABILITY_EFFECT_PREFIX = 'species-abilities:';
+
+/** Принадлежит ли эффект повышению характеристик, выданному видом. */
+function isSpeciesAbilityEffect(effect: ActiveEffect): boolean {
+  return effect.id.startsWith(SPECIES_ABILITY_EFFECT_PREFIX);
+}
+
+/**
+ * Собирает эффект с итоговым повышением характеристик вида.
+ *
+ * @param definition - определение вида (для имени и id-провенанса)
+ * @param increases - итоговые прибавки (фиксированные вида и подвидов плюс
+ * выбранные игроком)
+ * @returns эффект вида или `null`, если повышать нечего
+ */
+function buildSpeciesAbilityEffect(
+  definition: SpeciesDefinition,
+  increases: Partial<Record<AbilityType, number>>,
+): ActiveEffect | null {
+  const changes: EffectChange[] = [];
+
+  for (const [ability, bonus] of typedObjectEntries<AbilityType, number>(
+    increases,
+  )) {
+    if (!bonus || bonus <= 0) {
+      continue;
+    }
+
+    changes.push({
+      key: `ability.${ability}` satisfies EffectTargetKey,
+      mode: 'add',
+      value: String(bonus),
+      priority: 10,
+    });
+  }
+
+  if (changes.length === 0) {
+    return null;
+  }
+
+  return {
+    id: `${SPECIES_ABILITY_EFFECT_PREFIX}${definition.key}`,
+    name: `Характеристики вида (${definition.name})`,
+    description: `Повышение характеристик от вида «${definition.name}».`,
+    disabled: false,
+    origin: 'feature',
+    originId: definition.key,
+    transfer: false,
+    duration: { type: 'permanent' },
+    changes,
+    flags: [],
+  };
+}
 
 /** Принадлежит ли эффект защитам, выданным видом (текущий или старый префикс). */
 function isSpeciesDefenseEffect(effect: ActiveEffect): boolean {
@@ -202,6 +270,7 @@ export function useSpeciesWizard(
     selectedSize: null,
     grantSelections: {},
     featureChoices: {},
+    abilitySelections: {},
   });
 
   // Инициализация при смене вида
@@ -213,6 +282,7 @@ export function useSpeciesWizard(
           selectedSize: null,
           grantSelections: {},
           featureChoices: {},
+          abilitySelections: {},
         };
 
         return;
@@ -231,9 +301,52 @@ export function useSpeciesWizard(
         selectedSize: definition.size.length === 1 ? definition.size[0] : null,
         grantSelections,
         featureChoices: {},
+        abilitySelections: {},
       };
     },
     { immediate: true },
+  );
+
+  /**
+   * Повышения характеристик вида с учётом уже выбранных подвидов: смена
+   * подвида меняет и набор выборов, поэтому это computed, а не снимок.
+   */
+  const abilityIncreases = computed(() => {
+    if (!speciesDef.value) {
+      return { fixed: {}, choices: [] };
+    }
+
+    return collectSpeciesAbilityIncreases(
+      speciesDef.value,
+      Object.values(state.value.featureChoices),
+    );
+  });
+
+  /**
+   * Итоговые прибавки: фиксированные вида и подвидов плюс выбранные игроком.
+   * Выбор одной характеристики в нескольких группах суммируется — правила
+   * этого не запрещают, а мастер решает сам.
+   */
+  const resolvedAbilityIncreases = computed(() => {
+    const result: Partial<Record<AbilityType, number>> = {
+      ...abilityIncreases.value.fixed,
+    };
+
+    abilityIncreases.value.choices.forEach((choice, index) => {
+      for (const ability of state.value.abilitySelections[index] ?? []) {
+        result[ability] = (result[ability] ?? 0) + choice.amount;
+      }
+    });
+
+    return result;
+  });
+
+  /** Все ли группы выбора характеристик заполнены до нужного количества. */
+  const abilityChoicesComplete = computed(() =>
+    abilityIncreases.value.choices.every(
+      (choice, index) =>
+        (state.value.abilitySelections[index] ?? []).length === choice.count,
+    ),
   );
 
   const steps = computed(() => {
@@ -280,6 +393,13 @@ export function useSpeciesWizard(
 
     if (hasFeatures || speciesDef.value.features.length > 0) {
       result.push({ key: 'features', title: 'Особенности' });
+    }
+
+    // Шаг характеристик нужен, только когда есть что выбирать: у большинства
+    // видов прибавки фиксированные и показываются на обзоре. Идёт ПОСЛЕ
+    // особенностей — выбор подвида может добавить свою группу выбора.
+    if (abilityIncreases.value.choices.length > 0) {
+      result.push({ key: 'abilities', title: 'Характеристики' });
     }
 
     return result;
@@ -344,6 +464,10 @@ export function useSpeciesWizard(
       );
     }
 
+    if (stepKey === 'abilities') {
+      return abilityChoicesComplete.value;
+    }
+
     return true;
   });
 
@@ -400,6 +524,7 @@ export function useSpeciesWizard(
       size: state.value.selectedSize,
       featureChoices: { ...state.value.featureChoices },
       grantChoices,
+      abilityChoices: { ...resolvedAbilityIncreases.value },
     };
 
     // --- Откат предыдущего вида ---
@@ -764,7 +889,8 @@ export function useSpeciesWizard(
     );
 
     const baseEffects = (actor.value.activeEffects ?? []).filter(
-      (effect) => !isSpeciesDefenseEffect(effect),
+      (effect) =>
+        !isSpeciesDefenseEffect(effect) && !isSpeciesAbilityEffect(effect),
     );
 
     const hasDefenses =
@@ -780,6 +906,15 @@ export function useSpeciesWizard(
           ),
         ]
       : baseEffects;
+
+    const abilityEffect = buildSpeciesAbilityEffect(
+      definition,
+      resolvedAbilityIncreases.value,
+    );
+
+    if (abilityEffect) {
+      updatedEffects.push(abilityEffect);
+    }
 
     const originalEffects = actor.value.activeEffects ?? [];
 
@@ -806,6 +941,8 @@ export function useSpeciesWizard(
     canProceed,
     isFinalStep,
     grantedSpellSources,
+    abilityIncreases,
+    resolvedAbilityIncreases,
     buildUpdates,
   };
 }

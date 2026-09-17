@@ -66,6 +66,24 @@
           </span>
         </div>
       </div>
+
+      <div
+        class="col-span-2 rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5"
+      >
+        <span
+          class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+          >Особенность</span
+        >
+
+        <p class="mt-1 text-sm font-semibold text-highlighted">
+          {{ backgroundDefinition.feature.name }}
+        </p>
+
+        <ItemDescriptionRenderer
+          class="mt-1"
+          :content="backgroundDefinition.feature.description"
+        />
+      </div>
     </div>
   </div>
 </template>

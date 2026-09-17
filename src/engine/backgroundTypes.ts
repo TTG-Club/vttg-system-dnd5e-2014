@@ -1,8 +1,12 @@
 /**
- * Типы данных предысторий D&D 5e (PHB 2024)
+ * Типы данных предысторий D&D 5e (PHB 2014)
  *
  * Определяет структуру данных предыстории в компендиуме (BackgroundDefinition)
  * и запись на акторе (ActorBackgroundEntry).
+ *
+ * Отличие от редакции 2024: предыстория НЕ повышает характеристики (это делает
+ * вид) и не выдаёт черту, зато несёт собственную особенность и таблицы
+ * характера — черты, идеалы, привязанности и слабости.
  */
 
 import type { AbilityType, SkillType } from '@vtt/shared';
@@ -12,10 +16,33 @@ import type { FeatData } from './featTypes.js';
 /** Ключ предыстории (string для поддержки пользовательских предысторий) */
 export type BackgroundKey = string;
 
-/** Грант повышения характеристик предыстории */
-export interface BackgroundAbilityGrant {
-  /** 3 характеристики, между которыми распределяется +2/+1 или +1/+1/+1 */
-  abilities: AbilityType[];
+/**
+ * Особенность предыстории — сюжетная способность без числовой механики
+ * («Приют верующего» у Прислужника). В редакции 2024 особенности у предысторий
+ * нет вовсе, здесь она обязательна.
+ */
+export interface BackgroundFeature {
+  /** Название особенности */
+  name: string;
+  /** Описание (может содержать Markdown) */
+  description: string;
+}
+
+/**
+ * Таблицы характера предыстории: игрок бросает кубик или выбирает строку.
+ *
+ * Механики за ними нет — это опора для отыгрыша, поэтому все списки
+ * необязательны и хранятся как есть, без нумерации: номер строки — её индекс.
+ */
+export interface BackgroundPersonality {
+  /** Черты характера (в PHB — таблица d8) */
+  traits?: string[];
+  /** Идеалы (d6) */
+  ideals?: string[];
+  /** Привязанности (d6) */
+  bonds?: string[];
+  /** Слабости (d6) */
+  flaws?: string[];
 }
 
 /** Грант навыков предыстории */
@@ -57,12 +84,14 @@ export interface BackgroundDefinition {
   /** Принадлежит ли к SRD */
   isSRD?: boolean;
 
-  /** Повышение характеристик */
-  abilityGrant: BackgroundAbilityGrant;
   /** Навыки */
   skillGrant: BackgroundSkillGrant;
   /** Владение инструментами */
   toolGrant: BackgroundToolGrant;
+  /** Особенность предыстории */
+  feature: BackgroundFeature;
+  /** Таблицы характера (черты, идеалы, привязанности, слабости) */
+  personality?: BackgroundPersonality;
   /** Варианты стартового снаряжения */
   equipmentOptions: BackgroundEquipmentOption[];
 
@@ -87,8 +116,6 @@ export interface ActorBackgroundEntry {
   backgroundKey: string;
   /** Русское название */
   backgroundName: string;
-  /** Выбранное распределение характеристик: { strength: 2, wisdom: 1 } */
-  abilityChoices: Partial<Record<AbilityType, number>>;
   /** Навыки, полученные от предыстории */
   skillChoices: SkillType[];
   /** Выбранные инструменты (если был выбор) */

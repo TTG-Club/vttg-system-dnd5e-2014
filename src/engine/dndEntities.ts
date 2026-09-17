@@ -41,8 +41,9 @@ import type {
 } from '@vtt/shared';
 import type { ActiveEffect } from './activeEffectTypes.js';
 import type {
-  BackgroundAbilityGrant,
   BackgroundEquipmentOption,
+  BackgroundFeature,
+  BackgroundPersonality,
   BackgroundSkillGrant,
   BackgroundToolGrant,
 } from './backgroundTypes.js';
@@ -185,12 +186,14 @@ export interface DnDGameItem extends BaseGameItem {
    * английского названия при создании в панели «Предметы».
    */
   key?: string;
-  /** Повышение характеристик от предыстории */
-  abilityGrant?: BackgroundAbilityGrant;
   /** Владение навыками от предыстории */
   skillGrant?: BackgroundSkillGrant;
   /** Владение инструментами от предыстории */
   toolGrant?: BackgroundToolGrant;
+  /** Особенность предыстории */
+  feature?: BackgroundFeature;
+  /** Таблицы характера предыстории */
+  personality?: BackgroundPersonality;
   /** Стартовое снаряжение предыстории */
   equipmentOptions?: BackgroundEquipmentOption[];
   // --- Spell-specific (только для type === 'spell') ---

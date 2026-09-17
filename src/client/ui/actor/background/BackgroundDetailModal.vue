@@ -2,7 +2,6 @@
   import type { BackgroundDefinition } from '@vtt/shared/system/dnd.js';
 
   import {
-    ABILITY_LABELS,
     buildFeatGrantsSummary,
     SKILLS_LABELS,
     TOOLS_LABELS,
@@ -37,15 +36,20 @@
       : undefined,
   );
 
-  /** Список характеристик с русскими названиями */
-  const abilitiesDisplay = computed(() => {
-    if (!data.value?.abilityGrant?.abilities) {
-      return '';
+  /** Непустые таблицы характера — только те, что автор заполнил. */
+  const personalitySections = computed(() => {
+    const personality = data.value?.personality;
+
+    if (!personality) {
+      return [];
     }
 
-    return data.value.abilityGrant.abilities
-      .map((ability) => ABILITY_LABELS[ability] || ability)
-      .join(', ');
+    return [
+      { title: 'Черты характера', entries: personality.traits ?? [] },
+      { title: 'Идеалы', entries: personality.ideals ?? [] },
+      { title: 'Привязанности', entries: personality.bonds ?? [] },
+      { title: 'Слабости', entries: personality.flaws ?? [] },
+    ].filter((section) => section.entries.length > 0);
   });
 
   /** Список навыков с русскими названиями */
@@ -153,22 +157,8 @@
         <!-- Описание -->
         <ItemDescriptionRenderer :content="data.description" />
 
-        <!-- Основные характеристики в виде сетки -->
-        <div class="grid grid-cols-3 gap-2">
-          <!-- Характеристики -->
-          <div
-            class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
-          >
-            <span
-              class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Характеристики</span
-            >
-
-            <p class="mt-0.5 text-sm font-semibold text-highlighted">
-              {{ abilitiesDisplay }}
-            </p>
-          </div>
-
+        <!-- Что даёт предыстория, в виде сетки -->
+        <div class="grid grid-cols-2 gap-2">
           <!-- Навыки -->
           <div
             class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
@@ -201,6 +191,56 @@
           </div>
         </div>
 
+
+        <!-- Особенность предыстории -->
+        <div
+          v-if="data.feature"
+          class="rounded-lg border border-default/50 p-4"
+        >
+          <h3 class="mb-1 text-sm font-semibold tracking-wider text-primary">
+            ОСОБЕННОСТЬ
+          </h3>
+
+          <p class="mb-2 text-sm font-semibold text-highlighted">
+            {{ data.feature.name }}
+          </p>
+
+          <ItemDescriptionRenderer :content="data.feature.description" />
+        </div>
+
+        <!-- Таблицы характера -->
+        <div
+          v-if="personalitySections.length"
+          class="rounded-lg border border-default/50 p-4"
+        >
+          <h3 class="mb-3 text-sm font-semibold tracking-wider text-primary">
+            ХАРАКТЕР
+          </h3>
+
+          <div class="space-y-3">
+            <div
+              v-for="section in personalitySections"
+              :key="section.title"
+            >
+              <span
+                class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+                >{{ section.title }}</span
+              >
+
+              <ol class="mt-1 space-y-0.5">
+                <li
+                  v-for="(entry, idx) in section.entries"
+                  :key="idx"
+                  class="flex gap-2 text-sm text-toned"
+                >
+                  <span class="shrink-0 text-dimmed">{{ idx + 1 }}.</span>
+
+                  <span>{{ entry }}</span>
+                </li>
+              </ol>
+            </div>
+          </div>
+        </div>
 
         <!-- Дополнительные дары (featData / activeEffects) -->
         <div

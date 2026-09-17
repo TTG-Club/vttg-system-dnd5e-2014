@@ -1,11 +1,14 @@
 <script setup lang="ts">
+  import type { AbilityType } from '@vtt/shared';
   import type {
     DamageDefenseKind,
     SpeciesDefinition,
     SpeciesFeatureChoice,
   } from '@vtt/shared/system/dnd.js';
 
+  import { typedObjectEntries } from '@vtt/shared';
   import {
+    ABILITY_LABELS,
     CONDITIONS,
     DAMAGE_DEFENSE_KIND_LABELS,
     DAMAGE_TYPE_LABELS,
@@ -56,6 +59,29 @@
     return props.speciesDefinition.size
       .map((sizeValue) => CREATURE_SIZE_LABELS[sizeValue] || sizeValue)
       .join(' или ');
+  });
+
+  /**
+   * Повышение характеристик вида одной строкой: сначала фиксированные
+   * прибавки, затем выбор («+1 к двум на выбор»). Подвиды сюда не входят — их
+   * прибавки показываются вместе с самим подвидом.
+   */
+  const abilityGrantDisplay = computed(() => {
+    const grant = props.speciesDefinition?.abilityGrant;
+
+    if (!grant) {
+      return '';
+    }
+
+    const parts = typedObjectEntries<AbilityType, number>(grant.fixed ?? {})
+      .filter(([, bonus]) => Boolean(bonus))
+      .map(([ability, bonus]) => `${ABILITY_LABELS[ability] ?? ability} +${bonus}`);
+
+    if (grant.choice && grant.choice.count > 0) {
+      parts.push(`+${grant.choice.amount} к ${grant.choice.count} на выбор`);
+    }
+
+    return parts.join(', ');
   });
 
   const speedDisplay = computed(() => {
@@ -319,6 +345,21 @@
 
                 <p class="mt-0.5 text-sm font-semibold text-highlighted">
                   {{ speedDisplay }}
+                </p>
+              </div>
+
+              <!-- Повышение характеристик -->
+              <div
+                v-if="abilityGrantDisplay"
+                class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
+              >
+                <span
+                  class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+                  >Характеристики</span
+                >
+
+                <p class="mt-0.5 text-sm font-semibold text-highlighted">
+                  {{ abilityGrantDisplay }}
                 </p>
               </div>
 

@@ -18,7 +18,6 @@
     backgroundSpellSource,
     useBackgroundWizard,
   } from './useBackgroundWizard';
-  import WizardStepAbilities from './WizardStepAbilities.vue';
   import WizardStepEquipment from './WizardStepEquipment.vue';
   import WizardStepOverview from './WizardStepOverview.vue';
   import WizardStepTools from './WizardStepTools.vue';
@@ -45,8 +44,6 @@
   // Композабл мастера
   const {
     currentStepInfo,
-    selectedScheme,
-    abilityAllocation,
     toolSelections,
     wizardSteps: wizardStepKeys,
     canProceed,
@@ -63,7 +60,6 @@
     const titles: Record<string, string> = {
       overview: 'Обзор',
       tools: 'Инструменты',
-      abilities: 'Характеристики',
       equipment: 'Снаряжение',
     };
 
@@ -233,16 +229,7 @@
             :background-definition="backgroundDefinition"
           />
 
-          <!-- Шаг 2: Характеристики -->
-          <WizardStepAbilities
-            v-else-if="currentStepInfo.stepGroup === 'abilities'"
-            v-model:selected-scheme="selectedScheme"
-            v-model:ability-allocation="abilityAllocation"
-            :background-definition="backgroundDefinition"
-            :current-abilities="actor.system.abilities"
-          />
-
-          <!-- Шаг 3: Снаряжение -->
+          <!-- Шаг 2: Снаряжение -->
           <WizardStepEquipment
             v-else-if="currentStepInfo.stepGroup === 'equipment'"
             :equipment-options="backgroundDefinition.equipmentOptions"

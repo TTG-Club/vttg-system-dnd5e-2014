@@ -24,11 +24,7 @@ import {
 } from '@vtt/shared/system/dnd.js';
 import { computed, ref, watch } from 'vue';
 
-export type BackgroundWizardStep =
-  | 'overview'
-  | 'tools'
-  | 'abilities'
-  | 'equipment';
+export type BackgroundWizardStep = 'overview' | 'tools' | 'equipment';
 
 /**
  * Имя-источник заклинаний, выданных `featData` предыстории — по нему откат
@@ -90,15 +86,13 @@ export function useBackgroundWizard(
     total: 3,
   });
 
-  const selectedScheme = ref<'+2/+1' | '+1/+1/+1'>('+2/+1');
-  const abilityAllocation = ref<Partial<Record<AbilityType, number>>>({});
   const toolSelections = ref<string[]>([]);
 
   const wizardSteps = computed<BackgroundWizardStep[]>(() => {
     const def = backgroundDefinitionRef.value;
 
     if (!def) {
-      return ['overview', 'abilities', 'equipment'];
+      return ['overview', 'equipment'];
     }
 
     const steps: BackgroundWizardStep[] = ['overview'];
@@ -107,14 +101,12 @@ export function useBackgroundWizard(
       steps.push('tools');
     }
 
-    steps.push('abilities', 'equipment');
+    steps.push('equipment');
 
     return steps;
   });
 
   function resetState() {
-    selectedScheme.value = '+2/+1';
-    abilityAllocation.value = {};
     toolSelections.value = [];
 
     const def = backgroundDefinitionRef.value;
@@ -163,33 +155,6 @@ export function useBackgroundWizard(
 
       if (toolSelections.value.length - fixedCount !== neededCounts) {
         return false;
-      }
-    }
-
-    if (currentStepInfo.value.stepGroup === 'abilities') {
-      const values = Object.values(abilityAllocation.value);
-
-      const totalAllocated = values.reduce(
-        (sum, val) => (sum ?? 0) + (val ?? 0),
-        0,
-      );
-
-      // Для обеих схем в сумме должно быть 3 очка (2+1=3, 1+1+1=3)
-      if (totalAllocated !== 3) {
-        return false;
-      }
-
-      // Проверка структуры: для 2/1 должно быть ровно 2 стата (один 2, другой 1)
-      if (selectedScheme.value === '+2/+1') {
-        const hasTwo = values.includes(2);
-        const hasOne = values.includes(1);
-
-        return hasTwo && hasOne && values.length === 2;
-      }
-
-      // Для 1/1/1 должно быть ровно 3 стата по 1
-      if (selectedScheme.value === '+1/+1/+1') {
-        return values.length === 3 && values.every((value) => value === 1);
       }
     }
 
@@ -306,43 +271,10 @@ export function useBackgroundWizard(
       }
     }
 
-    // 3. Создаём Active Effect для бонусов характеристик от предыстории
-    const abilityChanges: import('@vtt/shared/system/dnd.js').EffectChange[] =
-      [];
-
-    for (const [abilityKey, bonus] of typedObjectEntries<AbilityType, number>(
-      abilityAllocation.value,
-    )) {
-      if (bonus && bonus > 0) {
-        abilityChanges.push({
-          key: `ability.${abilityKey}` as EffectTargetKey,
-          mode: 'add',
-          value: String(bonus),
-          priority: 10,
-        });
-      }
-    }
-
-    if (abilityChanges.length > 0) {
-      baseEffects.push({
-        id: generateId('eff'),
-        name: `Предыстория: ${def.name}`,
-        description: `Бонусы характеристик от предыстории «${def.name}»`,
-        icon: 'tabler:book',
-        disabled: false,
-        origin: 'feature',
-        originId: `background:${def.key}`,
-        transfer: false,
-        duration: { type: 'permanent' },
-        changes: abilityChanges,
-        flags: [],
-      });
-    }
-
-    // 4.5. Применяем СОБСТВЕННЫЕ расширенные дары предыстории (featData):
+    // 3. Применяем СОБСТВЕННЫЕ расширенные дары предыстории (featData):
     // владения, защиты/иммунитеты, тёмное зрение, авторские эффекты — по образцу
-    // черты, но с провенансом background:<key> (характеристики и навыки идут
-    // каноническими полями, поэтому featData ASI/навыков у фона пуст).
+    // черты, но с провенансом background:<key>. Характеристики предыстория в
+    // редакции 2014 не повышает: это делает вид.
     const featData = def.featData ?? null;
 
     const extraSkills = featData?.skillProficiencies ?? [];
@@ -396,7 +328,6 @@ export function useBackgroundWizard(
     const entry: ActorBackgroundEntry = {
       backgroundKey: def.key,
       backgroundName: def.name,
-      abilityChoices: { ...abilityAllocation.value },
       skillChoices: [...def.skillGrant.skills],
       toolChoices: [...toolSelections.value],
     };
@@ -497,8 +428,6 @@ export function useBackgroundWizard(
 
   return {
     currentStepInfo,
-    selectedScheme,
-    abilityAllocation,
     toolSelections,
     wizardSteps,
     canProceed,
