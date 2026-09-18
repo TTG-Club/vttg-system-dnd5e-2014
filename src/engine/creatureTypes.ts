@@ -1,5 +1,5 @@
 /**
- * Типы данных существ (Бестиарий) D&D 5e (2024)
+ * Типы данных существ (Бестиарий) D&D 5e (2014)
  *
  * Creature — отдельная сущность, НЕ наследует DnDActor.
  * Структура оптимизирована для NPC/монстров: КД, передвижение,
@@ -22,7 +22,7 @@ import type { CreatureSize, DnDAbilityScores } from './types.js';
 
 // ── Категория существа ─────────────────────────────────────────────────────
 
-/** Тип существа (D&D 2024 Monster Manual) */
+/** Тип существа (Monster Manual) */
 export type CreatureCategory =
   | 'aberration'
   | 'beast'
