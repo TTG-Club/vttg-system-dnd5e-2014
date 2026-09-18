@@ -26,8 +26,7 @@
   "isSRD": true,
   "classKeys": [
     "bard",
-    "wizard",
-    "rogue"
+    "wizard"
   ],
   "type": "spell",
   "activeEffects": [

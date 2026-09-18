@@ -29,8 +29,7 @@
     "druid",
     "sorcerer",
     "warlock",
-    "wizard",
-    "rogue"
+    "wizard"
   ],
   "type": "spell",
   "activeEffects": [

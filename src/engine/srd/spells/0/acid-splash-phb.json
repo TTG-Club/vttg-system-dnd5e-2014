@@ -30,9 +30,7 @@
   },
   "classKeys": [
     "sorcerer",
-    "wizard",
-    "fighter",
-    "rogue"
+    "wizard"
   ],
   "type": "spell",
   "damageParts": [

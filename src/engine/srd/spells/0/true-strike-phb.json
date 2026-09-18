@@ -9,27 +9,24 @@
   "components": {
     "verbal": false,
     "somatic": true,
-    "material": true,
-    "materialDescription": "оружие, которым у вас есть владение, и которое стоит 1+ зм"
+    "material": false
   },
-  "range": 0,
-  "durationValue": 0,
-  "durationUnit": "instantaneous",
-  "concentration": false,
+  "range": 30,
+  "durationValue": 1,
+  "durationUnit": "round",
+  "concentration": true,
   "ritual": false,
-  "targetType": "self",
-  "deliveryType": "self",
+  "targetType": "creature",
+  "deliveryType": "ranged",
   "saveType": "none",
-  "description": "Ведомый вспышкой магического прозрения, вы совершаете одну атаку с помощью оружия, использованного при наложении заклинания. Для бросков атаки и урона вместо Силы или Ловкости используется ваша заклинательная характеристика. Если атака наносит урон, то он может быть излучением или нормальным типом урона оружия (по вашему выбору).",
+  "description": "Вы протягиваете руку и указываете пальцем на цель в пределах дистанции. Ваша магия дарует вам мимолётное прозрение о защите цели.\n\nВ свой следующий ход вы совершаете с преимуществом первый бросок атаки по этой цели, при условии, что заклинание не закончилось.",
   "sourceKey": "phb",
   "isSRD": true,
   "classKeys": [
     "bard",
     "sorcerer",
     "warlock",
-    "wizard",
-    "fighter",
-    "rogue"
+    "wizard"
   ],
   "type": "spell",
   "damageParts": [],

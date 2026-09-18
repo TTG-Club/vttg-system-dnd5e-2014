@@ -25,8 +25,7 @@
   "isSRD": true,
   "classKeys": [
     "warlock",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell",
   "activeEffects": [

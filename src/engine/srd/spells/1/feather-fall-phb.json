@@ -27,8 +27,7 @@
   "classKeys": [
     "bard",
     "sorcerer",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell",
   "targetCount": 5

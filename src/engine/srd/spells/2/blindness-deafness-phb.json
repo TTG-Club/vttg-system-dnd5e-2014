@@ -80,8 +80,7 @@
     "bard",
     "cleric",
     "sorcerer",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell"
 }

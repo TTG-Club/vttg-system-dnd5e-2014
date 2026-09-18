@@ -28,8 +28,7 @@
     "bard",
     "druid",
     "sorcerer",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell",
   "areaOfEffect": {

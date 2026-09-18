@@ -33,9 +33,7 @@
     "bard",
     "sorcerer",
     "warlock",
-    "wizard",
-    "fighter",
-    "rogue"
+    "wizard"
   ],
   "type": "spell"
 }

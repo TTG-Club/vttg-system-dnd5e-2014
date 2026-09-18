@@ -28,8 +28,7 @@
     "cleric",
     "paladin",
     "warlock",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell"
 }

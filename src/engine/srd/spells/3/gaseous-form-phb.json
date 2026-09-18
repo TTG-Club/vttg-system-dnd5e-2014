@@ -28,8 +28,7 @@
   "classKeys": [
     "sorcerer",
     "warlock",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell"
 }

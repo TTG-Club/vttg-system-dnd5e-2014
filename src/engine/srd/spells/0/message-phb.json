@@ -26,9 +26,7 @@
   "isSRD": true,
   "classKeys": [
     "sorcerer",
-    "wizard",
-    "fighter",
-    "rogue"
+    "wizard"
   ],
   "type": "spell"
 }

@@ -27,8 +27,7 @@
   "classKeys": [
     "druid",
     "sorcerer",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell",
   "activeEffects": [

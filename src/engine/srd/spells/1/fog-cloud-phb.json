@@ -28,8 +28,7 @@
     "druid",
     "ranger",
     "sorcerer",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell"
 }

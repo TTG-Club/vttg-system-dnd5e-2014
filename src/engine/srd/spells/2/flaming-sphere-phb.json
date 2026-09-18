@@ -27,8 +27,7 @@
   "isSRD": true,
   "classKeys": [
     "druid",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell",
   "areaOfEffect": {

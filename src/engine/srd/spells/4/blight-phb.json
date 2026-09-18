@@ -28,8 +28,7 @@
     "druid",
     "sorcerer",
     "warlock",
-    "wizard",
-    "fighter"
+    "wizard"
   ],
   "type": "spell",
   "damageParts": [

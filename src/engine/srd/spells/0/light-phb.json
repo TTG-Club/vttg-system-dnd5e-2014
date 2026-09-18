@@ -27,9 +27,7 @@
     "bard",
     "cleric",
     "sorcerer",
-    "wizard",
-    "fighter",
-    "rogue"
+    "wizard"
   ],
   "type": "spell",
   "rangeUnit": "ft"

@@ -27,8 +27,7 @@
   "classKeys": [
     "bard",
     "sorcerer",
-    "wizard",
-    "rogue"
+    "wizard"
   ],
   "type": "spell",
   "areaOfEffect": {
