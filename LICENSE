@@ -30,17 +30,43 @@ International.
 
 ---
 
-## 2. Код — лицензия пока не определена
+## 2. Код — MIT
 
 Исходный код системы (`src/engine/*.ts`, `src/client/`, `src/server/`,
-`scripts/`, `sdk/`) под открытой лицензией **не выпущен**. Формально это
-означает, что все права на него сохраняются за авторами и разрешения на
-использование, изменение и распространение не предоставляются.
+`scripts/`) распространяется по лицензии MIT.
 
-Это временное состояние: лицензию на код предстоит выбрать до публичного
-релиза. До этого момента репозиторий пригоден для собственного использования и
-разработки, но не для форков и переиспользования кода третьими лицами.
+```
+MIT License
 
-Отдельно: каталог `sdk/` — временная копия нейтрального ядра `@vtt/shared` из
-монорепозитория VTTG, сделанная до публикации SDK-пакета. Его условия
-определяются проектом VTTG, а не этим репозиторием.
+Copyright (c) 2026 TTG Club
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+**MIT покрывает код, но не игровой контент.** Файлы в `src/engine/srd/`
+остаются под CC-BY-4.0 по разделу 1 — форк обязан сохранять атрибуцию SRD 5.1
+независимо от того, что делает с кодом.
+
+---
+
+## 3. Каталог `sdk/` — условия VTTG
+
+`sdk/` — временная копия нейтрального ядра `@vtt/shared` из монорепозитория
+VTTG, сделанная до публикации SDK-пакета. Это не наш код, и условия на него
+определяются проектом VTTG, а не этим репозиторием и не разделом 2.
