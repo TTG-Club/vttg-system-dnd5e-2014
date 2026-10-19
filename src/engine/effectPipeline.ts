@@ -10,15 +10,16 @@
  * значения с учётом всех активных эффектов.
  */
 
+// IncomingAttackContext — нейтральный контрактный тип (system/contracts/combat),
+// D&D его лишь реэкспортит для своих потребителей.
 import type {
   AbilityType,
   DefensibleDamageType,
+  IncomingAttackContext,
   MovementType,
   SkillType,
 } from '@vtt/shared';
-// IncomingAttackContext — нейтральный контрактный тип (system/contracts/combat),
-// D&D его лишь реэкспортит для своих потребителей.
-import type { IncomingAttackContext } from '@vtt/shared';
+
 import type {
   ActiveEffect,
   EffectChange,
@@ -26,81 +27,208 @@ import type {
   EffectFlagKey,
   EffectTargetKey,
   ResolvedActorStats,
+  SenseType,
+  WeaponOverrideEntry,
+  WeaponOverrideKey,
 } from './activeEffectTypes.js';
-import type { Creature, DnDActor, DnDSceneEntity } from './dndEntities.js';
+import type { ArmorConditionKind, CarrierArmorState } from './armorState.js';
+import type { CreatureCategory } from './creatureTypes.js';
+import type { DnDCustomBonusContext } from './customBonuses.js';
+import type {
+  DnDActor,
+  DnDCreature,
+  DnDGameItem,
+  DnDSceneEntity,
+} from './dndEntities.js';
 import type { FormulaContext } from './formulaParser.js';
+import type { DnDProficiencyBonusParams } from './proficiencyBonus.js';
 import type { BonusDamageFormula, TargetHpGate } from './spellUtils.js';
 
-import { isActorEntity, isCreatureEntity } from '@vtt/shared';
-import { isRecord } from '@vtt/shared';
-import { isDnDEffect } from './activeEffectTypes.js';
+import { isCreatureEntity, isRecord } from '@vtt/shared';
+
 import {
+  ABILITY_CHECK_KEY,
+  ATTACK_ABILITY_CONDITION_PREFIX,
+  ATTACKS_AGAINST_KEY,
+  CARRIER_ARMOR_CONDITION_PREFIX,
+  CONCENTRATION_SAVE_KEY,
+  DEATH_SAVE_KEY,
+  DEFAULT_CRIT_THRESHOLD,
+  INCOMING_ATTACKER_IS_SOURCE_CONDITION,
+  INCOMING_ATTACKER_NOT_SOURCE_CONDITION,
+  isCarrierEffect,
+  isEffectDormant,
+  isOffSheetChangeKey,
+  isSenseType,
+  isWeaponOverrideKey,
+  parseWeaponBaseTypeCondition,
+  splitConditionParts,
+  TARGET_ALLY_ADJACENT_CONDITION,
+  TARGET_ALLY_WITH_CONDITION_PREFIX,
+  TARGET_ALLY_WITHOUT_CONDITION_PREFIX,
+  TARGET_ANY_ALLY_ADJACENT_CONDITION,
+  TARGET_IS_SOURCE_CONDITION,
+  TARGET_NOT_SOURCE_CONDITION,
+  WEAPON_DAMAGE_DICE_KEY,
+  WEAPON_PROPERTY_CONDITION_PREFIX,
+} from './activeEffectTypes.js';
+import { isArmorProficient } from './armorProficiency.js';
+import {
+  armorConditionMatches,
+  getCarrierArmorState,
+  isArmorConditionKind,
+} from './armorState.js';
+import {
+  calculateAbilityModifier,
   calculateProficiencyBonus,
   getProficiencyContribution,
   isProficiencyLevel,
 } from './calculations.js';
+import { bindOwnerTokens } from './classEffectScope.js';
 import { getTotalLevel } from './classTypes.js';
-import { BASE_UNARMORED_AC, SKILL_ABILITY_MAP } from './consts.js';
+import { INCAPACITATED_CONDITION_KEY } from './conditionKeys.js';
+import {
+  ABILITY_KEYS,
+  BASE_UNARMORED_AC,
+  isAbilityType,
+  isMovementType,
+  isSkillType,
+  MAX_ROLL_BONUS_DICE,
+  MAX_ROLL_BONUS_DIE_SIDES,
+  MOVEMENT_KEYS,
+  SKILLS_LIST,
+} from './consts.js';
+import {
+  creatureTypeConditionHolds,
+  parseCreatureTypeCondition,
+} from './creatureTypeCondition.js';
+import {
+  resolveEntityCreatureType,
+  resolveEntityExtraCreatureTypes,
+} from './creatureTypeGate.js';
+import {
+  getCustomBonusesValue,
+  parseAbilityBonuses,
+  parseCustomBonuses,
+  parseMovementBonuses,
+} from './customBonuses.js';
 import { DEFENSIBLE_DAMAGE_TYPES } from './damageConstants.js';
 import { collectStaticDamageDefenses } from './damageUtils.js';
-import { buildFormulaContext, evaluateFormula } from './formulaParser.js';
+import { resolveDiceCountExpressions } from './diceCountExpressions.js';
+import { bindLivePaid } from './effectPaidTokens.js';
+import {
+  buildFormulaContext,
+  evaluateFormula,
+  substituteFormulaVariables,
+  withResolvedSheetNumbers,
+} from './formulaParser.js';
+import {
+  isAwaitingAttunement,
+  isItemDepleted,
+  isItemWorn,
+} from './itemUses.js';
+import {
+  DEFAULT_PROFICIENCY_BONUS,
+  getProficiencyBonusBreakdown,
+  parseProficiencySettings,
+} from './proficiencyBonus.js';
+import { saveSourceConditionHolds } from './saveSourceTraits.js';
+import {
+  getSavingThrowSetting,
+  parseSavingThrowSettings,
+} from './savingThrows.js';
+import {
+  getSkillEffectKey,
+  getSkillSetting,
+  getSkillSettingAbility,
+  parseSkillSettings,
+} from './skills.js';
+import { bindSourceFormula } from './sourceFormulaBinding.js';
+import {
+  listEntitySpeciesNames,
+  parseCarrierSpeciesCondition,
+  speciesConditionHolds,
+} from './speciesCondition.js';
+import {
+  getSpellSaveDCBreakdown,
+  parseSpellcastingSettings,
+} from './spellcastingSettings.js';
+import { findSpellcastingAbility } from './spellUtils.js';
+import { resolveTokenDarkvision } from './visionUtils.js';
 
 export type { IncomingAttackContext };
 
 // ── Константы ─────────────────────────────────────────────────
 
-/** Все ключи характеристик в порядке итерации */
-const ABILITY_KEYS: readonly AbilityType[] = [
-  'strength',
-  'dexterity',
-  'constitution',
-  'intelligence',
-  'wisdom',
-  'charisma',
-] as const;
-
 /** Все ключи навыков в порядке итерации */
-const SKILL_KEYS: readonly SkillType[] = [
-  'acrobatics',
-  'animalHandling',
-  'arcana',
-  'athletics',
-  'deception',
-  'history',
-  'insight',
-  'intimidation',
-  'investigation',
-  'medicine',
-  'nature',
-  'perception',
-  'performance',
-  'persuasion',
-  'sleightOfHand',
-  'stealth',
-  'survival',
-  'religion',
-] as const;
-
-/** Все типы движения */
-const MOVEMENT_KEYS: readonly MovementType[] = [
-  'walk',
-  'swim',
-  'fly',
-  'climb',
-  'burrow',
-] as const;
-
-/** Множество ключей характеристик для быстрой проверки принадлежности. */
-const ABILITY_KEY_SET = new Set<string>(ABILITY_KEYS);
+const SKILL_KEYS: readonly SkillType[] = SKILLS_LIST.map((skill) => skill.key);
 
 /**
- * Type-guard: значение — допустимый ключ характеристики (`AbilityType`).
- *
- * @param value - проверяемое значение
- * @returns true, если value входит в набор характеристик
+ * Приставка строки, меняющей саму характеристику: такие строки считаются
+ * первым проходом, от сырых чисел
  */
-function isAbilityType(value: unknown): value is AbilityType {
-  return typeof value === 'string' && ABILITY_KEY_SET.has(value);
+const ABILITY_CHANGE_PREFIX = 'ability.';
+
+/** Вид атаки/урона, к которому эффект даёт бонус */
+type BonusScope = keyof ResolvedActorStats['attackBonuses'];
+
+/** Все виды атаки/урона */
+const BONUS_SCOPES: readonly BonusScope[] = ['melee', 'ranged', 'spell'];
+
+/** Множество видов атаки/урона для быстрой проверки принадлежности */
+const BONUS_SCOPE_SET: ReadonlySet<string> = new Set(BONUS_SCOPES);
+
+/**
+ * Ключи, чьё число лист считает по правилам только в Фазе 3 (КД, инициатива,
+ * бонус мастерства, Сл заклинаний; спасброски и навыки — по префиксу).
+ *
+ * В Фазе 2 такого числа ещё нет: поле там нулевой накопитель. Применять к нему
+ * `override`/`upgrade`/`downgrade`/`multiply` нельзя — они сравнивались бы с
+ * нулём вместо настоящего значения листа («повысить спасбросок до +5» понижал
+ * бы +9 до +5, а «умножить» всегда давало бы 0). Поэтому Фаза 2 такие
+ * изменения пропускает, а Фаза 3 применяет их поверх посчитанного по правилам.
+ */
+const DERIVED_TARGET_KEYS: ReadonlySet<string> = new Set([
+  ABILITY_CHECK_KEY,
+  DEATH_SAVE_KEY,
+  'armorClass',
+  'initiative',
+  'proficiencyBonus',
+  'spellSaveDC',
+]);
+
+/** Префиксы производных ключей: у спасбросков и навыков их по шесть и восемнадцать */
+const DERIVED_TARGET_PREFIXES: readonly string[] = ['save.', 'skill.'];
+
+/**
+ * Производный ли ключ, то есть считается ли он по правилам в Фазе 3.
+ *
+ * @param targetKey - ключ изменения эффекта
+ * @returns `true`, если изменение нужно применять после расчёта по правилам
+ */
+function isDerivedTargetKey(targetKey: string): boolean {
+  return (
+    DERIVED_TARGET_KEYS.has(targetKey)
+    || DERIVED_TARGET_PREFIXES.some((prefix) => targetKey.startsWith(prefix))
+  );
+}
+
+/**
+ * Изменения производных ключей, сгруппированные по ключу и упорядоченные по
+ * приоритету внутри каждого ключа.
+ */
+export type DerivedChangeMap = ReadonlyMap<string, readonly EffectChange[]>;
+
+/**
+ * Type-guard: строка — вид атаки/урона (`melee` / `ranged` / `spell`).
+ * Нужен при разборе ключей эффектов вида `attack.melee`: хвост ключа приходит
+ * из записи мира, и чужое слово не должно попасть в бонусы.
+ *
+ * @param value - хвост ключа эффекта
+ * @returns `true`, если это известный вид атаки/урона
+ */
+function isBonusScope(value: string): value is BonusScope {
+  return BONUS_SCOPE_SET.has(value);
 }
 
 /**
@@ -124,6 +252,86 @@ function resolveHitPointsMax(hitPoints: unknown): number {
   return 10;
 }
 
+/**
+ * Нулевая заготовка значений по характеристикам.
+ * Явный литерал, а не сборка по списку ключей: только он доказывает типу, что
+ * запись заполнена целиком (у собранной из пар запись остаётся неполной).
+ *
+ * @returns запись «характеристика → 0»
+ */
+function createEmptyAbilityRecord(): Record<AbilityType, number> {
+  return {
+    strength: 0,
+    dexterity: 0,
+    constitution: 0,
+    intelligence: 0,
+    wisdom: 0,
+    charisma: 0,
+  };
+}
+
+/**
+ * Нулевая заготовка значений по навыкам.
+ *
+ * @returns запись «навык → 0»
+ */
+function createEmptySkillRecord(): Record<SkillType, number> {
+  return {
+    acrobatics: 0,
+    animalHandling: 0,
+    arcana: 0,
+    athletics: 0,
+    deception: 0,
+    history: 0,
+    insight: 0,
+    intimidation: 0,
+    investigation: 0,
+    medicine: 0,
+    nature: 0,
+    perception: 0,
+    performance: 0,
+    persuasion: 0,
+    religion: 0,
+    sleightOfHand: 0,
+    stealth: 0,
+    survival: 0,
+  };
+}
+
+/**
+ * Нулевая заготовка скоростей по типам движения.
+ *
+ * @returns запись «тип движения → 0»
+ */
+function createEmptyMovementRecord(): Record<MovementType, number> {
+  return { walk: 0, swim: 0, fly: 0, climb: 0, burrow: 0 };
+}
+
+/**
+ * Заготовка дальностей чувств.
+ *
+ * Числового поля чувств у сущности нет — дальность приходит эффектами
+ * (`sense.*`). Исключение — тёмное зрение: база берётся с зрения токена, чтобы
+ * «Добавить 60» складывалось с тёмным зрением вида.
+ *
+ * @param actor - сущность
+ * @returns запись «вид чувства → база»
+ */
+function createBaseSenseRecord(
+  actor: DnDActor | DnDCreature,
+): Record<SenseType, number> {
+  return {
+    // Тёмное зрение токена дали вид, класс или черта; от него считается
+    // `sense.darkvision` режимом «Добавить» — «если тёмное зрение уже есть, его
+    // дальность растёт на 60 футов, иначе появляется тёмное зрение 60 футов»
+    darkvision: resolveTokenDarkvision(actor.token),
+    blindsight: 0,
+    truesight: 0,
+    tremorsense: 0,
+    telepathy: 0,
+  };
+}
+
 // ── Фаза 1: prepareBaseData ───────────────────────────────────
 
 /**
@@ -136,29 +344,16 @@ function resolveHitPointsMax(hitPoints: unknown): number {
  * @returns начальные базовые статы
  */
 export function prepareBaseData(
-  actor: DnDActor | Creature,
+  actor: DnDActor | DnDCreature,
 ): ResolvedActorStats {
   const system = actor.system;
 
-  const abilities = Object.fromEntries(
-    ABILITY_KEYS.map((key) => [key, 0]),
-  ) as Record<AbilityType, number>;
-
-  const abilityMods = Object.fromEntries(
-    ABILITY_KEYS.map((key) => [key, 0]),
-  ) as Record<AbilityType, number>;
-
-  const saves = Object.fromEntries(
-    ABILITY_KEYS.map((key) => [key, 0]),
-  ) as Record<AbilityType, number>;
-
-  const skills = Object.fromEntries(
-    SKILL_KEYS.map((key) => [key, 0]),
-  ) as Record<SkillType, number>;
-
-  const movement = Object.fromEntries(
-    MOVEMENT_KEYS.map((key) => [key, 0]),
-  ) as Record<MovementType, number>;
+  const abilities = createEmptyAbilityRecord();
+  const abilityMods = createEmptyAbilityRecord();
+  const saves = createEmptyAbilityRecord();
+  const skills = createEmptySkillRecord();
+  const movement = createEmptyMovementRecord();
+  const senses = createBaseSenseRecord(actor);
 
   // Характеристики
   for (const abilityKey of ABILITY_KEYS) {
@@ -186,13 +381,21 @@ export function prepareBaseData(
     abilityMods,
     saves,
     skills,
+    // Заполняются в prepareDerivedData: база у них — ноль
+    abilityCheckBonus: 0,
+    concentrationSaveBonus: 0,
+    deathSaveBonus: 0,
     armorClass: system.armorClass?.value ?? BASE_UNARMORED_AC,
     initiative: 0,
     proficiencyBonus: 0,
     movement,
+    senses,
     hitPointsMax: resolveHitPointsMax(system.hitPoints),
+    critThreshold: DEFAULT_CRIT_THRESHOLD,
     attackBonuses: { melee: 0, ranged: 0, spell: 0 },
     damageBonuses: { melee: 0, ranged: 0, spell: 0 },
+    abilityDamageBonuses: { melee: {}, ranged: {} },
+    weaponOverrides: [],
     spellSaveDC: 0,
     activeFlags: new Set<EffectFlagKey>(),
     damageDefenses: {
@@ -201,127 +404,306 @@ export function prepareBaseData(
       vulnerabilities: new Set<DefensibleDamageType>(),
     },
     overriddenKeys: new Set<string>(),
+    // Заполняется в prepareDerivedData: здесь модификаторов ещё нет
+    abilityBonusContext: {
+      abilityMods: createEmptyAbilityRecord(),
+      proficiencyBonus: 0,
+    },
   };
 }
 
 // ── Сбор эффектов ─────────────────────────────────────────────
 
 /**
+ * Работают ли свойства предмета прямо сейчас.
+ *
+ * Предмет должен быть надет и не закончиться (см. {@link isItemWorn}) — либо,
+ * если его магия работает «при себе» (`activeWhenCarried`), просто лежать в
+ * инвентаре и не закончиться, — а
+ * предмет с обязательной настройкой — ещё и настроен: по правилам 2024 без настройки магия такого предмета не действует.
+ * Необязательная настройка (`optional`) ничего не гейтит — предмет работает и
+ * без неё, настройка лишь добавляет свойства, описанные текстом.
+ *
+ * Строка снаряжения на листе про это уже предупреждает значком «Нужна
+ * настройка», см. `EQUIPMENT_BADGE_HINTS.attunementRequired`.
+ *
+ * @param item - предмет инвентаря
+ */
+export function itemEffectsActive(item: DnDGameItem): boolean {
+  const present = item.activeWhenCarried
+    ? !isItemDepleted(item)
+    : isItemWorn(item);
+
+  if (!present) {
+    return false;
+  }
+
+  return !isAwaitingAttunement(item);
+}
+
+/** Вид записи, от которой эффект достался носителю */
+export type CarriedEffectSourceKind = 'item' | 'trait';
+
+/** Эффект вложенной записи, действующий на носителя, и его источник */
+export interface CarriedEffectEntry {
+  /** Эффект записи */
+  effect: ActiveEffect;
+  /** Название записи-источника */
+  sourceName: string;
+  /** Вид записи-источника */
+  sourceKind: CarriedEffectSourceKind;
+}
+
+/**
+ * Эффекты вложенных записей, которые действуют на носителя: работающих
+ * предметов (см. {@link itemEffectsActive}) и черт существа. Черта часть
+ * эффектов адресует чужому — их отсекает {@link affectsCarrier}. Без этого
+ * мимик хватал сам себя: флаг `speed.zero` обнулял ему скорость, и ядро
+ * отказывалось двигать токен, хотя на листе стоит 20 фт.
+ *
+ * Эффекты действий существа сюда не входят: они ложатся на цель при
+ * использовании действия, а не на само существо.
+ *
+ * @param entity - носитель
+ * @returns эффекты с источниками: сначала предметы, затем черты
+ */
+export function listCarriedEffectEntries(
+  entity: DnDSceneEntity,
+): CarriedEffectEntry[] {
+  const items = (entity.equipment ?? [])
+    .filter(itemEffectsActive)
+    .flatMap((item) =>
+      (item.activeEffects ?? [])
+        .filter(affectsCarrier)
+        .map((effect): CarriedEffectEntry => ({
+          // Предмет помнится в самом эффекте: по нему «только этим предметом»
+          // достаётся нужному оружию, а не всем атакам носителя
+          effect: item.id ? { ...effect, carriedItemId: item.id } : effect,
+          sourceName: item.name,
+          sourceKind: 'item',
+        })),
+    );
+
+  if (!isCreatureEntity(entity)) {
+    return items;
+  }
+
+  const traits = (entity.system.traits ?? []).flatMap((trait) =>
+    (trait.activeEffects ?? [])
+      .filter(affectsCarrier)
+      .map((effect): CarriedEffectEntry => ({
+        effect,
+        sourceName: trait.name,
+        sourceKind: 'trait',
+      })),
+  );
+
+  return [...items, ...traits];
+}
+
+/**
+ * Эффекты вложенных записей одного вида, действующие на носителя.
+ *
+ * @param entity - носитель
+ * @param sourceKind - вид записи
+ * @returns эффекты
+ */
+function listCarriedEffectsOf(
+  entity: DnDSceneEntity,
+  sourceKind: CarriedEffectSourceKind,
+): ActiveEffect[] {
+  return listCarriedEffectEntries(entity)
+    .filter((entry) => entry.sourceKind === sourceKind)
+    .map((entry) => entry.effect);
+}
+
+/**
+ * Эффекты работающих предметов носителя, которые действуют на него самого.
+ *
+ * @param entity - носитель
+ * @returns эффекты предметов
+ */
+export function listEquippedItemEffects(
+  entity: DnDSceneEntity,
+): ActiveEffect[] {
+  return listCarriedEffectsOf(entity, 'item');
+}
+
+/**
+ * Эффекты черт существа, действующие на само существо: их урон, лечение и
+ * наложения срабатывают на его ходу («Регенерация» чертой статблока).
+ *
+ * @param entity - носитель
+ * @returns эффекты черт
+ */
+export function listTraitEffects(entity: DnDSceneEntity): ActiveEffect[] {
+  return listCarriedEffectsOf(entity, 'trait');
+}
+
+/**
+ * Действует ли эффект вложенной записи — предмета или черты — на её носителя.
+ *
+ * Такая запись описывает не только своего хозяина. Эффект с
+ * `effectTarget: 'target'` адресован тому, по кому запись применили: «Липкий»
+ * мимика и «Похищение» багбира говорят про Схваченного — того, кто прилип или
+ * кого тащат. Аура без `applyToSelf` излучается наружу и хозяина не задевает.
+ * Носителю достаётся лишь то, что не отсеяно этими правилами и не выключено
+ * тумблером «Отключен».
+ *
+ * Собственные эффекты актора через эту проверку НЕ проходят — см. комментарий
+ * в {@link collectActiveEffects}.
+ *
+ * @param effect - эффект предмета или черты
+ * @returns `true`, если эффект применяется к носителю записи
+ */
+function affectsCarrier(effect: ActiveEffect): boolean {
+  if (isEffectDormant(effect)) {
+    return false;
+  }
+
+  // «На цели» адресован тому, по кому попали, «в зону» — стоящим в зоне
+  // заклинания: носителю ни тот, ни другой не достаётся
+  if (!isCarrierEffect(effect)) {
+    return false;
+  }
+
+  if (effect.aura && !effect.aura.applyToSelf) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Собирает все активные эффекты актора.
  *
  * Включает:
  * 1. Эффекты напрямую на акторе (actor.activeEffects)
- * 2. Эффекты с экипированных предметов (transfer === true && equipped)
+ * 2. Эффекты с работающих предметов (см. {@link itemEffectsActive})
+ * 3. Пассивные эффекты черт существа (creature.system.traits)
  *
- * Исключает отключённые (disabled === true).
+ * Исключает отключённые (disabled === true), а у вложенных записей — ещё и
+ * чужие (см. {@link affectsCarrier}).
  *
  * @param actor - объект DnDActor | Creature
  * @returns массив активных эффектов (immutable)
  */
 export function collectActiveEffects(
-  actor: DnDActor | Creature,
+  actor: DnDActor | DnDCreature,
 ): readonly ActiveEffect[] {
   const collectedEffects: ActiveEffect[] = [];
 
-  // Эффекты на самом акторе
+  // Эффекты на самом акторе. `affectsCarrier` здесь НЕ применяется: пометка
+  // `effectTarget: 'target'` у наложенного состояния сохраняется и после
+  // наложения (см. `buildEffectForTarget`), то есть на цели она говорит о
+  // происхождении, а не о чужом адресате. Отсев по ней снял бы с цели всё, что
+  // на неё навесили, — отравление, паралич, испуг.
   const actorEffects = actor.activeEffects ?? [];
 
   for (const effect of actorEffects) {
-    if (!effect.disabled) {
+    if (!isEffectDormant(effect)) {
       if (effect.aura && !effect.aura.applyToSelf) {
         continue; // Эффект-аура генерируется, но на самого себя не действует
       }
 
-      collectedEffects.push(effect);
+      // Потраченное при включении (`@paid.*`) — в формулы включённого
+      // переключателя; у эффекта без оплаты это тот же объект
+      collectedEffects.push(bindLivePaid(effect));
     }
   }
 
-  // Transferred-эффекты с экипированных предметов (только для DnDActor)
-  if ('equipment' in actor) {
-    const equipment = (actor as DnDActor).equipment ?? [];
+  // Эффекты работающих предметов (свойство transfer больше не требуется) и
+  // пассивные эффекты черт существа
+  collectedEffects.push(
+    ...listCarriedEffectEntries(actor).map((entry) => entry.effect),
+  );
 
-    for (const item of equipment) {
-      if (!item.equipped || !item.activeEffects) {
-        continue;
-      }
+  // Уровень своего класса и выборы листа — в формулы и условия. Здесь, в единственной
+  // точке сбора: дальше эффекты расходятся по статам листа, бонус-частям урона
+  // и подписям, и подставлять число у каждого потребителя пришлось бы заново
+  return bindOwnerTokens(dropSuppressedConditions(collectedEffects), actor);
+}
 
-      for (const itemEffect of item.activeEffects.filter(isDnDEffect)) {
-        // Игнорируем отключенные эффекты, свойство transfer больше не требуется (все эффекты предметов переносятся)
-        if (!itemEffect.disabled) {
-          // Эффекты, предназначенные для цели атаки, не применяются к владельцу при экипировке
-          if (itemEffect.effectTarget === 'target') {
-            continue;
-          }
+/**
+ * Состояния, подавленные эффектами носителя: «Свобода перемещения» не снимает
+ * Опутанного, а гасит его, и после снятия свободы состояние снова действует.
+ *
+ * @param effects - действующие эффекты носителя
+ * @returns ключи подавленных состояний
+ */
+export function listSuppressedConditions(
+  effects: readonly ActiveEffect[],
+): Set<string> {
+  const suppressed = new Set<string>();
 
-          if (itemEffect.aura && !itemEffect.aura.applyToSelf) {
-            continue; // Эффект-аура экипировки генерируется, но на самого себя не действует
-          }
-
-          collectedEffects.push(itemEffect);
-        }
-      }
+  for (const effect of effects) {
+    for (const key of effect.suppressConditions ?? []) {
+      suppressed.add(key);
     }
   }
 
-  // Эффекты от черт существа (только для Creature).
-  // Черты (traits) содержат пассивные эффекты, постоянно действующие на само существо
-  // (например, «Магическое сопротивление»).
-  // Эффекты из actions/bonusActions/reactions/legendary.actions НЕ собираются здесь —
-  // они предназначены для применения к целям при использовании действия,
-  // а не к самому существу.
-  if (isCreatureEntity(actor)) {
-    for (const trait of actor.system.traits ?? []) {
-      if (!trait.activeEffects) {
-        continue;
-      }
+  return suppressed;
+}
 
-      for (const traitEffect of trait.activeEffects) {
-        if (!traitEffect.disabled) {
-          if (traitEffect.aura && !traitEffect.aura.applyToSelf) {
-            continue;
-          }
+/**
+ * Убирает из списка эффекты подавленных состояний. Сам эффект остаётся на
+ * носителе — он просто не действует, поэтому подавление обратимо.
+ *
+ * @param effects - собранные эффекты
+ * @returns эффекты без подавленных состояний
+ */
+function dropSuppressedConditions(
+  effects: readonly ActiveEffect[],
+): ActiveEffect[] {
+  const suppressed = listSuppressedConditions(effects);
 
-          collectedEffects.push(traitEffect);
-        }
-      }
-    }
+  if (suppressed.size === 0) {
+    return [...effects];
   }
 
-  return collectedEffects;
+  return effects.filter(
+    (effect) =>
+      effect.conditionKey === undefined || !suppressed.has(effect.conditionKey),
+  );
 }
 
 // ── Фаза 2: applyActiveEffects ────────────────────────────────
 
 /**
- * Применяет числовые changes и собирает булевые flags из эффектов.
+ * Применяет числовые changes базовых ключей и собирает булевые flags из эффектов.
  *
  * Шаги:
- * 1. Собирает все changes из всех эффектов
+ * 1. Собирает changes базовых ключей из всех эффектов
  * 2. Сортирует по priority (меньше = раньше)
  * 3. Применяет каждый change к соответствующему полю baseStats
  * 4. Собирает все flags в Set
+ *
+ * Изменения производных ключей (см. {@link isDerivedTargetKey}) здесь
+ * пропускаются: их применяет Фаза 3 поверх посчитанного по правилам числа.
  *
  * Результат — IMMUTABLE: возвращает новый объект, не мутирует baseStats.
  *
  * @param baseStats - базовые статы из prepareBaseData
  * @param effects - массив активных эффектов
  * @param formulaContext - контекст для вычисления формул
+ * @param carrier - свойства носителя для условий семейства `self.*`
  * @returns модифицированные статы
  */
 export function applyActiveEffects(
   baseStats: ResolvedActorStats,
   effects: readonly ActiveEffect[],
   formulaContext: FormulaContext,
+  carrier?: CarrierContext,
 ): ResolvedActorStats {
   // Клонируем baseStats (immutable transforms)
   const modifiedStats = cloneResolvedStats(baseStats);
 
   // Собираем все changes и сортируем по priority
-  const allChanges: Array<{ change: EffectChange; effectName: string }> = [];
+  const allChanges: Array<{ change: EffectChange; effect: ActiveEffect }> = [];
 
   for (const effect of effects) {
     for (const change of effect.changes) {
-      allChanges.push({ change, effectName: effect.name });
+      allChanges.push({ change, effect });
     }
 
     // Собираем flags
@@ -335,25 +717,226 @@ export function applyActiveEffects(
     (itemA, itemB) => itemA.change.priority - itemB.change.priority,
   );
 
-  // Применяем каждый change (без условий — условные бонусы оцениваются в момент броска)
-  for (const { change } of allChanges) {
-    if (change.condition) {
+  // Два прохода. Изменения самих характеристик (`ability.*`) считаются от
+  // сырых чисел — здесь круг размыкается: «Сила += мод. Мудрости» и «Мудрость
+  // += мод. Силы» не зависят друг от друга. Всё остальное — от характеристик
+  // уже с этими изменениями: «+мод. Харизмы» у поднятой чертой Харизмы
+  // читает то число, что показывает лист
+  const isAbilityChange = (key: string): boolean =>
+    key.startsWith(ABILITY_CHANGE_PREFIX)
+    && isAbilityType(key.slice(ABILITY_CHANGE_PREFIX.length));
+
+  applyChangesPass(
+    modifiedStats,
+    allChanges.filter(({ change }) => isAbilityChange(change.key)),
+    formulaContext,
+    carrier,
+  );
+
+  refreshAbilityModifiers(modifiedStats);
+
+  applyChangesPass(
+    modifiedStats,
+    allChanges.filter(({ change }) => !isAbilityChange(change.key)),
+    // Бонус мастерства здесь ещё листа (его итог — в Фазе 3)
+    withResolvedSheetNumbers(formulaContext, {
+      abilities: modifiedStats.abilities,
+      abilityMods: modifiedStats.abilityMods,
+      proficiencyBonus: formulaContext.prof,
+    }),
+    carrier,
+  );
+
+  return modifiedStats;
+}
+
+/**
+ * Один проход строк эффектов по статам листа.
+ *
+ * @param modifiedStats - статы (меняются на месте: это клон этого расчёта)
+ * @param changes - строки прохода в порядке приоритета
+ * @param formulaContext - числа, от которых считаются формулы прохода
+ * @param carrier - свойства носителя для условий семейства `self.*`
+ */
+function applyChangesPass(
+  modifiedStats: ResolvedActorStats,
+  changes: ReadonlyArray<{ change: EffectChange; effect: ActiveEffect }>,
+  formulaContext: FormulaContext,
+  carrier: CarrierContext | undefined,
+): void {
+  // Применяем каждый change. Условия броска (преимущество, хиты цели, вид
+  // входящей атаки) на листе не считаются — их оценивают в момент броска;
+  // условие по типу носителя, наоборот, считается здесь: тип от броска не зависит
+  for (const { change, effect } of changes) {
+    // Замена свойства оружия — не число: каждое оружие выберет свою сам
+    if (isWeaponOverrideKey(change.key)) {
+      const entry = buildWeaponOverrideEntry(
+        change.key,
+        change,
+        effect,
+        formulaContext,
+      );
+
+      if (entry) {
+        modifiedStats.weaponOverrides.push(entry);
+      }
+
       continue;
     }
 
-    // Кость-формулы в damage.* — бонус-части урона, катаются отдельным броском
-    // в момент атаки (collectBonusDamageFormulas), в плоские статы не входят.
-    if (change.key.startsWith('damage.') && isDiceFormulaValue(change.value)) {
+    // Бонус урона «при атаке Силой» — число листа, но своё у каждого оружия:
+    // копится по характеристике, оружие берёт его в разборе своего урона
+    const abilityScope = readAbilityDamageScope(change);
+
+    if (abilityScope) {
+      addAbilityDamageBonus(
+        modifiedStats,
+        abilityScope,
+        change,
+        formulaContext,
+      );
+
+      continue;
+    }
+
+    if (skipChangeOnSheet(change, carrier)) {
+      continue;
+    }
+
+    // Строки события (временные хиты, досягаемость, тип урона заклинаний)
+    // считаются не на листе
+    if (isOffSheetChangeKey(change.key)) {
+      continue;
+    }
+
+    // Производные ключи считаются по правилам только в Фазе 3 — она их и применит
+    if (isDerivedTargetKey(change.key)) {
+      continue;
+    }
+
+    // Кубиковые бонусы считаются только при броске, а не при чтении листа.
+    if (isRollTimeDiceChange(change)) {
       continue;
     }
 
     applyChange(modifiedStats, change, formulaContext);
   }
+}
 
-  return modifiedStats;
+/**
+ * Запись замены свойства оружия из строки `weapon.*`.
+ *
+ * Условие у такой строки допустимо только по виду оружия: оружие листа
+ * сверяется с ним само, а другие условия (бросок, цель) замене кости не
+ * подходят — строка с ними не применяется, как и любое непонятое условие.
+ * Несколько частей `&&` оставляют виды, названные во всех.
+ *
+ * Кость считается числами носителя здесь же: `@level` в ней — уровень того,
+ * кто бьёт. Эффект заклинания приходит уже с числами заклинателя (их
+ * подставляют при сотворении), и тогда подставлять нечего.
+ *
+ * @param key - ключ замены
+ * @param change - строка эффекта
+ * @param effect - эффект строки
+ * @param formulaContext - числа носителя
+ * @returns запись либо `undefined`, если строка неприменима
+ */
+function buildWeaponOverrideEntry(
+  key: WeaponOverrideKey,
+  change: EffectChange,
+  effect: ActiveEffect,
+  formulaContext: FormulaContext,
+): WeaponOverrideEntry | undefined {
+  const rawValue = change.value.trim();
+
+  const value =
+    key === WEAPON_DAMAGE_DICE_KEY
+      ? resolveDiceCountExpressions(bindSourceFormula(rawValue, formulaContext))
+      : rawValue;
+
+  if (!value) {
+    return undefined;
+  }
+
+  let baseTypes: string[] | undefined;
+
+  for (const part of splitConditionParts(change.condition ?? '')) {
+    const partTypes = parseWeaponBaseTypeCondition(part);
+
+    if (!partTypes) {
+      return undefined;
+    }
+
+    baseTypes = baseTypes
+      ? baseTypes.filter((baseType) => partTypes.includes(baseType))
+      : partTypes;
+  }
+
+  return {
+    key,
+    value,
+    baseTypes,
+    itemId: effect.carriedItemId,
+    priority: change.priority,
+    sourceName: effect.name,
+  };
+}
+
+/**
+ * Собирает безусловные изменения производных ключей, сгруппировав их по ключу
+ * и упорядочив по приоритету.
+ *
+ * Фаза 3 берёт из этой карты изменения ровно того числа, которое только что
+ * посчитала по правилам, и применяет их поверх — так режимы «заменить»,
+ * «повысить до», «понизить до» и «умножить» сравниваются с настоящим значением
+ * листа, а не с нулевым накопителем Фазы 2.
+ *
+ * @param effects - массив активных эффектов
+ * @param carrier - свойства носителя для условий семейства `self.*`
+ * @returns изменения производных ключей по ключу
+ */
+export function collectDerivedChanges(
+  effects: readonly ActiveEffect[],
+  carrier?: CarrierContext,
+): DerivedChangeMap {
+  const grouped = new Map<string, EffectChange[]>();
+
+  for (const effect of effects) {
+    for (const change of effect.changes) {
+      // Условия броска оцениваются в момент броска, а не на листе; условие по
+      // типу носителя считается здесь — тем же правилом, что и в фазе 2
+      if (skipChangeOnSheet(change, carrier)) {
+        continue;
+      }
+
+      if (!isDerivedTargetKey(change.key) || isRollTimeDiceChange(change)) {
+        continue;
+      }
+
+      const keyChanges = grouped.get(change.key);
+
+      if (keyChanges) {
+        keyChanges.push(change);
+      } else {
+        grouped.set(change.key, [change]);
+      }
+    }
+  }
+
+  for (const keyChanges of grouped.values()) {
+    keyChanges.sort((left, right) => left.priority - right.priority);
+  }
+
+  return grouped;
 }
 
 // ── Условные бонусы (roll-time evaluation) ─────────────
+
+/** Союзник рядом с целью: какие состояния на нём сейчас */
+export interface AdjacentAllyState {
+  /** Ключи состояний союзника, недееспособность — тоже */
+  conditions: readonly string[];
+}
 
 /**
  * Контекст броска для оценки условных эффектов.
@@ -366,14 +949,158 @@ export interface RollContext {
   /** Бросок с помехой */
   hasDisadvantage: boolean;
   /**
-   * Состояние HP цели — для условий `target.hp.*` (напр. «Убийца»/«Окровавлен»).
-   * Отсутствует вне таргет-контекста; такие условия тогда не срабатывают.
+   * Предмет, которым бьют: по нему работают ключи «только этим предметом».
+   * Не задан — броска предметом нет, и такие строки не считаются.
    */
-  target?: { currentHp: number; maxHp: number };
+  itemId?: string;
+  /**
+   * Свойства оружия броска — для условий `weapon.property` («Сражение
+   * метательным оружием»). Не задано — бросок не оружием, условие не выполняется.
+   */
+  weaponProperties?: readonly string[];
+  /**
+   * Состояние HP цели — для условий `target.hp.*` (напр. «Убийца»/«Окровавлен»),
+   * и её тип — для условий `target.creatureType`. Отсутствует вне
+   * таргет-контекста; такие условия тогда не срабатывают.
+   */
+  target?: {
+    currentHp: number;
+    maxHp: number;
+    creatureType?: CreatureCategory;
+    /** Дополнительные типы цели — наравне с основным */
+    extraCreatureTypes?: readonly CreatureCategory[];
+    /** Кто пометил цель (`mark.bySource`) — для условия `target.markedBySelf` */
+    markedBy?: readonly string[];
+    /** Сущность цели — защитные эффекты цели в броске атаки */
+    entityId?: string;
+    /**
+     * Союзники бросающего в 5 фт от цели и их состояния — для условий
+     * «союзник рядом с целью». Считает клиент по фишкам сцены
+     */
+    adjacentAllies?: readonly AdjacentAllyState[];
+  };
+  /**
+   * Свойства НОСИТЕЛЯ эффекта — для условий семейства `self.*`.
+   *
+   * Плоские бонусы с такими условиями считаются уже на листе (фазы 2 и 3), и
+   * при броске их повторно НЕ суммируют; здесь свойства нужны кость-формулам
+   * бонус-урона, которые в статы не попадают никогда.
+   */
+  self?: CarrierContext;
+  /**
+   * Тот, кто вызвал бросок, — у спасброска: заклинатель, существо, наложивший
+   * эффект. Для условий `source.creatureType`; нет — такие условия не
+   * выполняются.
+   */
+  source?: {
+    creatureType?: CreatureCategory;
+    /** Школа заклинания, вызвавшего спасбросок (`source.spellSchool`) */
+    spellSchool?: string;
+    /** Типы урона того, что вызвало спасбросок (`source.damageType`) */
+    damageTypes?: readonly string[];
+  };
+  /**
+   * Кто наложил эффект, чьё условие сейчас оценивается, — для
+   * `target.isSource`. Ставит сам перебор эффектов ({@link scopeRollContext}):
+   * у каждого эффекта наложивший свой.
+   */
+  effectSourceId?: string;
+}
+
+/**
+ * Контекст броска для условий одного эффекта: с его наложившим.
+ *
+ * @param rollContext - контекст броска
+ * @param effect - эффект, чьи условия оцениваются
+ * @returns тот же контекст либо копия с наложившим этого эффекта
+ */
+function scopeRollContext(
+  rollContext: RollContext,
+  effect: Pick<ActiveEffect, 'sourceActorId'>,
+): RollContext {
+  return rollContext.effectSourceId === effect.sourceActorId
+    ? rollContext
+    : { ...rollContext, effectSourceId: effect.sourceActorId };
+}
+
+/**
+ * Свойства носителя, по которым считаются условия семейства `self.*`.
+ *
+ * Все они известны по самому листу и от броска не зависят, поэтому и живут
+ * одним объектом: следующее такое условие добавляется полем сюда, а не ещё
+ * одним параметром в сигнатуры фаз пайплайна.
+ */
+export interface CarrierContext {
+  /** Сама сущность-носитель — для условия `target.markedBySelf` */
+  entityId?: string;
+  /** Тип существа — для `self.creatureType === "..."` */
+  creatureType?: CreatureCategory;
+  /** Дополнительные типы существа — наравне с основным */
+  extraCreatureTypes?: readonly CreatureCategory[];
+  /** Вид персонажа или подтип статблока — для `self.species === "..."` */
+  speciesNames?: readonly string[];
+  /** Надетый доспех и щит — для `self.armor === "..."` */
+  armor?: CarrierArmorState;
+}
+
+/**
+ * Собирает свойства носителя для условий эффектов на листе и во время броска.
+ * @param carrier - персонаж или существо, несущее эффект
+ * @returns тип существа, вид и состояние надетого доспеха
+ */
+export function buildCarrierContext(carrier: DnDSceneEntity): CarrierContext {
+  return {
+    entityId: carrier.id,
+    creatureType: resolveEntityCreatureType(carrier),
+    extraCreatureTypes: resolveEntityExtraCreatureTypes(carrier),
+    speciesNames: listEntitySpeciesNames(carrier),
+    armor: getCarrierArmorState(carrier),
+  };
 }
 
 // Тип `IncomingAttackContext` вынесен в нейтральный контракт
 // (`../contracts/combat`) и реэкспортится выше.
+
+/**
+ * Входящая атака в D&D-форме: ядро передаёт контекст системе как есть, и
+ * клиент системы кладёт в него тип атакующего.
+ */
+export interface DndIncomingAttackContext extends IncomingAttackContext {
+  /** Тип атакующего — для `incoming.attackerCreatureType === "…"` */
+  attackerCreatureType?: CreatureCategory;
+  /** Дополнительные типы атакующего — наравне с основным */
+  attackerExtraCreatureTypes?: readonly CreatureCategory[];
+  /** Кто атакует — для `incoming.attackerIsSource` */
+  attackerId?: string;
+}
+
+/** Бросок без преимущества и помехи — для условий, где броска ещё нет */
+const NEUTRAL_ROLL_CONTEXT: RollContext = {
+  hasAdvantage: false,
+  hasDisadvantage: false,
+};
+
+/** Условие строки «цель помечена мной» (Метка охотника, Сглаз) */
+export const MARKED_BY_SELF_CONDITION = 'target.markedBySelf';
+
+/** Флаг метки на эффекте цели */
+const MARK_FLAG = 'mark.bySource';
+
+/**
+ * Кто пометил сущность: источники её активных эффектов с флагом метки.
+ *
+ * @param entity - цель
+ * @returns идентификаторы пометивших
+ */
+export function listEntityMarkSources(entity: DnDSceneEntity): string[] {
+  return (entity.activeEffects ?? []).flatMap((effect) =>
+    !isEffectDormant(effect)
+    && effect.sourceActorId
+    && effect.flags.includes(MARK_FLAG)
+      ? [effect.sourceActorId]
+      : [],
+  );
+}
 
 /**
  * Маппинг условий `target.hp.*` на гейты состояния HP цели.
@@ -425,6 +1152,147 @@ export function targetHpGateMatches(
   return currentHp < maxHp;
 }
 
+// ── Условия по типу существа ──────────────────────────────────
+
+/**
+ * Вид доспеха, названный условием `self.armor === "heavy"`.
+ *
+ * @param condition - строка условия
+ * @returns вид доспеха либо undefined (другое семейство/неизвестный вид)
+ */
+function parseArmorCondition(
+  condition: string,
+): ArmorConditionKind | undefined {
+  const trimmed = condition.trim();
+
+  if (!trimmed.startsWith(CARRIER_ARMOR_CONDITION_PREFIX)) {
+    return undefined;
+  }
+
+  const quoted = trimmed.slice(CARRIER_ARMOR_CONDITION_PREFIX.length).trim();
+  const value = quoted.replace(/^["']|["']$/g, '');
+
+  return isArmorConditionKind(value) ? value : undefined;
+}
+
+/**
+ * Условие ли это о НОСИТЕЛЕ эффекта — про одну часть составного условия.
+ *
+ * @param part - часть условия
+ * @returns `true`, если часть о носителе
+ */
+function isCarrierConditionPart(part: string): boolean {
+  return (
+    parseCreatureTypeCondition(part, 'self.creatureType') !== undefined
+    || part.startsWith(CARRIER_ARMOR_CONDITION_PREFIX)
+    || parseCarrierSpeciesCondition(part) !== undefined
+  );
+}
+
+/**
+ * Условие ли это о НОСИТЕЛЕ эффекта.
+ *
+ * Такие условия статические: свойства носителя известны по листу, поэтому они
+ * считаются в фазах 2 и 3 пайплайна, а не в момент броска. Отличать их
+ * необходимо: плоский бонус с таким условием уже сидит в статах, и при броске
+ * его нельзя прибавлять второй раз.
+ *
+ * Составное условие считается «о носителе», только если о носителе КАЖДАЯ его
+ * часть. Смешанное («в доспехе И цель ранена») проверить по листу нечем, и оно
+ * целиком уходит в оценку при броске.
+ *
+ * @param condition - строка условия
+ * @returns `true`, если условие о носителе
+ */
+function isCarrierCondition(condition: string): boolean {
+  const parts = splitConditionParts(condition);
+
+  return parts.length > 0 && parts.every(isCarrierConditionPart);
+}
+
+/**
+ * Выполняется ли одна часть условия носителя при данных его свойствах.
+ *
+ * @param part - часть условия
+ * @param carrier - свойства носителя (undefined — считать нечем)
+ * @returns `true`, если часть выполняется
+ */
+function carrierConditionPartMatches(
+  part: string,
+  carrier: CarrierContext | undefined,
+): boolean {
+  const wantedArmor = parseArmorCondition(part);
+
+  if (wantedArmor !== undefined) {
+    return armorConditionMatches(wantedArmor, carrier?.armor);
+  }
+
+  const speciesCondition = parseCarrierSpeciesCondition(part);
+
+  if (speciesCondition !== undefined) {
+    // Вид известен только с носителем: без него считать нечем
+    return (
+      carrier?.speciesNames !== undefined
+      && speciesConditionHolds(speciesCondition, carrier.speciesNames)
+    );
+  }
+
+  const typeCondition = parseCreatureTypeCondition(part, 'self.creatureType');
+
+  return (
+    typeCondition !== undefined
+    && creatureTypeConditionHolds(
+      typeCondition,
+      carrier?.creatureType,
+      carrier?.extraCreatureTypes,
+    )
+  );
+}
+
+/**
+ * Выполняется ли условие носителя целиком: части соединены «и».
+ *
+ * @param condition - строка условия
+ * @param carrier - свойства носителя (undefined — считать нечем)
+ * @returns `true`, если выполняются все части
+ */
+function carrierConditionMatches(
+  condition: string,
+  carrier: CarrierContext | undefined,
+): boolean {
+  const parts = splitConditionParts(condition);
+
+  return (
+    parts.length > 0
+    && parts.every((part) => carrierConditionPartMatches(part, carrier))
+  );
+}
+
+/**
+ * Пропускает ли фаза листа это условное изменение.
+ *
+ * Условия броска (преимущество, хиты цели, вид входящей атаки) на листе не
+ * считаются — их оценивают в момент броска. Условие носителя, наоборот, тут и
+ * считается: тип носителя от броска не зависит.
+ *
+ * @param change - изменение эффекта
+ * @param carrier - свойства носителя
+ * @returns `true`, если изменение на листе применять не нужно
+ */
+function skipChangeOnSheet(
+  change: EffectChange,
+  carrier: CarrierContext | undefined,
+): boolean {
+  if (!change.condition) {
+    return false;
+  }
+
+  return (
+    !isCarrierCondition(change.condition)
+    || !carrierConditionMatches(change.condition, carrier)
+  );
+}
+
 /**
  * Оценивает условие EffectChange против контекста броска.
  *
@@ -438,7 +1306,10 @@ export function targetHpGateMatches(
  * Условия `target.hp.*` срабатывают только если в контексте есть HP цели;
  * иначе возвращают false (нет цели — нет состояния). Для кость-формул
  * бонус-урона без единой цели такие условия не гасятся, а откладываются в
- * per-target гейт ({@link collectBonusDamageFormulas}).
+ * per-target гейт ({@link collectBonusDamageFormulas}); отложить умеет только
+ * одиночное условие, составное с частью о цели там просто не сработает.
+ *
+ * Части, соединённые `&&`, обязаны выполниться все.
  *
  * @param condition - строка условия
  * @param rollContext - контекст текущего броска
@@ -448,8 +1319,87 @@ function evaluateCondition(
   condition: string,
   rollContext: RollContext,
 ): boolean {
-  const trimmed = condition.trim();
+  const parts = splitConditionParts(condition);
 
+  return (
+    parts.length > 0
+    && parts.every((part) => evaluateConditionPart(part, rollContext))
+  );
+}
+
+/**
+ * Значение в кавычках после приставки условия: `prefix"value"`.
+ *
+ * @param condition - часть условия
+ * @param prefix - приставка семейства
+ * @returns значение либо `undefined`, если часть не из семейства
+ */
+function parseQuotedCondition(
+  condition: string,
+  prefix: string,
+): string | undefined {
+  if (!condition.startsWith(prefix)) {
+    return undefined;
+  }
+
+  const value = condition
+    .slice(prefix.length)
+    .trim()
+    .replace(/^["']|["']$/g, '');
+
+  return value || undefined;
+}
+
+/**
+ * Проверка союзника рядом с целью по условию семейства «союзник рядом».
+ *
+ * @param part - часть условия
+ * @returns проверка союзника либо `undefined`, если часть не из семейства
+ */
+function matchAdjacentAlly(
+  part: string,
+): ((ally: AdjacentAllyState) => boolean) | undefined {
+  if (part === TARGET_ALLY_ADJACENT_CONDITION) {
+    return (ally) => !ally.conditions.includes(INCAPACITATED_CONDITION_KEY);
+  }
+
+  if (part === TARGET_ANY_ALLY_ADJACENT_CONDITION) {
+    return () => true;
+  }
+
+  const withCondition = parseQuotedCondition(
+    part,
+    TARGET_ALLY_WITH_CONDITION_PREFIX,
+  );
+
+  if (withCondition) {
+    return (ally) => ally.conditions.includes(withCondition);
+  }
+
+  const withoutCondition = parseQuotedCondition(
+    part,
+    TARGET_ALLY_WITHOUT_CONDITION_PREFIX,
+  );
+
+  if (withoutCondition) {
+    return (ally) => !ally.conditions.includes(withoutCondition);
+  }
+
+  return undefined;
+}
+
+/**
+ * Оценивает одну часть условия против контекста броска. Общая для модификаторов
+ * и срабатываний (`triggerConditions.ts`): словарь один.
+ *
+ * @param trimmed - часть условия, уже обрезанная по краям
+ * @param rollContext - контекст текущего броска
+ * @returns true если часть выполняется
+ */
+export function evaluateConditionPart(
+  trimmed: string,
+  rollContext: RollContext,
+): boolean {
   if (trimmed === 'roll.hasAdvantage === true') {
     return rollContext.hasAdvantage;
   }
@@ -458,8 +1408,48 @@ function evaluateCondition(
     return rollContext.hasDisadvantage;
   }
 
+  const weaponProperty = parseQuotedCondition(
+    trimmed,
+    WEAPON_PROPERTY_CONDITION_PREFIX,
+  );
+
+  if (weaponProperty) {
+    return rollContext.weaponProperties?.includes(weaponProperty) ?? false;
+  }
+
   // Условия по состоянию HP цели
   const { target } = rollContext;
+
+  // Рядом с целью союзник бросающего — нужного состояния
+  const allyMatches = matchAdjacentAlly(trimmed);
+
+  if (allyMatches) {
+    return (target?.adjacentAllies ?? []).some(allyMatches);
+  }
+
+  // Метка: цель помечена тем, кто сейчас бросает
+  if (trimmed === MARKED_BY_SELF_CONDITION) {
+    const selfId = rollContext.self?.entityId;
+
+    return Boolean(selfId && target?.markedBy?.includes(selfId));
+  }
+
+  // Цель броска — тот, кто наложил этот эффект, либо не он. Без цели или
+  // без наложившего данных нет: часть не выполняется
+  if (
+    trimmed === TARGET_IS_SOURCE_CONDITION
+    || trimmed === TARGET_NOT_SOURCE_CONDITION
+  ) {
+    const targetId = target?.entityId;
+    const sourceId = rollContext.effectSourceId;
+
+    return (
+      targetId !== undefined
+      && sourceId !== undefined
+      && (targetId === sourceId) === (trimmed === TARGET_IS_SOURCE_CONDITION)
+    );
+  }
+
   const hpGate = TARGET_HP_CONDITION_GATES[trimmed];
 
   if (hpGate) {
@@ -468,8 +1458,66 @@ function evaluateCondition(
       : false;
   }
 
+  // Свойства носителя: известны вне броска, поэтому и здесь берутся из
+  // контекста, а не из цели
+  if (isCarrierConditionPart(trimmed)) {
+    return carrierConditionPartMatches(trimmed, rollContext.self);
+  }
+
+  // Тип цели
+  const targetType = parseCreatureTypeCondition(trimmed, 'target.creatureType');
+
+  if (targetType !== undefined) {
+    return creatureTypeConditionHolds(
+      targetType,
+      target?.creatureType,
+      target?.extraCreatureTypes,
+    );
+  }
+
+  const sourceType = parseCreatureTypeCondition(trimmed, 'source.creatureType');
+
+  if (sourceType !== undefined) {
+    return creatureTypeConditionHolds(
+      sourceType,
+      rollContext.source?.creatureType,
+    );
+  }
+
+  // Школа и типы урона того, что вызвало спасбросок
+  const sourceHolds = saveSourceConditionHolds(trimmed, rollContext.source);
+
+  if (sourceHolds !== undefined) {
+    return sourceHolds;
+  }
+
   // Неизвестное условие — не применяем
   return false;
+}
+
+/**
+ * Типы цели, названные условием `target.creatureType === "…"` (если это оно).
+ *
+ * Нужны для отложенной per-target оценки, когда единой цели на броске нет, —
+ * так же, как {@link targetHpGateForCondition} для условий по хитам. Цель
+ * одного типа проходит ровно одну ветку списка, поэтому список раскладывается
+ * по веткам без задвоения. «Не из списка» веткой не выразить: такое условие
+ * без единой цели не выполняется.
+ *
+ * @param condition - строка условия
+ * @returns типы либо `undefined` (условие не про тип цели или с отрицанием)
+ */
+function targetTypeGatesForCondition(
+  condition: string,
+): CreatureCategory[] | undefined {
+  const typeCondition = parseCreatureTypeCondition(
+    condition,
+    'target.creatureType',
+  );
+
+  return typeCondition && !typeCondition.negate
+    ? typeCondition.types
+    : undefined;
 }
 
 /**
@@ -482,13 +1530,53 @@ function evaluateCondition(
  *
  * @param condition - строка условия
  * @param attackContext - контекст входящей атаки
+ * @param effectSourceId - кто наложил эффект с этим условием
  * @returns true если условие выполняется
  */
 function evaluateDefensiveCondition(
   condition: string,
-  attackContext: IncomingAttackContext,
+  attackContext: DndIncomingAttackContext,
+  effectSourceId?: string,
 ): boolean {
-  const trimmed = condition.trim();
+  const parts = splitConditionParts(condition);
+
+  return (
+    parts.length > 0
+    && parts.every((part) =>
+      evaluateDefensiveConditionPart(part, attackContext, effectSourceId),
+    )
+  );
+}
+
+/**
+ * Одна часть защитного условия: вид входящей атаки, тип атакующего или «атакует
+ * (не) наложивший эффект».
+ *
+ * @param trimmed - часть условия
+ * @param attackContext - контекст входящей атаки
+ * @param effectSourceId - кто наложил эффект с этим условием
+ * @returns true если часть выполняется
+ */
+function evaluateDefensiveConditionPart(
+  trimmed: string,
+  attackContext: DndIncomingAttackContext,
+  effectSourceId?: string,
+): boolean {
+  // Атакует тот, кто наложил этот эффект, либо не он. Без атакующего или без
+  // наложившего данных нет: часть не выполняется
+  if (
+    trimmed === INCOMING_ATTACKER_IS_SOURCE_CONDITION
+    || trimmed === INCOMING_ATTACKER_NOT_SOURCE_CONDITION
+  ) {
+    const { attackerId } = attackContext;
+
+    return (
+      attackerId !== undefined
+      && effectSourceId !== undefined
+      && (attackerId === effectSourceId)
+        === (trimmed === INCOMING_ATTACKER_IS_SOURCE_CONDITION)
+    );
+  }
 
   if (trimmed === 'incoming.attackType === "ranged"') {
     return attackContext.attackType === 'ranged';
@@ -502,7 +1590,240 @@ function evaluateDefensiveCondition(
     return attackContext.attackType === 'spell';
   }
 
-  return false;
+  const attackerType = parseCreatureTypeCondition(
+    trimmed,
+    'incoming.attackerCreatureType',
+  );
+
+  return (
+    attackerType !== undefined
+    && creatureTypeConditionHolds(
+      attackerType,
+      attackContext.attackerCreatureType,
+      attackContext.attackerExtraCreatureTypes,
+    )
+  );
+}
+
+/**
+ * Действует ли эффект только в бросках: у него условие броска не о носителе.
+ *
+ * @param effect - эффект
+ * @returns `true`, если эффекта нет в числах листа
+ */
+export function isRollOnlyEffect(
+  effect: Pick<ActiveEffect, 'rollCondition'>,
+): boolean {
+  return (
+    effect.rollCondition !== undefined
+    && !isCarrierCondition(effect.rollCondition)
+  );
+}
+
+/**
+ * Входит ли эффект в числа листа: без условия броска либо с условием о
+ * носителе, которое выполнено.
+ *
+ * @param effect - эффект
+ * @param carrier - свойства носителя
+ * @returns `true`, если эффект считается на листе
+ */
+function effectAppliesOnSheet(
+  effect: ActiveEffect,
+  carrier: CarrierContext | undefined,
+): boolean {
+  return (
+    effect.rollCondition === undefined
+    || (!isRollOnlyEffect(effect)
+      && carrierConditionMatches(effect.rollCondition, carrier))
+  );
+}
+
+/**
+ * Выполнено ли условие броска эффекта в этом броске. Эффект без условия —
+ * всегда.
+ *
+ * @param effect - эффект
+ * @param rollContext - контекст броска
+ * @returns `true`, если эффект действует в броске
+ */
+function rollConditionHolds(
+  effect: ActiveEffect,
+  rollContext: RollContext,
+): boolean {
+  return (
+    effect.rollCondition === undefined
+    || evaluateCondition(
+      effect.rollCondition,
+      scopeRollContext(rollContext, effect),
+    )
+  );
+}
+
+/**
+ * Защитные эффекты, действующие против этой атаки: без условия броска либо с
+ * выполненным условием входящей атаки.
+ *
+ * @param effects - эффекты защитника
+ * @param attackContext - входящая атака
+ * @returns действующие эффекты
+ */
+function listIncomingAttackEffects(
+  effects: readonly ActiveEffect[],
+  attackContext: DndIncomingAttackContext,
+): ActiveEffect[] {
+  return effects.filter(
+    (effect) =>
+      !isEffectDormant(effect)
+      && (effect.rollCondition === undefined
+        || evaluateDefensiveCondition(
+          effect.rollCondition,
+          attackContext,
+          effect.sourceActorId,
+        )),
+  );
+}
+
+/**
+ * Флаги эффектов «только в бросках», чьё условие выполнено в этом броске:
+ * «Тактика стаи» даёт преимущество, пока рядом с целью союзник.
+ *
+ * @param effects - эффекты бросающего
+ * @param rollContext - контекст броска
+ * @returns флаги
+ */
+export function collectRollConditionFlags(
+  effects: readonly ActiveEffect[],
+  rollContext: RollContext,
+): string[] {
+  return effects.flatMap((effect) =>
+    !isEffectDormant(effect)
+    && isRollOnlyEffect(effect)
+    && rollConditionHolds(effect, rollContext)
+      ? effect.flags
+      : [],
+  );
+}
+
+/** Ключ строки изменения с порогом крита */
+const CRIT_THRESHOLD_KEY: EffectTargetKey = 'critThreshold';
+
+/**
+ * Порог крита в этом броске. Порог листа уже учёл строки без условия и с
+ * условием о носителе; здесь добавляются строки, чьё условие — о броске:
+ * «крит на 19–20 по существам из вашего Гримуара» (`target.creatureType`).
+ * Порог только понижается: из нескольких действует самый низкий.
+ *
+ * @param effects - эффекты бросающего (с аурами карты)
+ * @param sheetThreshold - порог листа
+ * @param rollContext - контекст броска с целью
+ * @param formulaContext - контекст формул бросающего
+ * @returns порог крита для броска
+ */
+export function resolveRollCritThreshold(
+  effects: readonly ActiveEffect[],
+  sheetThreshold: number,
+  rollContext: RollContext,
+  formulaContext?: FormulaContext,
+): number {
+  let threshold = sheetThreshold;
+
+  for (const effect of effects) {
+    if (isEffectDormant(effect) || !rollConditionHolds(effect, rollContext)) {
+      continue;
+    }
+
+    const rollOnly = isRollOnlyEffect(effect);
+
+    for (const change of effect.changes) {
+      if (change.key !== CRIT_THRESHOLD_KEY) {
+        continue;
+      }
+
+      // Строка без условия и с условием о носителе уже сидит в пороге листа
+      if (
+        !rollOnly
+        && (!change.condition || isCarrierCondition(change.condition))
+      ) {
+        continue;
+      }
+
+      if (
+        change.condition
+        && !evaluateCondition(
+          change.condition,
+          scopeRollContext(rollContext, effect),
+        )
+      ) {
+        continue;
+      }
+
+      const value = resolveConditionalValue(change.value, formulaContext);
+
+      if (value > 0) {
+        threshold = Math.min(threshold, value);
+      }
+    }
+  }
+
+  return threshold;
+}
+
+/**
+ * Флаги защитника, которые включает входящая атака: «Защита от добра и зла»
+ * даёт помеху атакам исчадий.
+ *
+ * @param effects - эффекты защитника
+ * @param attackContext - входящая атака
+ * @returns флаги
+ */
+export function collectIncomingAttackFlags(
+  effects: readonly ActiveEffect[],
+  attackContext: DndIncomingAttackContext,
+): string[] {
+  return listIncomingAttackEffects(effects, attackContext).flatMap((effect) =>
+    isRollOnlyEffect(effect) ? effect.flags : [],
+  );
+}
+
+/**
+ * Прибавки атакующему от защитника («Атаки по носителю»): формулы для
+ * добавления к d20 атакующего.
+ *
+ * @param effects - эффекты защитника
+ * @param attackContext - входящая атака
+ * @param formulaContext - переменные защитника
+ * @returns формулы
+ */
+export function collectIncomingAttackRollFormulas(
+  effects: readonly ActiveEffect[],
+  attackContext: DndIncomingAttackContext,
+  formulaContext?: FormulaContext,
+): string[] {
+  const applicable = listIncomingAttackEffects(effects, attackContext).map(
+    (effect) => ({
+      ...effect,
+      rollCondition: undefined,
+      changes: effect.changes.flatMap((change) =>
+        change.key === ATTACKS_AGAINST_KEY
+        && (!change.condition
+          || evaluateDefensiveCondition(
+            change.condition,
+            attackContext,
+            effect.sourceActorId,
+          ))
+          ? [{ ...change, condition: undefined }]
+          : [],
+      ),
+    }),
+  );
+
+  return collectBonusRollFormulas(
+    applicable,
+    ATTACKS_AGAINST_KEY,
+    NEUTRAL_ROLL_CONTEXT,
+    formulaContext,
+  );
 }
 
 /**
@@ -513,35 +1834,157 @@ function evaluateDefensiveCondition(
  *
  * @param effects - массив активных эффектов защитника
  * @param attackContext - контекст входящей атаки (тип: melee/ranged/spell)
+ * @param formulaContext - контекст @-переменных; без него формулы не считаются
  * @returns суммарный условный бонус к AC
  */
 export function evaluateDefensiveACBonus(
   effects: readonly ActiveEffect[],
-  attackContext: IncomingAttackContext,
+  attackContext: DndIncomingAttackContext,
+  formulaContext?: FormulaContext,
 ): number {
   let bonus = 0;
 
-  for (const effect of effects) {
-    if (effect.disabled) {
-      continue;
-    }
+  for (const effect of listIncomingAttackEffects(effects, attackContext)) {
+    // Эффект «только в бросках» в КД листа не вошёл: его безусловные строки
+    // считаются здесь, против этой атаки
+    const rollOnly = isRollOnlyEffect(effect);
 
     for (const change of effect.changes) {
-      if (change.key !== 'armorClass' || !change.condition) {
+      if (change.key !== 'armorClass' || (!change.condition && !rollOnly)) {
         continue;
       }
 
-      if (evaluateDefensiveCondition(change.condition, attackContext)) {
-        const value = Number(change.value);
-
-        if (!Number.isNaN(value)) {
-          bonus += value;
-        }
+      if (
+        !change.condition
+        || evaluateDefensiveCondition(
+          change.condition,
+          attackContext,
+          effect.sourceActorId,
+        )
+      ) {
+        bonus += resolveConditionalValue(change.value, formulaContext);
       }
     }
   }
 
   return bonus;
+}
+
+/**
+ * Вычисляет значение условного изменения.
+ *
+ * Условные бонусы считаются в момент броска, а не на листе, поэтому контекст
+ * формул сюда доходит не всегда. Когда он есть — значение разбирается так же,
+ * как у безусловных изменений (`@prof`, `@mod.dex` и прочие переменные);
+ * когда нет — берётся только плоское число, а формула даёт 0 вместо `NaN`.
+ *
+ * @param value - строка значения изменения
+ * @param formulaContext - контекст @-переменных, если он известен
+ * @returns числовой вклад изменения
+ */
+function resolveConditionalValue(
+  value: string,
+  formulaContext: FormulaContext | undefined,
+): number {
+  if (formulaContext) {
+    // Условный бонус только складывается: нечитаемое значение вклада не даёт
+    return resolveChangeValue(value, formulaContext) ?? 0;
+  }
+
+  const plainValue = Number(value);
+
+  return Number.isNaN(plainValue) ? 0 : plainValue;
+}
+
+/** Ключ «весь наносимый урон»: подходит любому виду урона */
+export const ALL_DAMAGE_KEY = 'damage.all';
+
+/** Ключ урона «только этим предметом»: считается лишь у эффекта на предмете */
+export const WEAPON_DAMAGE_KEY = 'damage.weapon';
+
+/** Ключ атаки «только этим предметом» */
+export const WEAPON_ATTACK_KEY = 'attack.weapon';
+
+/** Ключ атаки заклинанием: его собирают броски каста персонажа и существа */
+export const SPELL_ATTACK_KEY = 'attack.spell';
+
+/** Ключи, привязанные к предмету: без предмета броска они ничего не дают */
+const ITEM_SCOPED_KEYS: ReadonlySet<string> = new Set([
+  WEAPON_DAMAGE_KEY,
+  WEAPON_ATTACK_KEY,
+]);
+
+/**
+ * Привязана ли строка к предмету. Такая строка не считается на листе — на ней
+ * написано «только этим предметом», а каким именно, известно лишь в броске.
+ *
+ * @param changeKey - ключ строки
+ * @returns `true`, если строка про конкретный предмет
+ */
+export function isItemScopedKey(changeKey: string): boolean {
+  return ITEM_SCOPED_KEYS.has(changeKey);
+}
+
+/**
+ * Достаётся ли строка этому предмету броска.
+ *
+ * Строка, привязанная к предмету, работает только у эффекта, который ЛЕЖИТ на
+ * предмете (`carriedItemId` ставит сбор эффектов) и только когда бьют именно
+ * им. Обычные строки предмет не разбирают вовсе.
+ *
+ * @param changeKey - ключ строки
+ * @param effect - эффект, которому строка принадлежит
+ * @param itemId - предмет текущего броска; нет — броска предметом нет
+ * @returns `true`, если строку можно считать
+ */
+export function changeReachesItem(
+  changeKey: string,
+  effect: Pick<ActiveEffect, 'carriedItemId'>,
+  itemId: string | undefined,
+): boolean {
+  if (!ITEM_SCOPED_KEYS.has(changeKey)) {
+    return true;
+  }
+
+  return (
+    itemId !== undefined
+    && effect.carriedItemId !== undefined
+    && effect.carriedItemId === itemId
+  );
+}
+
+/**
+ * Подходит ли строка изменения ключу урона.
+ *
+ * `damage.all` («Метка охотника» на все атаки) работает с любым видом урона:
+ * рукопашным, дальнобойным и заклинанием — одна строка вместо трёх.
+ *
+ * @param changeKey - ключ строки изменения
+ * @param targetKey - ключ, для которого ищут бонусы
+ * @returns `true`, если строка относится к этому ключу
+ */
+export function matchesDamageKey(
+  changeKey: string,
+  targetKey: EffectTargetKey,
+): boolean {
+  if (changeKey === targetKey) {
+    return true;
+  }
+
+  if (changeKey === ALL_DAMAGE_KEY) {
+    return targetKey.startsWith('damage.');
+  }
+
+  // «Только этим предметом» — про удар оружием: заклинание предметом не бьют
+  if (changeKey === WEAPON_DAMAGE_KEY) {
+    return targetKey === 'damage.melee' || targetKey === 'damage.ranged';
+  }
+
+  if (changeKey === WEAPON_ATTACK_KEY) {
+    return targetKey === 'attack.melee' || targetKey === 'attack.ranged';
+  }
+
+  return false;
 }
 
 /**
@@ -554,31 +1997,57 @@ export function evaluateDefensiveACBonus(
  * @param effects - массив активных эффектов (включая ауры)
  * @param targetKey - ключ, для которого ищем бонусы (например `attack.melee`)
  * @param rollContext - контекст текущего броска
+ * @param formulaContext - контекст @-переменных; без него формулы не считаются
  * @returns суммарный бонус от условных эффектов
  */
 export function evaluateConditionalBonuses(
   effects: readonly ActiveEffect[],
   targetKey: EffectTargetKey,
   rollContext: RollContext,
+  formulaContext?: FormulaContext,
 ): number {
   let bonus = 0;
 
   for (const effect of effects) {
-    if (effect.disabled) {
+    if (isEffectDormant(effect) || !rollConditionHolds(effect, rollContext)) {
       continue;
     }
 
+    // Эффекта «только в бросках» нет в статах: его строки считаются здесь все
+    const rollOnly = isRollOnlyEffect(effect);
+
     for (const change of effect.changes) {
-      if (!change.condition || change.key !== targetKey) {
+      if (
+        !changeReachesItem(change.key, effect, rollContext.itemId)
+        || (!change.condition && !rollOnly && !isItemScopedKey(change.key))
+        || !matchesDamageKey(change.key, targetKey)
+        || isDiceFormulaValue(change.value)
+        // Бонус «при атаке Силой» уже сидит в разборе урона оружия — в броске
+        // его второй раз не считаем
+        || readAbilityDamageScope(change) !== undefined
+      ) {
         continue;
       }
 
-      if (evaluateCondition(change.condition, rollContext)) {
-        const value = Number(change.value);
+      if (!change.condition) {
+        bonus += resolveConditionalValue(change.value, formulaContext);
 
-        if (!Number.isNaN(value)) {
-          bonus += value;
-        }
+        continue;
+      }
+
+      // Условие носителя уже посчитано на листе (фазы 2 и 3), и его вклад сидит
+      // в итоговых статах. Прибавить его здесь значило бы учесть бонус дважды
+      if (isCarrierCondition(change.condition) && !rollOnly) {
+        continue;
+      }
+
+      if (
+        evaluateCondition(
+          change.condition,
+          scopeRollContext(rollContext, effect),
+        )
+      ) {
+        bonus += resolveConditionalValue(change.value, formulaContext);
       }
     }
   }
@@ -586,23 +2055,323 @@ export function evaluateConditionalBonuses(
   return bonus;
 }
 
+/**
+ * Ключ прибавки к броску к20: атаке, спасброску, проверке, проверке навыка
+ * или спасброску от смерти.
+ *
+ * Навык здесь наравне с проверками: «Наставление» даёт 1к4 к проверкам одного
+ * навыка, и кость катается в броске, а не входит в число навыка на листе.
+ *
+ * @param key - ключ изменения
+ * @returns `true` для ключа броска
+ */
+function isRollBonusKey(key: string): boolean {
+  return (
+    key.startsWith('attack.')
+    || key.startsWith('save.')
+    || key.startsWith('skill.')
+    || key === ABILITY_CHECK_KEY
+    || key === DEATH_SAVE_KEY
+  );
+}
+
+/**
+ * Бросается ли кость в строке с этим ключом: урон, атака, спасбросок, проверка
+ * или навык. У прочих ключей («Класс доспеха», скорость) кость не бросает
+ * никто — такая строка не значит ничего, и форма эффекта говорит об этом
+ * автору.
+ *
+ * @param key - ключ изменения
+ * @returns `true`, если кость в значении строки катается при броске
+ */
+export function isRollTimeDiceKey(key: string): boolean {
+  return (
+    key === ATTACKS_AGAINST_KEY
+    || key.startsWith('damage.')
+    || isRollBonusKey(key)
+  );
+}
+
+/** К какому урону оружия относится бонус «при атаке характеристикой» */
+export interface AbilityDamageScope {
+  /** Урон рукопашного или дальнобойного оружия */
+  range: 'melee' | 'ranged';
+  /** Характеристика атаки, при которой бонус действует */
+  ability: AbilityType;
+}
+
+/**
+ * Бонус урона «при атаке характеристикой»: прибавка к урону рукопашного или
+ * дальнобойного оружия с единственным условием `attack.ability === "…"`.
+ * Составное условие сюда не попадает — оно остаётся условием броска.
+ *
+ * @param change - строка эффекта
+ * @returns урон и характеристика либо `undefined`, если строка не такая
+ */
+export function readAbilityDamageScope(
+  change: EffectChange,
+): AbilityDamageScope | undefined {
+  if (!change.condition || change.mode !== 'add') {
+    return undefined;
+  }
+
+  let range: AbilityDamageScope['range'];
+
+  if (change.key === 'damage.melee') {
+    range = 'melee';
+  } else if (change.key === 'damage.ranged') {
+    range = 'ranged';
+  } else {
+    return undefined;
+  }
+
+  const parts = splitConditionParts(change.condition);
+
+  if (parts.length !== 1) {
+    return undefined;
+  }
+
+  const ability = parseQuotedCondition(
+    parts[0],
+    ATTACK_ABILITY_CONDITION_PREFIX,
+  );
+
+  return ability && isAbilityType(ability) ? { range, ability } : undefined;
+}
+
+/**
+ * Копит бонус урона «при атаке характеристикой» в статах листа. Кость
+ * («1к6») числом листа не бывает — такая строка катается только в броске.
+ *
+ * @param stats - статы актора (мутабельный клон)
+ * @param scope - урон и характеристика бонуса
+ * @param change - строка эффекта
+ * @param formulaContext - контекст формул
+ */
+function addAbilityDamageBonus(
+  stats: ResolvedActorStats,
+  scope: AbilityDamageScope,
+  change: EffectChange,
+  formulaContext: FormulaContext,
+): void {
+  if (isDiceFormulaValue(change.value)) {
+    return;
+  }
+
+  const value = resolveChangeValue(change.value, formulaContext);
+
+  if (value === undefined) {
+    return;
+  }
+
+  const bonuses = stats.abilityDamageBonuses[scope.range];
+
+  bonuses[scope.ability] = (bonuses[scope.ability] ?? 0) + value;
+}
+
+/** Определяет бонусы, которые нельзя вычислять как постоянное число листа. */
+function isRollTimeDiceChange(change: EffectChange): boolean {
+  // Прибавка атакующему — не число листа носителя вовсе
+  if (change.key === ATTACKS_AGAINST_KEY) {
+    return true;
+  }
+
+  // «Только этим предметом»: каким именно, известно лишь в момент броска —
+  // на листе такая строка стала бы прибавкой ко всем атакам носителя
+  if (isItemScopedKey(change.key)) {
+    return true;
+  }
+
+  return (
+    isDiceFormulaValue(change.value)
+    && (change.key.startsWith('damage.') || isRollBonusKey(change.key))
+  );
+}
+
+/** Линейные кубиковые бонусы одинаково исполняются клиентом и сервером. */
+const ROLL_BONUS_FORMULA_REGEX =
+  /^[+-]?(?:[1-9]\d*d[1-9]\d*|\d+)(?:[+-](?:[1-9]\d*d[1-9]\d*|\d+))*$/i;
+
+/** Слагаемые уже проверенной линейной формулы: количество/грани либо целое число. */
+const ROLL_BONUS_TERM_REGEX = /[+-]?(\d+)(?:d(\d+))?/gi;
+
+/**
+ * Проверяет числовые границы формулы до передачи клиентскому или серверному роллеру.
+ * Отрицательная кость тоже расходует бюджет: знак меняет сумму, но не число бросков.
+ * @param formula - нормализованная линейная кубиковая формула
+ * @returns число костей либо undefined при выходе за безопасные ограничения
+ */
+function getBonusFormulaDiceCount(formula: string): number | undefined {
+  let diceCount = 0;
+
+  for (const term of formula.matchAll(ROLL_BONUS_TERM_REGEX)) {
+    const value = Number(term[1]);
+
+    if (!Number.isSafeInteger(value)) {
+      return undefined;
+    }
+
+    if (term[2] === undefined) {
+      continue;
+    }
+
+    const sides = Number(term[2]);
+
+    if (!Number.isSafeInteger(sides) || sides > MAX_ROLL_BONUS_DIE_SIDES) {
+      return undefined;
+    }
+
+    diceCount += value;
+
+    if (diceCount > MAX_ROLL_BONUS_DICE) {
+      return undefined;
+    }
+  }
+
+  return diceCount;
+}
+
+/**
+ * Собирает добавляемые кубиковые бонусы атаки или спасброска в момент броска.
+ * Учитывает условия и переменные носителя; плоские изменения уже входят в статы.
+ * Поддерживает суммы и разности костей и целых чисел, включая отрицательный бонус.
+ * @param effects - действующие эффекты, включая ауры
+ * @param targetKey - ключ атаки или спасброска
+ * @param rollContext - фактический режим броска, носитель и цель
+ * @param formulaContext - значения переменных носителя
+ * @returns отдельные формулы для добавления к d20
+ */
+export function collectBonusRollFormulas(
+  effects: readonly ActiveEffect[],
+  targetKey: EffectTargetKey,
+  rollContext: RollContext,
+  formulaContext?: FormulaContext,
+): string[] {
+  const acceptsFlat = targetKey === ATTACKS_AGAINST_KEY;
+
+  if (!isRollBonusKey(targetKey) && !acceptsFlat) {
+    return [];
+  }
+
+  const formulas: string[] = [];
+
+  let totalDiceCount = 0;
+
+  for (const effect of effects) {
+    if (isEffectDormant(effect) || !rollConditionHolds(effect, rollContext)) {
+      continue;
+    }
+
+    // Плоские числа эффекта «только в бросках» в статы не вошли — они едут
+    // формулой, как кости
+    const flatAllowed = acceptsFlat || isRollOnlyEffect(effect);
+
+    for (const change of effect.changes) {
+      if (
+        change.key !== targetKey
+        || change.mode !== 'add'
+        || (!flatAllowed && !isDiceFormulaValue(change.value))
+        || (change.condition
+          && !evaluateCondition(
+            change.condition,
+            scopeRollContext(rollContext, effect),
+          ))
+      ) {
+        continue;
+      }
+
+      try {
+        const substituted = formulaContext
+          ? substituteFormulaVariables(change.value, formulaContext)
+          : change.value;
+
+        // Подстановка отрицательных @-переменных оборачивает число в скобки.
+        const formula = substituted
+          .replace(/\s+/g, '')
+          .replace(/[кд]/gi, 'd')
+          .replace(/^\(-(\d+)\)/, '-$1')
+          .replace(/(^|[+-])d/gi, '$11d')
+          .replace(/\+\(-(\d+)\)/g, '-$1')
+          .replace(/-\(-(\d+)\)/g, '+$1');
+
+        if (!ROLL_BONUS_FORMULA_REGEX.test(formula)) {
+          console.warn(
+            '[ActiveEffects] Невалидный кубиковый бонус:',
+            change.value,
+          );
+
+          continue;
+        }
+
+        const diceCount = getBonusFormulaDiceCount(formula);
+
+        if (
+          diceCount === undefined
+          || totalDiceCount + diceCount > MAX_ROLL_BONUS_DICE
+        ) {
+          console.warn(
+            '[ActiveEffects] Кубиковый бонус превышает безопасные ограничения:',
+            change.value,
+          );
+
+          continue;
+        }
+
+        totalDiceCount += diceCount;
+        formulas.push(formula);
+      } catch (error: unknown) {
+        console.warn(
+          '[ActiveEffects] Невалидный кубиковый бонус:',
+          change.value,
+          error,
+        );
+      }
+    }
+  }
+
+  return formulas;
+}
+
 // ── Бонус-части урона (кость-формулы в damage.*) ──────────────
 
 /** Регэксп кубиковой нотации в значении change (напр. "2к6", "1d4", "к8"). */
-const DICE_VALUE_REGEX = /\d*\s*[кd]\s*\d+/i;
+const DICE_VALUE_REGEX = /\d*\s*[кдd]\s*\d+/i;
 
 /**
  * Определяет, является ли значение change формулой костей (а не плоским числом).
  *
- * Такие значения в ключах `damage.*` не складываются в `damageBonuses` пайплайна,
- * а собираются в момент броска как отдельные бонус-части урона
- * (см. {@link collectBonusDamageFormulas}).
+ * Значения в `damage.*`, `attack.*`, `save.*`, `skill.*` и проверках не входят
+ * в постоянные статы. Их собирают при броске: collectBonusDamageFormulas для
+ * урона, collectBonusRollFormulas для атаки, спасброска или проверки.
  *
  * @param value - строка значения change
  * @returns true если в значении есть кубиковая нотация
  */
 export function isDiceFormulaValue(value: string): boolean {
   return DICE_VALUE_REGEX.test(value);
+}
+
+/**
+ * Ничего ли не меняет модификатор: прибавка 0 или множитель 1. Такая строка —
+ * почти всегда ошибка автора: преимущество он искал в модификаторах, а оно —
+ * особое правило.
+ *
+ * @param change - модификатор
+ * @returns `true`, если строка ни на что не влияет
+ */
+export function isNoOpEffectChange(
+  change: Pick<EffectChange, 'key' | 'mode' | 'value'>,
+): boolean {
+  const value = change.value.trim();
+
+  if (change.key === '' || value === '' || !Number.isFinite(Number(value))) {
+    return false;
+  }
+
+  return (
+    (change.mode === 'add' && Number(value) === 0)
+    || (change.mode === 'multiply' && Number(value) === 1)
+  );
 }
 
 /**
@@ -620,14 +2389,19 @@ export function isDiceFormulaValue(value: string): boolean {
 export function hasBonusDamageFormulas(
   effects: readonly ActiveEffect[],
   targetKey: EffectTargetKey,
+  itemId?: string,
 ): boolean {
   for (const effect of effects) {
-    if (effect.disabled) {
+    if (isEffectDormant(effect)) {
       continue;
     }
 
     for (const change of effect.changes) {
-      if (change.key === targetKey && isDiceFormulaValue(change.value)) {
+      if (
+        changeReachesItem(change.key, effect, itemId)
+        && matchesDamageKey(change.key, targetKey)
+        && isDiceFormulaValue(change.value)
+      ) {
         return true;
       }
     }
@@ -662,12 +2436,16 @@ export function collectBonusDamageFormulas(
   const formulas: BonusDamageFormula[] = [];
 
   for (const effect of effects) {
-    if (effect.disabled) {
+    if (isEffectDormant(effect) || !rollConditionHolds(effect, rollContext)) {
       continue;
     }
 
     for (const change of effect.changes) {
-      if (change.key !== targetKey || !isDiceFormulaValue(change.value)) {
+      if (
+        !changeReachesItem(change.key, effect, rollContext.itemId)
+        || !matchesDamageKey(change.key, targetKey)
+        || !isDiceFormulaValue(change.value)
+      ) {
         continue;
       }
 
@@ -681,7 +2459,28 @@ export function collectBonusDamageFormulas(
           continue;
         }
 
-        if (!evaluateCondition(change.condition, rollContext)) {
+        const conditionTypeGates = targetTypeGatesForCondition(
+          change.condition,
+        );
+
+        if (conditionTypeGates && rollContext.target === undefined) {
+          // Условие по типу цели без единой цели: тем же приёмом откладываем,
+          // по ветке на тип списка — цель одного типа пройдёт ровно одну
+          for (const conditionTypeGate of conditionTypeGates) {
+            formulas.push({ formula: change.value, conditionTypeGate });
+          }
+
+          continue;
+        }
+
+        // Условие носителя здесь, наоборот, ОЦЕНИВАЕТСЯ: кость-формулы в
+        // плоские статы не попадают никогда, и задвоения быть не может
+        if (
+          !evaluateCondition(
+            change.condition,
+            scopeRollContext(rollContext, effect),
+          )
+        ) {
           continue;
         }
       }
@@ -705,8 +2504,21 @@ function applyChange(
   change: EffectChange,
   formulaContext: FormulaContext,
 ): void {
+  // Ключ ещё не выбран: строка заведена готовым пунктом меню ради условия, а что
+  // менять, автор пока не назвал — менять нечего
+  if (change.key === '') {
+    return;
+  }
+
   try {
     const resolvedValue = resolveChangeValue(change.value, formulaContext);
+
+    // Значение не разобралось: строка эффекта не применяется вовсе. Иначе
+    // «заменить» с пустым значением обнулило бы поле, и лист замер бы молча
+    if (resolvedValue === undefined) {
+      return;
+    }
+
     const currentValue = getStatValue(stats, change.key);
     const newValue = applyMode(currentValue, resolvedValue, change.mode);
 
@@ -731,21 +2543,25 @@ function applyChange(
 /**
  * Вычисляет числовое значение из строки (число или формула).
  *
+ * Нечитаемое значение — это НЕ ноль: у режимов «заменить», «умножить» и
+ * «понизить» ноль означал бы «обнулить поле», и пустая строка эффекта молча
+ * гасила бы скорость, КД или хиты носителя. Такое изменение пропускается
+ * целиком, поэтому неудача возвращается отдельным `undefined`, а не числом.
+ *
  * @param value - строка со значением или формулой
  * @param formulaContext - контекст @-переменных
- * @returns числовое значение
+ * @returns числовое значение либо `undefined`, если значение не разбирается
  */
-function resolveChangeValue(
+export function resolveChangeValue(
   value: string,
   formulaContext: FormulaContext,
-): number {
+): number | undefined {
   try {
     return evaluateFormula(value, formulaContext);
   } catch {
-    // Если формула невалидна — игнорируем (fallback на 0)
     console.warn(`[ActiveEffects] Невалидная формула: "${value}"`);
 
-    return 0;
+    return undefined;
   }
 }
 
@@ -782,6 +2598,64 @@ function applyMode(
 }
 
 /**
+ * Применяет изменения эффектов к числу, уже посчитанному по правилам листа.
+ *
+ * Используется Фазой 3 для производных ключей (спасброски, навыки, инициатива,
+ * КД, бонус мастерства, Сл заклинаний): «повысить до» сравнивается с итоговым
+ * значением листа, «заменить» его действительно заменяет, а не прибавляется.
+ * Ключ помечается в `overriddenKeys` — лист рисует по этой пометке значок
+ * «значение задано эффектом» — только когда режим замены ДЕЙСТВИТЕЛЬНО сдвинул
+ * число: «повысить до +3» при своём +5 ничего не меняет, и значок над честным
+ * значением листа обещал бы вмешательство, которого не было.
+ *
+ * @param stats - статы листа; правится только набор `overriddenKeys`
+ * @param targetKey - ключ производного значения
+ * @param ruleValue - число, посчитанное по правилам
+ * @param derivedChanges - изменения производных ключей по ключу
+ * @param formulaContext - контекст для вычисления формул
+ * @returns итоговое значение с учётом эффектов
+ */
+function applyDerivedChanges(
+  stats: ResolvedActorStats,
+  targetKey: EffectTargetKey,
+  ruleValue: number,
+  derivedChanges: DerivedChangeMap,
+  formulaContext: FormulaContext,
+): number {
+  const changes = derivedChanges.get(targetKey);
+
+  if (!changes) {
+    return ruleValue;
+  }
+
+  let value = ruleValue;
+
+  for (const change of changes) {
+    const previousValue = value;
+    const resolvedValue = resolveChangeValue(change.value, formulaContext);
+
+    // Нечитаемое значение производного ключа пропускается по той же причине,
+    // что и у базовых: ноль тут значил бы «обнулить», а не «нет значения»
+    if (resolvedValue === undefined) {
+      continue;
+    }
+
+    value = applyMode(value, resolvedValue, change.mode);
+
+    if (
+      value !== previousValue
+      && (change.mode === 'override'
+        || change.mode === 'upgrade'
+        || change.mode === 'downgrade')
+    ) {
+      stats.overriddenKeys.add(targetKey);
+    }
+  }
+
+  return value;
+}
+
+/**
  * Извлекает текущее значение поля из ResolvedActorStats по EffectTargetKey.
  *
  * @param stats - статы актора
@@ -794,48 +2668,51 @@ function getStatValue(
 ): number {
   // Характеристики
   if (targetKey.startsWith('ability.')) {
-    const abilityName = targetKey.slice(8) as AbilityType;
+    const abilityName = targetKey.slice(8);
 
-    return stats.abilities[abilityName] ?? 0;
+    return isAbilityType(abilityName) ? stats.abilities[abilityName] : 0;
   }
 
   // Спасброски
   if (targetKey.startsWith('save.')) {
-    const abilityName = targetKey.slice(5) as AbilityType;
+    const abilityName = targetKey.slice(5);
 
-    return stats.saves[abilityName] ?? 0;
+    return isAbilityType(abilityName) ? stats.saves[abilityName] : 0;
   }
 
   // Навыки
   if (targetKey.startsWith('skill.')) {
-    const skillName = targetKey.slice(6) as SkillType;
+    const skillName = targetKey.slice(6);
 
-    return stats.skills[skillName] ?? 0;
+    return isSkillType(skillName) ? stats.skills[skillName] : 0;
   }
 
   // Движение
   if (targetKey.startsWith('movement.')) {
-    const movementName = targetKey.slice(9) as MovementType;
+    const movementName = targetKey.slice(9);
 
-    return stats.movement[movementName] ?? 0;
+    return isMovementType(movementName) ? stats.movement[movementName] : 0;
+  }
+
+  // Чувства
+  if (targetKey.startsWith('sense.')) {
+    const senseName = targetKey.slice(6);
+
+    return isSenseType(senseName) ? stats.senses[senseName] : 0;
   }
 
   // Атака
   if (targetKey.startsWith('attack.')) {
-    const attackType = targetKey.slice(
-      7,
-    ) as keyof ResolvedActorStats['attackBonuses'];
+    const attackType = targetKey.slice(7);
 
-    return stats.attackBonuses[attackType] ?? 0;
+    return isBonusScope(attackType) ? stats.attackBonuses[attackType] : 0;
   }
 
   // Урон
   if (targetKey.startsWith('damage.')) {
-    const damageType = targetKey.slice(
-      7,
-    ) as keyof ResolvedActorStats['damageBonuses'];
+    const damageType = targetKey.slice(7);
 
-    return stats.damageBonuses[damageType] ?? 0;
+    return isBonusScope(damageType) ? stats.damageBonuses[damageType] : 0;
   }
 
   // Простые поля
@@ -844,8 +2721,8 @@ function getStatValue(
       return stats.armorClass;
     case 'hitPoints.max':
       return stats.hitPointsMax;
-    case 'hitPoints.temp':
-      return 0; // temp HP не хранятся в resolved stats
+    case 'critThreshold':
+      return stats.critThreshold;
     case 'initiative':
       return stats.initiative;
     case 'proficiencyBonus':
@@ -871,58 +2748,77 @@ function setStatValue(
 ): void {
   // Характеристики
   if (targetKey.startsWith('ability.')) {
-    const abilityName = targetKey.slice(8) as AbilityType;
+    const abilityName = targetKey.slice(8);
 
-    stats.abilities[abilityName] = statValue;
+    if (isAbilityType(abilityName)) {
+      stats.abilities[abilityName] = statValue;
+    }
 
     return;
   }
 
   // Спасброски
   if (targetKey.startsWith('save.')) {
-    const abilityName = targetKey.slice(5) as AbilityType;
+    const abilityName = targetKey.slice(5);
 
-    stats.saves[abilityName] = statValue;
+    if (isAbilityType(abilityName)) {
+      stats.saves[abilityName] = statValue;
+    }
 
     return;
   }
 
   // Навыки
   if (targetKey.startsWith('skill.')) {
-    const skillName = targetKey.slice(6) as SkillType;
+    const skillName = targetKey.slice(6);
 
-    stats.skills[skillName] = statValue;
+    if (isSkillType(skillName)) {
+      stats.skills[skillName] = statValue;
+    }
 
     return;
   }
 
   // Движение
   if (targetKey.startsWith('movement.')) {
-    const movementName = targetKey.slice(9) as MovementType;
+    const movementName = targetKey.slice(9);
 
-    stats.movement[movementName] = statValue;
+    if (isMovementType(movementName)) {
+      stats.movement[movementName] = statValue;
+    }
+
+    return;
+  }
+
+  // Чувства
+  if (targetKey.startsWith('sense.')) {
+    const senseName = targetKey.slice(6);
+
+    if (isSenseType(senseName)) {
+      stats.senses[senseName] = statValue;
+    }
 
     return;
   }
 
   // Атака
   if (targetKey.startsWith('attack.')) {
-    const attackType = targetKey.slice(
-      7,
-    ) as keyof ResolvedActorStats['attackBonuses'];
+    const attackType = targetKey.slice(7);
 
-    stats.attackBonuses[attackType] = statValue;
+    if (isBonusScope(attackType)) {
+      stats.attackBonuses[attackType] = statValue;
+    }
 
     return;
   }
 
   // Урон
   if (targetKey.startsWith('damage.')) {
-    const damageType = targetKey.slice(
-      7,
-    ) as keyof ResolvedActorStats['damageBonuses'];
+    const damageType = targetKey.slice(7);
 
-    stats.damageBonuses[damageType] = statValue;
+    if (isBonusScope(damageType)) {
+      stats.damageBonuses[damageType] = statValue;
+    }
 
     return;
   }
@@ -935,6 +2831,10 @@ function setStatValue(
       break;
     case 'hitPoints.max':
       stats.hitPointsMax = statValue;
+
+      break;
+    case 'critThreshold':
+      stats.critThreshold = statValue;
 
       break;
     case 'initiative':
@@ -967,7 +2867,7 @@ function setStatValue(
  * @returns наборы иммунитетов, сопротивлений и уязвимостей
  */
 function resolveDamageDefenses(
-  actor: DnDActor | Creature,
+  actor: DnDActor | DnDCreature,
   activeFlags: ReadonlySet<EffectFlagKey>,
 ): ResolvedActorStats['damageDefenses'] {
   const { immunities, resistances, vulnerabilities } =
@@ -991,28 +2891,230 @@ function resolveDamageDefenses(
 }
 
 /**
+ * Прибавка к максимуму хитов от активных эффектов (ключ `hitPoints.max`).
+ *
+ * Отдаётся именно разницей: запас хитов читает `hitPoints.ts` по правилам
+ * листа, а пайплайн знает лишь вклад эффектов. Так «Ложная жизнь» поднимает
+ * потолок и у актёра, и у существа с хитами из статблока, не подменяя сам
+ * запас.
+ *
+ * У персонажа сюда же входит Телосложение сверх листа. Запас листа считается
+ * по числу из листа (`calculateMaxHP`), а прибавки предыстории и повышения
+ * характеристик лежат эффектами — без этой добавки персонаж с Телосложением
+ * 14 из предыстории получал за уровень одну кость хитов. По правилам 2024
+ * модификатор Телосложения входит в хиты каждого уровня, и его рост поднимает
+ * максимум задним числом — поэтому разница модификаторов умножается на
+ * суммарный уровень, а не пишется в лист на повышении.
+ *
+ * @param entity - актор или существо
+ * @returns насколько эффекты меняют максимум хитов (может быть отрицательной)
+ */
+export function resolveMaxHitPointsDelta(
+  entity: DnDActor | DnDCreature,
+): number {
+  const baseMax = resolveHitPointsMax(entity.system.hitPoints);
+  const stats = resolveActorStats(entity);
+  const effectsDelta = stats.hitPointsMax - baseMax;
+
+  // Хиты существа заданы статблоком целиком, уровней у него нет
+  if (isCreatureEntity(entity)) {
+    return effectsDelta;
+  }
+
+  return effectsDelta + resolveConstitutionHitPointsDelta(entity, stats);
+}
+
+/**
+ * Хиты персонажа от Телосложения сверх листа: разница модификаторов (итог с
+ * эффектами против числа листа) за каждый уровень.
+ *
+ * @param actor - персонаж
+ * @param stats - его разрешённые статы
+ * @returns прибавка к максимуму хитов (может быть отрицательной)
+ */
+function resolveConstitutionHitPointsDelta(
+  actor: DnDActor,
+  stats: ResolvedActorStats,
+): number {
+  const sheetConstitutionMod = calculateAbilityModifier(
+    actor.system.abilities?.constitution ?? 10,
+  );
+
+  return (
+    (stats.abilityMods.constitution - sheetConstitutionMod)
+    * getTotalLevel(actor.system.classes)
+  );
+}
+
+/** Виды источников прибавки к максимуму хитов */
+export const MAX_HIT_POINTS_SOURCE_KIND = {
+  /** Эффект: черта, предмет, заклинание */
+  effect: 'effect',
+  /** Телосложение, поднятое эффектами сверх числа листа */
+  constitution: 'constitution',
+} as const;
+
+/** Откуда взялась одна часть прибавки к максимуму хитов */
+export type MaxHitPointsSource =
+  | {
+      kind: typeof MAX_HIT_POINTS_SOURCE_KIND.effect;
+      /** Название эффекта */
+      name: string;
+      /** Насколько источник сдвинул максимум хитов */
+      delta: number;
+    }
+  | {
+      kind: typeof MAX_HIT_POINTS_SOURCE_KIND.constitution;
+      /** Насколько источник сдвинул максимум хитов */
+      delta: number;
+    };
+
+/**
+ * Вклад эффектов в максимум хитов построчно. Считается тем же порядком и теми
+ * же числами, что и Фаза 2 пайплайна: строки, которые лист не применяет
+ * (условие броска, условие носителя), сюда не попадают.
+ *
+ * @param entity - актор или существо
+ * @returns эффекты с ненулевым вкладом в порядке применения
+ */
+function resolveEffectHitPointsSources(
+  entity: DnDActor | DnDCreature,
+): MaxHitPointsSource[] {
+  const baseStats = prepareBaseData(entity);
+  const formulaContext = buildFormulaContext(entity);
+  const carrier = buildCarrierContext(entity);
+
+  const sheetEffects = collectActiveEffects(entity).filter((effect) =>
+    effectAppliesOnSheet(effect, carrier),
+  );
+
+  // Формулы хитов читают характеристики уже с эффектами — как второй проход
+  // Фазы 2
+  const modifiedStats = applyActiveEffects(
+    baseStats,
+    sheetEffects,
+    formulaContext,
+    carrier,
+  );
+
+  const passContext = withResolvedSheetNumbers(formulaContext, {
+    abilities: modifiedStats.abilities,
+    abilityMods: modifiedStats.abilityMods,
+    proficiencyBonus: formulaContext.prof,
+  });
+
+  const hitPointChanges = sheetEffects
+    .flatMap((effect) => effect.changes.map((change) => ({ change, effect })))
+    .filter(
+      ({ change }) =>
+        change.key === 'hitPoints.max'
+        && !skipChangeOnSheet(change, carrier)
+        && !isRollTimeDiceChange(change),
+    )
+    .sort((left, right) => left.change.priority - right.change.priority);
+
+  const sources: MaxHitPointsSource[] = [];
+
+  let currentMax = baseStats.hitPointsMax;
+
+  for (const { change, effect } of hitPointChanges) {
+    const resolvedValue = resolveChangeValue(change.value, passContext);
+
+    if (resolvedValue === undefined) {
+      continue;
+    }
+
+    const nextMax = applyMode(currentMax, resolvedValue, change.mode);
+
+    if (nextMax !== currentMax) {
+      sources.push({
+        kind: MAX_HIT_POINTS_SOURCE_KIND.effect,
+        name: effect.name,
+        delta: nextMax - currentMax,
+      });
+    }
+
+    currentMax = nextMax;
+  }
+
+  return sources;
+}
+
+/**
+ * Разбор прибавки к максимуму хитов по источникам — то же число, что отдаёт
+ * {@link resolveMaxHitPointsDelta}, но поимённо.
+ *
+ * Игрок видит в плитке хитов число больше набранного в окне и не знает, откуда
+ * оно: «Дварфская стойкость» и Телосложение из предыстории лежат эффектами.
+ * Вклад формулы («+1 за уровень») приходит готовым числом.
+ *
+ * @param entity - актор или существо
+ * @returns источники с ненулевым вкладом в порядке применения
+ */
+export function resolveMaxHitPointsBreakdown(
+  entity: DnDActor | DnDCreature,
+): MaxHitPointsSource[] {
+  const effectSources = resolveEffectHitPointsSources(entity);
+
+  // Хиты существа заданы статблоком целиком, уровней у него нет
+  if (isCreatureEntity(entity)) {
+    return effectSources;
+  }
+
+  const constitutionDelta = resolveConstitutionHitPointsDelta(
+    entity,
+    resolveActorStats(entity),
+  );
+
+  return constitutionDelta === 0
+    ? effectSources
+    : [
+        ...effectSources,
+        {
+          kind: MAX_HIT_POINTS_SOURCE_KIND.constitution,
+          delta: constitutionDelta,
+        },
+      ];
+}
+
+/**
  * Собирает иммунитеты сущности к состояниям из двух источников:
  * 1. Статический список существа (`system.defenses.conditionImmunities`).
- * 2. Поля `conditionImmunities` активных эффектов (предметы, виды, состояния) —
- *    единственный путь для актёров, у которых нет `system.defenses`.
+ * 2. Поля `conditionImmunities` действующих эффектов — тех же, что собирает
+ *    лист (`collectActiveEffects`): свои эффекты, экипированные предметы,
+ *    черты существа. Раньше читались только свои эффекты сущности, и кольцо
+ *    «иммунитет к очарованию» или черта монстра не защищали ни от чего, хотя
+ *    окно эффекта это обещало.
  *
  * Единый помощник для всех мест наложения состояний (DRY): и проверка цели
  * атаки/заклинания, и тоггл на листе используют один источник правды.
  *
  * @param entity - актор или существо
+ * @param ambientEffects - ауры чужих токенов, накрывающие сущность («Аура
+ *   отваги» даёт иммунитет к Испугу всем союзникам в ней)
+ * @param sourceCreatureType - тип того, кто накладывает состояние: по нему
+ *   включаются иммунитеты «только от существ этих типов» («Защита от зла и
+ *   добра»). Нет — такие иммунитеты не действуют
  * @returns ключи состояний, к которым сущность иммунна (может быть пустым)
  */
 export function getEntityConditionImmunities(
   entity: DnDSceneEntity,
+  ambientEffects: readonly ActiveEffect[] = [],
+  sourceCreatureType?: CreatureCategory,
 ): readonly string[] {
   const fromEffects: string[] = [];
 
-  for (const effect of entity.activeEffects ?? []) {
-    if (effect.disabled) {
+  // Отключённые эффекты, предметы вне экипировки и эффекты «в цель» отсеяны
+  // сбором — второй проверки здесь не нужно
+  for (const effect of [...collectActiveEffects(entity), ...ambientEffects]) {
+    if (
+      !effect.conditionImmunities?.length
+      || !sourceImmunityHolds(effect, sourceCreatureType)
+    ) {
       continue;
     }
 
-    for (const conditionKey of effect.conditionImmunities ?? []) {
+    for (const conditionKey of effect.conditionImmunities) {
       fromEffects.push(conditionKey);
     }
   }
@@ -1025,63 +3127,216 @@ export function getEntityConditionImmunities(
 }
 
 /**
+ * Действует ли иммунитет эффекта против того, кто накладывает состояние.
+ *
+ * Иммунитет эффекта с условием об источнике (`source.creatureType === "…"`) —
+ * «не может получить состояния очарованный или испуганный от таких существ»:
+ * он действует, только когда накладывает существо нужного типа. У остальных
+ * эффектов иммунитет действует всегда, как и раньше.
+ *
+ * @param effect - эффект с иммунитетами
+ * @param sourceCreatureType - тип накладывающего; нет — источник неизвестен
+ * @returns `true`, если иммунитет действует
+ */
+function sourceImmunityHolds(
+  effect: ActiveEffect,
+  sourceCreatureType: CreatureCategory | undefined,
+): boolean {
+  const { rollCondition } = effect;
+
+  if (
+    rollCondition === undefined
+    || !splitConditionParts(rollCondition).some(
+      (part) =>
+        parseCreatureTypeCondition(part, 'source.creatureType') !== undefined,
+    )
+  ) {
+    return true;
+  }
+
+  return (
+    sourceCreatureType !== undefined
+    && evaluateCondition(rollCondition, {
+      ...NEUTRAL_ROLL_CONTEXT,
+      source: { creatureType: sourceCreatureType },
+    })
+  );
+}
+
+/**
+ * Пересчитывает модификаторы характеристик по их текущим значениям.
+ *
+ * Отдельной функцией, потому что считается дважды: до своих бонусов к
+ * характеристикам (от этих чисел бонусы и считаются) и после них.
+ *
+ * @param stats - разрешённые статы листа; правятся на месте
+ */
+function refreshAbilityModifiers(stats: ResolvedActorStats): void {
+  for (const abilityKey of ABILITY_KEYS) {
+    stats.abilityMods[abilityKey] = Math.floor(
+      (stats.abilities[abilityKey] - 10) / 2,
+    );
+  }
+}
+
+/**
  * Вычисляет производные значения на основе модифицированных базовых данных.
  *
  * Эта фаза выполняется ПОСЛЕ применения Active Effects.
  * Модификаторы, AC, навыки, спасброски — всё вычисляется здесь.
  *
+ * Изменения эффектов на производные ключи применяются здесь же, поверх числа,
+ * посчитанного по правилам (см. {@link collectDerivedChanges}).
+ *
  * @param modifiedStats - статы после applyActiveEffects
  * @param actor - исходный актор (для proficiencies и настроек)
+ * @param derivedChanges - изменения производных ключей по ключу
+ * @param formulaContext - контекст для вычисления формул
  * @returns финальные resolved статы
  */
 export function prepareDerivedData(
   modifiedStats: ResolvedActorStats,
-  actor: DnDActor | Creature,
+  actor: DnDActor | DnDCreature,
+  derivedChanges: DerivedChangeMap,
+  formulaContext: FormulaContext,
 ): ResolvedActorStats {
   const system = actor.system;
   const derivedStats = cloneResolvedStats(modifiedStats);
 
-  // Вычисляем proficiency bonus
-  let proficiencyBonus = 2;
+  // 1. Модификаторы характеристик. Считаются первыми: от них зависят и свои
+  // бонусы к мастерству, и всё, что идёт ниже
+  refreshAbilityModifiers(derivedStats);
+
+  // 2. Бонус мастерства — по правилам
+  let ruleProficiencyBonus = DEFAULT_PROFICIENCY_BONUS;
 
   if ('classes' in system && Array.isArray(system.classes)) {
     // DnDActor
     const level = getTotalLevel(system.classes);
 
-    proficiencyBonus = calculateProficiencyBonus(level);
+    ruleProficiencyBonus = calculateProficiencyBonus(level);
   } else if ('details' in system) {
     // Legacy / Fallback
     const details = system.details;
 
-    proficiencyBonus =
+    ruleProficiencyBonus =
       isRecord(details) && typeof details.proficiencyBonus === 'number'
         ? details.proficiencyBonus
-        : 2;
+        : DEFAULT_PROFICIENCY_BONUS;
   } else if ('proficiencyBonus' in system) {
     // Creature
     const creatureProficiencyBonus = system.proficiencyBonus;
 
-    proficiencyBonus =
+    ruleProficiencyBonus =
       typeof creatureProficiencyBonus === 'number'
         ? creatureProficiencyBonus
-        : 2;
+        : DEFAULT_PROFICIENCY_BONUS;
   }
 
-  derivedStats.proficiencyBonus =
-    derivedStats.proficiencyBonus || proficiencyBonus;
+  // Настройка листа заменяет основу расчёта и добавляет свои бонусы: у актёра
+  // она правит бонус по уровню, у существа — бонус по опасности.
+  // Модификаторы передаются ссылкой на живой объект статов: ниже они
+  // пересчитываются на месте, и повторный разбор берёт уже новые числа
+  const proficiencyParams: DnDProficiencyBonusParams = {
+    ruleValue: ruleProficiencyBonus,
+    settings: parseProficiencySettings(
+      isRecord(system) ? system.proficiencySettings : undefined,
+    ),
+    abilityMods: derivedStats.abilityMods,
+  };
 
-  // 2. Модификаторы характеристик
+  derivedStats.proficiencyBonus = applyDerivedChanges(
+    derivedStats,
+    'proficiencyBonus',
+    getProficiencyBonusBreakdown(proficiencyParams).value,
+    derivedChanges,
+    formulaContext,
+  );
+
+  // 3. Свои бонусы к самим характеристикам (пояс силы, дар вида, домашнее
+  // правило). Прибавка идёт в значение характеристики, а не в модификатор:
+  // так же работают предметы и эффекты, и всё производное ниже считается уже
+  // с ней.
+  //
+  // Источники бонусов берутся из чисел листа ДО этих прибавок — иначе бонус
+  // «+мод. Мудрости к Силе» зависел бы от значения, которое сам же и меняет.
+  // Круг размыкается здесь один раз: сперва прибавки по старым числам, затем
+  // модификаторы и бонус мастерства пересчитываются набело.
+  derivedStats.abilityBonusContext = {
+    abilityMods: { ...derivedStats.abilityMods },
+    proficiencyBonus: derivedStats.proficiencyBonus,
+  };
+
+  const abilityBonuses = parseAbilityBonuses(
+    isRecord(system) ? system.abilityBonuses : undefined,
+  );
+
+  let hasAbilityBonuses = false;
+
   for (const abilityKey of ABILITY_KEYS) {
-    derivedStats.abilityMods[abilityKey] = Math.floor(
-      (derivedStats.abilities[abilityKey] - 10) / 2,
+    const bonuses = abilityBonuses[abilityKey];
+
+    // Значение, заданное эффектом целиком, прибавок не принимает: оно и есть
+    // итог, пока эффект держится
+    if (!bonuses || derivedStats.overriddenKeys.has(`ability.${abilityKey}`)) {
+      continue;
+    }
+
+    const bonusValue = getCustomBonusesValue(
+      derivedStats.abilityBonusContext,
+      bonuses,
+    );
+
+    if (bonusValue !== 0) {
+      derivedStats.abilities[abilityKey] += bonusValue;
+      hasAbilityBonuses = true;
+    }
+  }
+
+  if (hasAbilityBonuses) {
+    refreshAbilityModifiers(derivedStats);
+
+    derivedStats.proficiencyBonus = applyDerivedChanges(
+      derivedStats,
+      'proficiencyBonus',
+      getProficiencyBonusBreakdown(proficiencyParams).value,
+      derivedChanges,
+      formulaContext,
     );
   }
 
-  // 3. Спасброски
+  // Всё ниже — спасброски, навыки, КД формулой, Сл — считается от итоговых
+  // чисел листа: характеристики уже с эффектами и своими бонусами. Бонус
+  // мастерства выше считался от чисел до прибавок — он и есть размыкание
+  const derivedFormulaContext = withResolvedSheetNumbers(
+    formulaContext,
+    derivedStats,
+  );
+
+  // Числа, от которых считаются свои бонусы листа. Собираются один раз и
+  // передаются во все расчёты ниже: бонус берёт отсюда либо модификатор своей
+  // характеристики, либо бонус мастерства
+  const bonusContext: DnDCustomBonusContext = {
+    abilityMods: derivedStats.abilityMods,
+    proficiencyBonus: derivedStats.proficiencyBonus,
+  };
+
+  // 4. Спасброски
+  const savingThrowSettings = parseSavingThrowSettings(
+    isRecord(system) ? system.savingThrowSettings : undefined,
+  );
+
+  // Бонусы ко всем шести считаются один раз: они у листа общие
+  const commonSaveBonus = getCustomBonusesValue(
+    bonusContext,
+    savingThrowSettings?.common ?? [],
+  );
+
   for (const abilityKey of ABILITY_KEYS) {
-    if (derivedStats.overriddenKeys.has(`save.${abilityKey}`)) {
-      continue;
-    }
+    const savingThrowSetting = getSavingThrowSetting(
+      savingThrowSettings,
+      abilityKey,
+    );
 
     let hasProficiency = false;
 
@@ -1103,26 +3358,79 @@ export function prepareDerivedData(
 
     const profBonus = hasProficiency ? derivedStats.proficiencyBonus : 0;
 
-    derivedStats.saves[abilityKey] =
-      derivedStats.abilityMods[abilityKey]
+    // Характеристика расчёта берётся из настройки: умения и предметы дают
+    // катить спасбросок от другой, чем та, чьё имя он носит
+    const saveAbility = savingThrowSetting.ability ?? abilityKey;
+
+    const ruleSave =
+      derivedStats.abilityMods[saveAbility]
       + profBonus
-      + derivedStats.saves[abilityKey];
+      + getCustomBonusesValue(bonusContext, savingThrowSetting.bonuses)
+      + commonSaveBonus;
+
+    derivedStats.saves[abilityKey] = applyDerivedChanges(
+      derivedStats,
+      `save.${abilityKey}`,
+      ruleSave,
+      derivedChanges,
+      derivedFormulaContext,
+    );
   }
 
-  // 4. Навыки
-  for (const skillKey of SKILL_KEYS) {
-    if (derivedStats.overriddenKeys.has(`skill.${skillKey}`)) {
-      continue;
-    }
+  // Концентрация — отдельная прибавка поверх спасброска Телосложения
+  derivedStats.concentrationSaveBonus = applyDerivedChanges(
+    derivedStats,
+    CONCENTRATION_SAVE_KEY,
+    0,
+    derivedChanges,
+    derivedFormulaContext,
+  );
 
-    const baseAbility = SKILL_ABILITY_MAP[skillKey];
+  // Спасбросок от смерти характеристики не имеет — только прибавки
+  derivedStats.deathSaveBonus = applyDerivedChanges(
+    derivedStats,
+    DEATH_SAVE_KEY,
+    0,
+    derivedChanges,
+    derivedFormulaContext,
+  );
+
+  // 5. Навыки. Прибавка ко всем проверкам характеристик входит и в навык:
+  // проверка навыка — та же проверка характеристики
+  derivedStats.abilityCheckBonus = applyDerivedChanges(
+    derivedStats,
+    ABILITY_CHECK_KEY,
+    0,
+    derivedChanges,
+    derivedFormulaContext,
+  );
+
+  const skillSettings = parseSkillSettings(
+    isRecord(system) ? system.skillSettings : undefined,
+  );
+
+  for (const skillKey of SKILL_KEYS) {
+    const skillSetting = getSkillSetting(skillSettings, skillKey);
+
+    // Характеристика расчёта берётся из настройки: умения и предметы дают
+    // катить проверку от другой, чем та, что у навыка по правилам
+    const baseAbility = getSkillSettingAbility(skillSetting, skillKey);
 
     let profContribution = 0;
 
     const proficiencies = system.proficiencies;
+    const rootSkills = system.skills;
+
+    let rawLevel: unknown;
 
     if (isRecord(proficiencies) && isRecord(proficiencies.skills)) {
-      const rawLevel = proficiencies.skills[skillKey];
+      rawLevel = proficiencies.skills[skillKey];
+    } else if (isRecord(rootSkills)) {
+      // Creature: владения навыками хранятся на корне system
+      rawLevel = rootSkills[skillKey];
+    }
+
+    if (rawLevel !== undefined) {
       const profLevel = isProficiencyLevel(rawLevel) ? rawLevel : 'none';
 
       profContribution = getProficiencyContribution(
@@ -1131,41 +3439,72 @@ export function prepareDerivedData(
       );
     }
 
-    derivedStats.skills[skillKey] =
+    const ruleSkill =
       derivedStats.abilityMods[baseAbility]
       + profContribution
-      + derivedStats.skills[skillKey];
+      + getCustomBonusesValue(bonusContext, skillSetting.bonuses)
+      + derivedStats.abilityCheckBonus;
+
+    derivedStats.skills[skillKey] = applyDerivedChanges(
+      derivedStats,
+      getSkillEffectKey(skillKey),
+      ruleSkill,
+      derivedChanges,
+      derivedFormulaContext,
+    );
   }
 
-  // 5. Инициатива
-  if (!derivedStats.overriddenKeys.has('initiative')) {
-    const initAbility = system.initiativeAbility ?? 'dexterity';
+  // 6. Инициатива
+  const initAbility = system.initiativeAbility ?? 'dexterity';
 
-    derivedStats.initiative =
-      derivedStats.abilityMods[initAbility]
-      + (system.initiativeBonus ?? 0)
-      + derivedStats.initiative;
-  }
+  const ruleInitiative =
+    derivedStats.abilityMods[initAbility]
+    + (system.initiativeBonus ?? 0)
+    + getCustomBonusesValue(
+      bonusContext,
+      parseCustomBonuses(
+        isRecord(system) ? system.initiativeBonuses : undefined,
+      ),
+    );
 
-  // 6. Класс доспеха (AC)
+  derivedStats.initiative = applyDerivedChanges(
+    derivedStats,
+    'initiative',
+    ruleInitiative,
+    derivedChanges,
+    derivedFormulaContext,
+  );
+
+  // 7. Класс доспеха (AC)
   const dexMod = derivedStats.abilityMods.dexterity;
 
   let calculatedAC: number;
   let shieldBonus = 0;
-  let acEffectBonus = 0;
 
-  if ('equipment' in actor) {
-    // Бонус от Active Effects, применённых в фазе 2 (разница с базовым значением)
-    acEffectBonus =
-      modifiedStats.armorClass
-      - (system.armorClass?.value ?? BASE_UNARMORED_AC);
+  // Инвентарь теперь есть у обоих листов, поэтому ветку выбирает ТИП сущности,
+  // а не наличие поля: у существа класс доспеха задан статблоком, и надетая
+  // броня его не трогает. Иначе весь бестиарий поехал бы от одного факта
+  // появления инвентаря — вместе с помехой за «чужую» броню на каждой атаке.
+  //
+  // Единственный вход в общий расчёт для существа — осознанный выбор мастера:
+  // способ «По умолчанию» и означает «считать от снаряжения». Способ, которого
+  // у записи нет, читается как «фиксированный»: так ведёт себя статблок.
+  const isActorSheet = actor.entityType === 'actor';
 
+  const calculation =
+    system.armorClass?.calculation ?? (isActorSheet ? 'default' : 'flat');
+
+  // Список ключей базовых типов брони/щитов, которыми владеет актёр. У существа
+  // владений нет вовсе: монстр умеет то, чем вооружён, и помеха за незнакомую
+  // броню ему не грозит — поэтому здесь `undefined`, а не пустой список.
+  const armorProficiencies =
+    actor.entityType === 'actor'
+      ? (actor.system.proficiencies?.armor ?? [])
+      : undefined;
+
+  if (isActorSheet || calculation === 'default') {
     // Поиск экипированной брони и щита.
-    // `'equipment' in actor` уже сузил тип до DnDActor — каст не нужен.
     const equipment = actor.equipment ?? [];
-
-    // Список ключей базовых типов брони/щитов, которыми актёр владеет.
-    const armorProficiencies = actor.system.proficiencies?.armor ?? [];
 
     let equippedArmor: (typeof equipment)[number] | undefined;
     // Носит броню или щит, которым не владеет → помеха по правилам D&D 5e
@@ -1174,7 +3513,7 @@ export function prepareDerivedData(
     let hasStealthDisadvantage = false;
 
     for (const item of equipment) {
-      if (!item.equipped || !item.baseArmorAC) {
+      if (!isItemWorn(item) || !item.baseArmorAC) {
         continue;
       }
 
@@ -1182,14 +3521,18 @@ export function prepareDerivedData(
         continue;
       }
 
-      // Владение: baseType надетого предмета должен быть в списке владений.
-      // Если baseType неизвестен (кастомный предмет) — не штрафуем.
-      if (item.baseType && !armorProficiencies.includes(item.baseType)) {
+      // Владение: сам доспех, его категория или все доспехи категории
+      // (см. isArmorProficient). Списка нет (существо) — не проверяется.
+      if (armorProficiencies && !isArmorProficient(item, armorProficiencies)) {
         lacksArmorProficiency = true;
       }
 
+      // Магия брони/щита работает по тем же правилам, что и её эффекты:
+      // предмету с обязательной настройкой без настройки магия не считается
+      const magicBonus = itemEffectsActive(item) ? (item.magicBonus ?? 0) : 0;
+
       if (item.equipmentCategory === 'shield') {
-        shieldBonus += item.baseArmorAC + (item.magicBonus ?? 0);
+        shieldBonus += item.baseArmorAC + magicBonus;
       } else if (item.baseArmorAC > 0) {
         if (item.stealthDisadvantage) {
           hasStealthDisadvantage = true;
@@ -1219,8 +3562,6 @@ export function prepareDerivedData(
       derivedStats.activeFlags.add('skill.stealth.disadvantage');
     }
 
-    const calculation = system.armorClass?.calculation ?? 'default';
-
     switch (calculation) {
       case 'flat': {
         calculatedAC = system.armorClass?.value ?? BASE_UNARMORED_AC;
@@ -1237,7 +3578,11 @@ export function prepareDerivedData(
         if (equippedArmor) {
           // Есть экипированная броня
           const armorBase = equippedArmor.baseArmorAC ?? BASE_UNARMORED_AC;
-          const armorMagicBonus = equippedArmor.magicBonus ?? 0;
+
+          const armorMagicBonus = itemEffectsActive(equippedArmor)
+            ? (equippedArmor.magicBonus ?? 0)
+            : 0;
+
           const maxDex = equippedArmor.maxDexBonus;
 
           // maxDexBonus: null = без ограничений, 0 = DEX не добавляется, N = cap
@@ -1255,44 +3600,86 @@ export function prepareDerivedData(
         break;
     }
   } else {
-    // Creature
-    const creatureAC = system.armorClass;
-
-    calculatedAC = creatureAC?.value ?? BASE_UNARMORED_AC;
-
-    const modifiedAC = modifiedStats.armorClass;
-
-    acEffectBonus = Number(modifiedAC) - calculatedAC;
-
-    if (Number.isNaN(acEffectBonus)) {
-      acEffectBonus = 0;
-    }
+    // Существо без расчёта от снаряжения: КД задан статблоком как есть.
+    // Ни надетая броня, ни щит сюда не приходят — только свои бонусы листа и
+    // активные эффекты ниже, как это было до появления инвентаря.
+    calculatedAC = system.armorClass?.value ?? BASE_UNARMORED_AC;
   }
 
-  // Итоговое AC = расчётный КД + щит + бонусы от Active Effects
-  derivedStats.armorClass = calculatedAC + shieldBonus + acEffectBonus;
+  // КД по правилам: расчётный + щит + свои бонусы листа. Эффекты применяются
+  // поверх — тогда «заменить КД на 13» действительно даёт 13, а не прибавку
+  const ruleArmorClass =
+    calculatedAC
+    + shieldBonus
+    + getCustomBonusesValue(
+      bonusContext,
+      parseCustomBonuses(
+        isRecord(system) ? system.armorClassBonuses : undefined,
+      ),
+    );
+
+  derivedStats.armorClass = applyDerivedChanges(
+    derivedStats,
+    'armorClass',
+    ruleArmorClass,
+    derivedChanges,
+    derivedFormulaContext,
+  );
 
   // 8. Spell Save DC (8 + бонус мастерства + мод. характеристики заклинателя)
-  const spellcastingAbility = getFirstSpellcastingAbility(actor);
+  const spellcastingAbility = findSpellcastingAbility(actor);
 
-  if (spellcastingAbility) {
-    const spellMod = derivedStats.abilityMods[spellcastingAbility];
+  // Настройка листа: своё число вместо расчёта по правилам и свои бонусы
+  // сверху. Активные эффекты ложатся уже поверх неё
+  const spellSaveDC = getSpellSaveDCBreakdown({
+    ability: spellcastingAbility,
+    settings: parseSpellcastingSettings(
+      isRecord(system) ? system.spellcastingSettings : undefined,
+    )?.saveDC,
+    context: bonusContext,
+  });
 
-    derivedStats.spellSaveDC =
-      derivedStats.spellSaveDC // бонусы от эффектов (фаза 2)
-      + 8
-      + derivedStats.proficiencyBonus
-      + spellMod;
+  if (spellSaveDC) {
+    derivedStats.spellSaveDC = applyDerivedChanges(
+      derivedStats,
+      'spellSaveDC',
+      spellSaveDC.value,
+      derivedChanges,
+      derivedFormulaContext,
+    );
   }
 
-  // 9. Speed.zero flag — обнуляет все скорости
-  if (derivedStats.activeFlags.has('speed.zero')) {
-    for (const movementKey of MOVEMENT_KEYS) {
-      derivedStats.movement[movementKey] = 0;
+  // 9. Свои бонусы к передвижению
+  const movementBonuses = parseMovementBonuses(
+    isRecord(system) ? system.movementBonuses : undefined,
+  );
+
+  for (const movementKey of MOVEMENT_KEYS) {
+    const bonuses = movementBonuses[movementKey];
+
+    // Ноль значит, что такого передвижения у листа нет: прибавка не должна
+    // заводить его сама — этим занимаются активные эффекты
+    if (!bonuses || derivedStats.movement[movementKey] === 0) {
+      continue;
     }
+
+    derivedStats.movement[movementKey] += getCustomBonusesValue(
+      bonusContext,
+      bonuses,
+    );
   }
 
-  // 10. Защиты от урона (статические + от флагов активных эффектов)
+  // 10. Скорость не бывает отрицательной: флаг `speed.zero` обнуляет её целиком,
+  // а штрафы (Истощение даёт −5 фт за степень) зажимаются нулём снизу
+  const hasZeroSpeed = derivedStats.activeFlags.has('speed.zero');
+
+  for (const movementKey of MOVEMENT_KEYS) {
+    derivedStats.movement[movementKey] = hasZeroSpeed
+      ? 0
+      : Math.max(0, derivedStats.movement[movementKey]);
+  }
+
+  // 11. Защиты от урона (статические + от флагов активных эффектов)
   derivedStats.damageDefenses = resolveDamageDefenses(
     actor,
     derivedStats.activeFlags,
@@ -1306,10 +3693,14 @@ export function prepareDerivedData(
 /**
  * Объединяет нативные эффекты актора с внешними (ambient, от аур на карте).
  *
- * Ambient-эффект не добавляется, если на акторе УЖЕ есть такой же активный
- * эффект — по правилам D&D 5e эффекты с одинаковым именем не суммируются.
- * Ambient-эффект имеет id `${effect.id}_aura_${source.id}`; совпадение ищется
- * по оригинальному ID или имени.
+ * По правилу PHB 2024 «Combining Game Effects» одноимённые эффекты не
+ * складываются, поэтому отсеиваются два вида дублей:
+ * 1. Аура повторяет эффект, который уже висит на самом акторе.
+ * 2. Одну и ту же ауру излучают сразу несколько источников (два паладина рядом)
+ *    — засчитывается только первая.
+ *
+ * Ambient-эффект имеет id `${effect.id}_aura_${source.id}`; сравнение идёт по
+ * оригинальному id эффекта и по имени.
  *
  * @param nativeEffects - собственные эффекты актора (см. collectActiveEffects)
  * @param ambientEffects - внешние эффекты от аур
@@ -1319,16 +3710,26 @@ export function combineEffectsWithAmbient(
   nativeEffects: readonly ActiveEffect[],
   ambientEffects: readonly ActiveEffect[],
 ): ActiveEffect[] {
-  const filteredAmbient = ambientEffects.filter((ambientEff) => {
-    const ambientBaseId = ambientEff.id.split('_aura_')[0];
+  const takenIds = new Set(nativeEffects.map((effect) => effect.id));
 
-    return !nativeEffects.some(
-      (nativeEff) =>
-        nativeEff.id === ambientBaseId
-        || (nativeEff.name || '').trim().toLowerCase()
-          === (ambientEff.name || '').trim().toLowerCase(),
-    );
-  });
+  const takenNames = new Set(
+    nativeEffects.map((effect) => effect.name.trim().toLowerCase()),
+  );
+
+  const filteredAmbient: ActiveEffect[] = [];
+
+  for (const ambientEffect of ambientEffects) {
+    const ambientBaseId = ambientEffect.id.split('_aura_')[0];
+    const ambientName = ambientEffect.name.trim().toLowerCase();
+
+    if (takenIds.has(ambientBaseId) || takenNames.has(ambientName)) {
+      continue;
+    }
+
+    takenIds.add(ambientBaseId);
+    takenNames.add(ambientName);
+    filteredAmbient.push(ambientEffect);
+  }
 
   return nativeEffects.concat(filteredAmbient);
 }
@@ -1346,7 +3747,7 @@ export function combineEffectsWithAmbient(
  * @returns полностью вычисленные ResolvedActorStats
  */
 export function resolveActorStats(
-  actor: DnDActor | Creature,
+  actor: DnDActor | DnDCreature,
   ambientEffects: readonly ActiveEffect[] = [],
 ): ResolvedActorStats {
   // Фаза 1: базовые данные
@@ -1361,56 +3762,55 @@ export function resolveActorStats(
   // Контекст формул (из базовых данных — ДО модификации)
   const formulaContext = buildFormulaContext(actor);
 
-  // Фаза 2: применение эффектов
-  const modifiedStats = applyActiveEffects(
-    baseStats,
-    activeEffects,
-    formulaContext,
+  // Свойства носителя — для условий семейства `self.*`: они известны по листу,
+  // и такие условия считаются здесь, а не при броске
+  const carrier = buildCarrierContext(actor);
+
+  // Эффекты «только в бросках» в числа листа не входят
+  const sheetEffects = activeEffects.filter((effect) =>
+    effectAppliesOnSheet(effect, carrier),
   );
 
-  // Фаза 3: производные данные
-  return prepareDerivedData(modifiedStats, actor);
+  // Фаза 2: применение эффектов к базовым значениям
+  const modifiedStats = applyActiveEffects(
+    baseStats,
+    sheetEffects,
+    formulaContext,
+    carrier,
+  );
+
+  // Фаза 3: производные данные — считаются по правилам, поверх ложатся
+  // изменения производных ключей (спасброски, навыки, КД, Сл заклинаний…)
+  return prepareDerivedData(
+    modifiedStats,
+    actor,
+    collectDerivedChanges(sheetEffects, carrier),
+    formulaContext,
+  );
+}
+
+/**
+ * Суммарная скорость сущности всеми способами передвижения. Ноль значит, что
+ * сущность не может двигаться вовсе: опутана, окаменела или скорость отняли
+ * иначе.
+ *
+ * @param stats - разрешённые статы сущности
+ * @returns сумма скоростей ходьбы, полёта, плавания, лазания и копания
+ */
+export function resolveTotalMovementSpeed(stats: ResolvedActorStats): number {
+  return Object.values(stats.movement).reduce(
+    (totalSpeed, speed) => totalSpeed + (speed || 0),
+    0,
+  );
 }
 
 // ── Вспомогательные функции ───────────────────────────────────
 
 /**
- * Определяет характеристику заклинателя из классов актора.
- *
- * Берёт первый класс, у которого заполнено spellcastingAbility
- * (копируется из ClassDefinition.spellcasting.ability при выборе класса).
- *
- * @param actor - актор
- * @returns характеристика заклинателя или null если нет классов-заклинателей
- */
-function getFirstSpellcastingAbility(
-  actor: DnDActor | Creature,
-): AbilityType | null {
-  // Ручной приоритет в корне персонажа
-  const manualSpellcastingAbility = actor.system.spellcastingAbility;
-
-  if (isAbilityType(manualSpellcastingAbility)) {
-    return manualSpellcastingAbility;
-  }
-
-  // Если есть классы
-  if (isActorEntity(actor)) {
-    const casterClass = actor.system.classes.find(
-      (entry) => entry.spellcastingAbility != null,
-    );
-
-    if (casterClass?.spellcastingAbility) {
-      return casterClass.spellcastingAbility;
-    }
-  }
-
-  return null;
-}
-
-/**
  * Создаёт глубокую копию ResolvedActorStats.
  *
- * Необходимо для immutable transforms (AGENTS.md).
+ * Нужна, чтобы расчёт не менял чужие статы на месте: вызывающий получает
+ * новый объект.
  *
  * @param stats - исходные статы
  * @returns независимая копия
@@ -1421,13 +3821,23 @@ function cloneResolvedStats(stats: ResolvedActorStats): ResolvedActorStats {
     abilityMods: { ...stats.abilityMods },
     saves: { ...stats.saves },
     skills: { ...stats.skills },
+    abilityCheckBonus: stats.abilityCheckBonus,
+    concentrationSaveBonus: stats.concentrationSaveBonus,
+    deathSaveBonus: stats.deathSaveBonus,
     armorClass: stats.armorClass,
     initiative: stats.initiative,
     proficiencyBonus: stats.proficiencyBonus,
     movement: { ...stats.movement },
+    senses: { ...stats.senses },
     hitPointsMax: stats.hitPointsMax,
+    critThreshold: stats.critThreshold,
     attackBonuses: { ...stats.attackBonuses },
     damageBonuses: { ...stats.damageBonuses },
+    abilityDamageBonuses: {
+      melee: { ...stats.abilityDamageBonuses.melee },
+      ranged: { ...stats.abilityDamageBonuses.ranged },
+    },
+    weaponOverrides: [...stats.weaponOverrides],
     spellSaveDC: stats.spellSaveDC,
     activeFlags: new Set(stats.activeFlags),
     damageDefenses: {
@@ -1436,5 +3846,20 @@ function cloneResolvedStats(stats: ResolvedActorStats): ResolvedActorStats {
       vulnerabilities: new Set(stats.damageDefenses.vulnerabilities),
     },
     overriddenKeys: new Set(stats.overriddenKeys),
+    abilityBonusContext: {
+      abilityMods: { ...stats.abilityBonusContext.abilityMods },
+      proficiencyBonus: stats.abilityBonusContext.proficiencyBonus,
+    },
   };
+}
+
+/**
+ * Недееспособна ли сущность: флаг недееспособности среди её действующих
+ * флагов (его ставят «Парализованный», «Ошеломлённый» и другие состояния).
+ *
+ * @param entity - сущность
+ * @returns `true`, если сущность недееспособна
+ */
+export function isEntityIncapacitated(entity: DnDActor | DnDCreature): boolean {
+  return resolveActorStats(entity).activeFlags.has(INCAPACITATED_CONDITION_KEY);
 }

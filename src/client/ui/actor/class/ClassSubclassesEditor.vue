@@ -1,13 +1,24 @@
 <script setup lang="ts">
+  import type { TypedWebSocketClient } from '@vtt/shared';
+
   import type { SpellOption } from '../grantedSpellsEditorTypes';
   import type { EditableSubclass } from './classEditorTypes';
 
-  import { generateId } from '@vtt/shared';
-  import { computed, ref } from 'vue';
+  import { computed, ref, useTemplateRef } from 'vue';
 
   import RichTextEditor from '@/shared_ui/components/RichTextEditor.vue';
+  import { generateId } from '@vtt/shared';
 
-  import ClassCountersEditor from './ClassCountersEditor.vue';
+  import {
+    CLASS_FEATURES_EDITOR_LABELS,
+    CLASS_SUBCLASS_DEFAULT_NAME,
+    CLASS_SUBCLASSES_LABELS,
+    FEAT_GRANTS_LABELS,
+    FORM_FIELD_LABELS,
+  } from '../constants';
+  import CounterRowsEditor from '../CounterRowsEditor.vue';
+  import EditorNestedSection from '../EditorNestedSection.vue';
+  import SourceField from '../SourceField.vue';
   import {
     createEmptyLevelTable,
     createEmptySpellcasting,
@@ -19,6 +30,11 @@
   const props = defineProps<{
     /** Заклинания компендиума по пакам — для подсказок связывания. */
     availableSpells?: SpellOption[];
+    /**
+     * Сокет для окна выбора заклинания из компендиума. Без него добавить
+     * заклинание нечем: другого способа завести запись у редактора нет.
+     */
+    socket?: TypedWebSocketClient | null;
     /** Уровень получения подкласса из базового класса (по умолч. unlockLevel). */
     subclassLevel: number;
   }>();
@@ -35,13 +51,6 @@
 
   const selected = computed<EditableSubclass | null>(
     () => subclasses.value[selectedIndex.value] ?? null,
-  );
-
-  /** Особенности выбранного подкласса как опции привязки счётчиков. */
-  const featureOptions = computed(() =>
-    (selected.value?.features ?? [])
-      .filter((feature) => feature.name.trim().length > 0)
-      .map((feature) => ({ value: feature.key, label: feature.name })),
   );
 
   /** Добавляет подкласс и выбирает его. */
@@ -76,6 +85,13 @@
   function forwardOpenSpell(spellId: string, packId?: string): void {
     emit('open-spell', spellId, packId);
   }
+
+  /**
+   * Списки разделов подкласса: кнопка добавления живёт в шапке раздела, а
+   * знание о том, какой получается новая строка, остаётся у редактора.
+   */
+  const featureRows = useTemplateRef('featureRows');
+  const counterRows = useTemplateRef('counterRows');
 </script>
 
 <template>
@@ -85,7 +101,7 @@
       <UButton
         v-for="(subclass, index) in subclasses"
         :key="subclass.key"
-        :label="subclass.name || 'Подкласс'"
+        :label="subclass.name || CLASS_SUBCLASSES_LABELS.fallbackName"
         :color="index === selectedIndex ? 'primary' : 'neutral'"
         :variant="index === selectedIndex ? 'solid' : 'soft'"
         size="xs"
@@ -94,7 +110,7 @@
 
       <UButton
         icon="tabler:plus"
-        label="Подкласс"
+        :label="CLASS_SUBCLASSES_LABELS.fallbackName"
         color="primary"
         variant="soft"
         size="xs"
@@ -102,21 +118,14 @@
       />
     </div>
 
-    <div
-      v-if="!selected"
-      class="rounded-lg border border-dashed border-default p-4 text-center text-xs text-dimmed italic"
-    >
-      Выберите или добавьте подкласс.
-    </div>
-
     <!-- Детали выбранного подкласса -->
     <div
-      v-else
+      v-if="selected"
       class="flex flex-col gap-4 rounded-lg border border-default bg-elevated/20 p-3"
     >
       <div class="flex items-center gap-2">
         <span class="text-sm font-semibold text-highlighted">
-          {{ selected.name || 'Новый подкласс' }}
+          {{ selected.name || CLASS_SUBCLASS_DEFAULT_NAME }}
         </span>
 
         <UButton
@@ -125,21 +134,21 @@
           variant="ghost"
           size="xs"
           class="ml-auto"
-          label="Удалить подкласс"
+          :label="CLASS_SUBCLASSES_LABELS.remove"
           @click.left.exact.prevent="removeSubclass(selectedIndex)"
         />
       </div>
 
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <UFormField label="Название">
+        <UFormField :label="FORM_FIELD_LABELS.name">
           <UInput
             v-model="selected.name"
-            placeholder="Чемпион"
+            :placeholder="CLASS_SUBCLASSES_LABELS.namePlaceholder"
             class="w-full"
           />
         </UFormField>
 
-        <UFormField label="Англ.">
+        <UFormField :label="CLASS_SUBCLASSES_LABELS.nameEnShort">
           <UInput
             v-model="selected.nameEn"
             placeholder="Champion"
@@ -147,7 +156,7 @@
           />
         </UFormField>
 
-        <UFormField label="Уровень получения">
+        <UFormField :label="CLASS_SUBCLASSES_LABELS.level">
           <UInputNumber
             v-model="selected.unlockLevel"
             :min="1"
@@ -155,41 +164,56 @@
           />
         </UFormField>
 
-        <UFormField label="Источник (ключ)">
-          <UInput
-            v-model="selected.sourceKey"
-            placeholder="phb"
-            class="w-full"
-          />
-        </UFormField>
+        <SourceField
+          v-model:source-key="selected.sourceKey"
+          v-model:source="selected.source"
+          class="col-span-2"
+        />
       </div>
 
-      <UFormField label="Описание (Markdown)">
+      <UFormField :label="FORM_FIELD_LABELS.descriptionMarkdown">
         <RichTextEditor v-model="selected.description" />
       </UFormField>
 
-      <UFormField label="Заклинательство подкласса">
+      <UFormField :label="CLASS_SUBCLASSES_LABELS.spellcasting">
         <ClassSpellcastingFields v-model="selected.spellcasting" />
       </UFormField>
 
-      <UFormField label="Особенности подкласса">
+      <EditorNestedSection
+        :title="CLASS_SUBCLASSES_LABELS.features"
+        :count="selected.features.length"
+        :add-label="CLASS_FEATURES_EDITOR_LABELS.add"
+        :collapsible="false"
+        @add="featureRows?.addFeature()"
+      >
         <ClassFeaturesEditor
+          ref="featureRows"
           v-model="selected.features"
           :available-spells="availableSpells"
+          :socket="socket"
           @open-spell="forwardOpenSpell"
         />
-      </UFormField>
+      </EditorNestedSection>
 
-      <UFormField label="Счётчики подкласса">
-        <ClassCountersEditor
+      <EditorNestedSection
+        :title="CLASS_SUBCLASSES_LABELS.counters"
+        :hint="FEAT_GRANTS_LABELS.countersHint"
+        :count="selected.counters.length"
+        :add-label="FEAT_GRANTS_LABELS.addCounter"
+        :collapsible="false"
+        @add="counterRows?.addCounter()"
+      >
+        <CounterRowsEditor
+          ref="counterRows"
           v-model="selected.counters"
-          :feature-options="featureOptions"
+          with-start-level
+          with-table-column
         />
-      </UFormField>
+      </EditorNestedSection>
 
       <UCheckbox
         v-model="selected.hasOwnTable"
-        label="Своя таблица прогрессии (напр. Мистический рыцарь)"
+        :label="CLASS_SUBCLASSES_LABELS.ownTable"
       />
 
       <ClassLevelTableEditor

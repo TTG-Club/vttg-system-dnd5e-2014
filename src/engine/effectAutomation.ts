@@ -4,11 +4,20 @@
  * и иммунитета цели к состоянию. Заменяет прежний модуль «райдеров» — теперь
  * спас и урон живут на самом `ActiveEffect`, а не на отдельной обёртке.
  *
- * Все импорты — type-only, чтобы не создавать рантайм-цикл.
+ * Рантайм-импорт один — гейты `effectTriggers.ts`, у которого нет зависимостей
+ * от пайплайна эффектов: цикла не возникает.
  */
 
+import type { SkillType } from '@vtt/shared';
+
 import type { ActiveEffect } from './activeEffectTypes.js';
-import type { ConditionKey } from './conditionKeys.js';
+import type { ConditionRef } from './conditionKeys.js';
+import type { EffectTrigger } from './effectTriggerTypes.js';
+
+import {
+  resolveEffectLandingGates,
+  resolveGateScale,
+} from './effectTriggers.js';
 
 /**
  * Проверяет, иммунна ли цель к состоянию.
@@ -19,21 +28,40 @@ import type { ConditionKey } from './conditionKeys.js';
  */
 export function isImmuneToCondition(
   conditionImmunities: readonly string[],
-  conditionKey: ConditionKey,
+  conditionKey: ConditionRef,
 ): boolean {
   return conditionImmunities.includes(conditionKey);
 }
 
 /**
  * Ключ идентичности статуса для дедупликации: один и тот же статус не
- * стакается. Стандартное состояние сравнивается по `conditionKey`, прочие
- * эффекты — по имени (без регистра), чтобы «Замедление» от разных источников
- * считалось одним статусом.
+ * стакается. Отметка сравнивается по ключу, стандартное состояние — по
+ * `conditionKey`, прочие эффекты — по имени (без регистра), чтобы «Замедление»
+ * от разных источников считалось одним статусом.
  *
  * @param effect - эффект
  * @returns стабильный ключ идентичности
  */
-function effectIdentityKey(effect: ActiveEffect): string {
+export function effectIdentityKey(effect: ActiveEffect): string {
+  // Концентрация у заклинателя одна: новая метка заменяет прежнюю
+  if (effect.concentration) {
+    return 'concentration';
+  }
+
+  // «Складывается с одноимёнными»: каждое наложение — само по себе
+  if (effect.stackable) {
+    return `instance:${effect.id}`;
+  }
+
+  if (effect.tag) {
+    // Отметка «от наложившего» у каждого наложившего своя: «невосприимчив к
+    // Ужасающему облику ЭТОГО привидения» не должна стирать такую же отметку
+    // от другого. Счётчик ступеней и отметка без наложившего — общие
+    return effect.sourceActorId && effect.tagStacks === undefined
+      ? `tag:${effect.tag}:${effect.sourceActorId}`
+      : `tag:${effect.tag}`;
+  }
+
   return effect.conditionKey
     ? `condition:${effect.conditionKey}`
     : `name:${effect.name.trim().toLowerCase()}`;
@@ -83,6 +111,285 @@ export function mergeAppliedEffects(
   return [...kept, ...dedupedIncoming];
 }
 
+/**
+ * Остаётся ли эффект висеть на цели после наложения.
+ *
+ * Эффект только с уроном срабатывания лишь бьёт и не оставляет следа. Состояние,
+ * модификаторы, флаги, периодика (урон каждый ход, повторный спасбросок),
+ * срабатывания и отметка — это длящаяся нагрузка: ради неё эффект и кладётся в
+ * `activeEffects` цели. Эффект, у которого есть только срабатывание «урон
+ * снимает эффект», без этого на цель не попал бы вовсе.
+ *
+ * Нагрузка — любое поле, которое действует, пока эффект лежит: правило каста
+ * («ячейки 7-го круга и выше недоступны»), «вырваться», иммунитет к
+ * состояниям и их подавление, свет, подмена спасброска, ступени, степень
+ * истощения. Эффект с одним таким полем раньше молча отбрасывался при
+ * наложении. Цена (`pay`), применение (`activation`) и аура сюда не входят:
+ * сами по себе они ничего не делают — им нужна строка, флаг или срабатывание.
+ *
+ * @param effect - накладываемый эффект
+ * @returns `true`, если у эффекта есть длящаяся нагрузка
+ */
+export function hasLastingEffectPayload(effect: ActiveEffect): boolean {
+  return (
+    effect.conditionKey !== undefined
+    || effect.changes.length > 0
+    || effect.flags.length > 0
+    || effect.recurringDamage !== undefined
+    || effect.recurringSave !== undefined
+    || (effect.triggers?.length ?? 0) > 0
+    || effect.tag !== undefined
+    || effect.castRule !== undefined
+    || effect.escape !== undefined
+    || (effect.conditionImmunities?.length ?? 0) > 0
+    || (effect.suppressConditions?.length ?? 0) > 0
+    || effect.light !== undefined
+    || effect.saveOverride !== undefined
+    || (effect.stages?.length ?? 0) > 0
+    || effect.exhaustionLevel !== undefined
+  );
+}
+
+/**
+ * Сложность спасброска эффекта с учётом источника.
+ *
+ * Соглашение редактора: Сл 0 значит «Сл того, кто наложил» — заклинателя или
+ * действия. У заклинания персонажа она зависит от билда, и фиксированным числом
+ * в эффекте её не записать. Без подстановки такой спасбросок бросался бы против
+ * нуля и проходил всегда.
+ *
+ * @param dc - сложность, записанная в эффекте
+ * @param sourceDc - сложность источника (Сл заклинаний кастера, Сл действия)
+ * @returns сложность для броска
+ */
+export function resolveEffectSaveDc(dc: number, sourceDc: number): number {
+  return dc > 0 ? dc : sourceDc;
+}
+
+/**
+ * Есть ли у срабатываний эффекта спасбросок со Сл 0.
+ *
+ * @param effect - эффект
+ * @returns `true`, если хоть одно срабатывание ждёт Сл источника
+ */
+function hasSourceTriggerSaveDc(effect: ActiveEffect): boolean {
+  return (effect.triggers ?? []).some(
+    (trigger) =>
+      trigger.save?.dc === 0
+      || trigger.actions.some(
+        (action) =>
+          action.type === 'applyCondition'
+          && (action.recurringSave?.dc === 0
+            // «Вырваться» наложенного состояния ждёт ту же Сл источника
+            || action.escape?.check?.dc === 0),
+      ),
+  );
+}
+
+/**
+ * Срабатывание со Сл источника: в спасброске, в повторном спасброске
+ * наложенного состояния и в его проверке «вырваться».
+ *
+ * @param trigger - срабатывание
+ * @param sourceDc - Сл источника
+ * @returns срабатывание с проставленной Сл
+ */
+function stampTriggerSaveDc(
+  trigger: EffectTrigger,
+  sourceDc: number,
+): EffectTrigger {
+  return {
+    ...trigger,
+    ...(trigger.save
+      ? {
+          save: {
+            ...trigger.save,
+            dc: resolveEffectSaveDc(trigger.save.dc, sourceDc),
+          },
+        }
+      : {}),
+    actions: trigger.actions.map((action) => {
+      if (action.type !== 'applyCondition') {
+        return action;
+      }
+
+      const { recurringSave, escape } = action;
+
+      return {
+        ...action,
+        ...(recurringSave
+          ? {
+              recurringSave: {
+                ...recurringSave,
+                dc: resolveEffectSaveDc(recurringSave.dc, sourceDc),
+              },
+            }
+          : {}),
+        ...(escape?.check
+          ? {
+              escape: {
+                ...escape,
+                check: {
+                  ...escape.check,
+                  dc: resolveEffectSaveDc(escape.check.dc, sourceDc),
+                },
+              },
+            }
+          : {}),
+      };
+    }),
+  };
+}
+
+/**
+ * Есть ли у эффекта отложенный спасбросок со Сл 0 — «Сл того, кто наложил»:
+ * повторный спасбросок хода, спасбросок против урона каждый ход или спасбросок
+ * срабатывания. Такую Сл надо проставить при наложении: на ходу и на событии
+ * урона сервер источника уже не знает.
+ *
+ * @param effect - накладываемый эффект
+ * @returns `true`, если Сл источника нужно проставить
+ */
+export function hasSourceTurnSaveDc(effect: ActiveEffect): boolean {
+  return (
+    effect.recurringSave?.dc === 0
+    || effect.recurringDamage?.save?.dc === 0
+    // Проверка действия «вырваться» ждёт того же: кнопку нажмут потом, когда
+    // источника уже не спросишь
+    || effect.escape?.check?.dc === 0
+    // Спасбросок при попытке каста бросят позже — тоже без источника под рукой
+    || effect.castRule?.failSave?.dc === 0
+    || hasSourceTriggerSaveDc(effect)
+  );
+}
+
+/**
+ * Проставляет Сл источника в отложенные спасброски эффекта со Сл 0: повторный
+ * спасбросок хода, спасбросок против урона каждый ход и спасбросок
+ * срабатывания.
+ *
+ * @param effect - накладываемый эффект
+ * @param sourceDc - Сл спасброска источника (кастера, действия)
+ * @returns исходный эффект либо копия с проставленной Сл
+ */
+export function stampSourceTurnSaveDc(
+  effect: ActiveEffect,
+  sourceDc: number,
+): ActiveEffect {
+  if (!hasSourceTurnSaveDc(effect)) {
+    return effect;
+  }
+
+  const { recurringSave, recurringDamage, triggers } = effect;
+
+  return {
+    ...stampCastRuleDc(stampEscapeDc(effect, sourceDc), sourceDc),
+    recurringSave: recurringSave
+      ? {
+          ...recurringSave,
+          dc: resolveEffectSaveDc(recurringSave.dc, sourceDc),
+        }
+      : undefined,
+    recurringDamage: recurringDamage?.save
+      ? {
+          ...recurringDamage,
+          save: {
+            ...recurringDamage.save,
+            dc: resolveEffectSaveDc(recurringDamage.save.dc, sourceDc),
+          },
+        }
+      : recurringDamage,
+    triggers: triggers?.map((trigger) => stampTriggerSaveDc(trigger, sourceDc)),
+  };
+}
+
+/**
+ * Проставляет Сл источника во ВСЕ спасброски эффекта со Сл 0: при наложении,
+ * повторный хода и против урона каждый ход.
+ *
+ * Нужна там, где спасбросок эффекта бросают без заклинателя под рукой: зона
+ * заклинания на сцене и аура на заклинателе живут отдельно от каста, и Сл 0 в
+ * них бросалась бы против нуля. Цель атаки или заклинания получает Сл
+ * источника прямо в момент броска и в этом не нуждается.
+ *
+ * @param effect - эффект заклинания или действия
+ * @param sourceDc - Сл спасброска источника
+ * @returns исходный эффект либо копия с проставленной Сл
+ */
+export function stampSourceSaveDcs(
+  effect: ActiveEffect,
+  sourceDc: number,
+): ActiveEffect {
+  const turnStamped = stampSourceTurnSaveDc(effect, sourceDc);
+  const { applySave } = turnStamped;
+
+  if (applySave?.dc !== 0) {
+    return turnStamped;
+  }
+
+  return {
+    ...turnStamped,
+    applySave: {
+      ...applySave,
+      dc: resolveEffectSaveDc(applySave.dc, sourceDc),
+    },
+  };
+}
+
+/**
+ * Проставляет Сл источника в проверку действия «вырваться».
+ *
+ * Без неё кнопка на листе бросала бы проверку против нуля — её прошёл бы кто
+ * угодно, и эффект снимался бы всегда (`resolveEffectEscapeDc`).
+ *
+ * @param effect - эффект заклинания или действия
+ * @param sourceDc - Сл спасброска источника
+ * @returns исходный эффект либо копия с проставленной Сл
+ */
+function stampEscapeDc(effect: ActiveEffect, sourceDc: number): ActiveEffect {
+  const check = effect.escape?.check;
+
+  if (!effect.escape || check?.dc !== 0) {
+    return effect;
+  }
+
+  return {
+    ...effect,
+    escape: {
+      ...effect.escape,
+      check: { ...check, dc: resolveEffectSaveDc(check.dc, sourceDc) },
+    },
+  };
+}
+
+/**
+ * Проставляет Сл источника в спасбросок правила каста («Слово силы: Боль»:
+ * спасбросок Телосложения против Сл наложившего при попытке колдовать).
+ *
+ * @param effect - эффект заклинания или действия
+ * @param sourceDc - Сл спасброска источника
+ * @returns исходный эффект либо копия с проставленной Сл
+ */
+function stampCastRuleDc(effect: ActiveEffect, sourceDc: number): ActiveEffect {
+  const { castRule } = effect;
+  const failSave = castRule?.failSave;
+
+  if (!castRule || failSave?.dc !== 0) {
+    return effect;
+  }
+
+  return {
+    ...effect,
+    castRule: {
+      ...castRule,
+      failSave: { ...failSave, dc: resolveEffectSaveDc(failSave.dc, sourceDc) },
+    },
+  };
+}
+
+/** Наименьшая Сл из проверки навыка: Сл 0 значила бы «Сл источника» */
+const MIN_SKILL_CHECK_DC = 1;
+
 /** Результат вычисления применимости эффекта к цели */
 export interface EffectApplication {
   /** Вешать ли эффект-состояние на цель */
@@ -111,42 +418,96 @@ export interface EffectApplication {
  * @param context - результат приземления и (если был) спасброска эффекта
  * @param context.landed - провалена ли защита уровня действия (см. выше)
  * @param context.applySaveSucceeded - прошла ли цель `applySave` (если кидался)
+ * @param context.targetFlags - флаги цели: «Увёртливость» на спасброске эффекта
+ * @param context.againstMagic - спасбросок эффекта навязан магией
  * @returns применимость эффекта и множитель его урона
  */
 export function resolveEffectApplication(
   effect: ActiveEffect,
-  context: { landed: boolean; applySaveSucceeded?: boolean },
+  context: {
+    landed: boolean;
+    applySaveSucceeded?: boolean;
+    targetFlags?: ReadonlySet<string>;
+    againstMagic?: boolean;
+  },
 ): EffectApplication {
   // Прошла ли цель релевантный спасбросок?
   const saved = effect.applySave
     ? context.applySaveSucceeded === true
     : !context.landed;
 
-  if (!saved) {
-    // Провал спаса: обычно эффект применяется. Исключение — эффект, помеченный
-    // «только при успехе» (`applyOnSuccessOnly`): на провале он не накладывается
-    // и свой урон не наносит (его место занимает отдельный эффект-на-провал).
-    if (effect.applyOnSuccessOnly === true) {
-      return { applyEffect: false, damageMultiplier: 0 };
-    }
+  // Гейты те же, что у разового срабатывания эффекта на сервере: «только при
+  // успехе» на провале не бьёт и не ложится, «половина» бьёт при любом исходе
+  const gates = resolveEffectLandingGates(effect);
 
-    return { applyEffect: true, damageMultiplier: 1 };
+  const defense =
+    effect.applySave && context.targetFlags
+      ? {
+          flags: context.targetFlags,
+          ability: effect.applySave.ability,
+          againstMagic: context.againstMagic,
+        }
+      : undefined;
+
+  return {
+    applyEffect: resolveGateScale(gates.effect, saved, false) > 0,
+    damageMultiplier: resolveGateScale(
+      gates.damage,
+      saved,
+      gates.halfOnSave,
+      defense,
+    ),
+  };
+}
+
+/**
+ * Навыки, итог проверки которых служит Сл спасброска эффектов источника
+ * (`applySave.dcSkill`): «спасбросок Мудрости со Сл, равной результату вашей
+ * проверки Запугивания».
+ *
+ * @param effects - эффекты, которые источник накладывает на цель
+ * @returns навыки без повторов; пусто — Сл обычная
+ */
+export function listSaveDcSkills(
+  effects: readonly ActiveEffect[],
+): SkillType[] {
+  return [
+    ...new Set(
+      effects.flatMap((effect) =>
+        effect.applySave?.dcSkill ? [effect.applySave.dcSkill] : [],
+      ),
+    ),
+  ];
+}
+
+/**
+ * Записывает итог проверки навыка Сл спасброска эффектов, которые её ждут.
+ * Сл не меньше единицы: отрицательный итог проверки спасбросок не отменяет.
+ *
+ * @param effect - эффект источника
+ * @param skill - навык проверки
+ * @param total - итог проверки применившего
+ * @returns исходный эффект либо копия с Сл из проверки
+ */
+export function stampSkillCheckDc(
+  effect: ActiveEffect,
+  skill: SkillType,
+  total: number,
+): ActiveEffect {
+  const { applySave } = effect;
+
+  if (applySave?.dcSkill !== skill) {
+    return effect;
   }
 
-  // Успешный спасбросок. Статус накладывается, если эффект помечен
-  // `applyOnSuccess` ИЛИ `applyOnSuccessOnly`. Множитель урона: для
-  // «только при успехе» — полный (это его штатный исход), иначе по `onSuccess`
-  // ('half' — половина, 'negate' — нет урона).
-  const applyEffect =
-    effect.applyOnSuccess === true || effect.applyOnSuccessOnly === true;
-
-  let damageMultiplier = 0;
-
-  if (effect.applyOnSuccessOnly === true) {
-    damageMultiplier = 1;
-  } else if (effect.applySave?.onSuccess === 'half') {
-    damageMultiplier = 0.5;
-  }
-
-  return { applyEffect, damageMultiplier };
+  return {
+    ...effect,
+    applySave: {
+      ...applySave,
+      dc: Math.max(MIN_SKILL_CHECK_DC, Math.trunc(total)),
+      // Формула уступает проверке: Сл уже число
+      dcFormula: undefined,
+      dcSkill: undefined,
+    },
+  };
 }

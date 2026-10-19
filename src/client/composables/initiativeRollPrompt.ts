@@ -1,0 +1,99 @@
+import type { InitiativeRollPromptResult } from '@/core/systems/uiSystemRegistry';
+import type { SceneEntity } from '@vtt/shared';
+
+import type { CheckRollResult } from '../ui/actor/diceRollTypes';
+
+import { useModalManager } from '@/shared_ui/composables/useModalManager';
+import {
+  dnd5eSystemInstance,
+  resolveInitiativeRollMode,
+} from '@vtt/shared/system/dnd.js';
+
+import { INITIATIVE_ROLL_LABELS } from '../ui/actor/constants';
+import { openDiceRollWindow } from './diceRollWindow';
+
+/**
+ * Открывает окно броска инициативы за участника боя — то же `DiceRollModal`,
+ * что и по клику на инициативу в листе персонажа: свой бонус,
+ * преимущество/помеха, видимость броска. Ядро зовёт эту функцию на «личном»
+ * броске из трекера или промпта на сцене (слот `promptInitiativeRoll`).
+ *
+ * Сообщение о броске пишет само окно (со своей формулой и видимостью), поэтому
+ * результат помечается `announced` — серверное сообщение о том же броске тогда
+ * не выводится.
+ *
+ * У участника может быть несколько управляющих: инициативу засчитывают первому
+ * бросившему, и окно остальных ядро закрывает через `onCancelled`.
+ *
+ * @param entity - участник боя: актёр или существо
+ * @param onRolled - принимает бросок; не вызывается, если окно закрыли без броска
+ * @param onCancelled - принимает закрытие окна снаружи
+ * @returns всегда `true` — бросок за системой (её окном)
+ */
+export function promptInitiativeRoll(
+  entity: SceneEntity,
+  onRolled: (result: InitiativeRollPromptResult) => void,
+  onCancelled: (closeWindow: () => void) => void,
+): boolean {
+  const { closeModal, modals } = useModalManager();
+  const modalKey = `initiative:${entity.id}`;
+
+  const modifier = dnd5eSystemInstance.getInitiativeModifier(entity);
+
+  const initialRollMode = resolveInitiativeRollMode(
+    dnd5eSystemInstance.getEntityActiveFlags(entity),
+  );
+
+  // Окно видит только бросающий, а чат читают все: имя существа, скрытое от
+  // игроков, в сообщение о броске не попадает — иначе бросок выдал бы то, что
+  // ядро прячет в трекере. Правило то же, что у ядра: существо без явно
+  // включённого «Показывать имя».
+  const isNameHidden =
+    entity.entityType === 'creature' && entity.token?.showName !== true;
+
+  const announcedName = isNameHidden
+    ? INITIATIVE_ROLL_LABELS.hiddenName
+    : entity.name;
+
+  const rollLabel = `${INITIATIVE_ROLL_LABELS.rollLabel}${INITIATIVE_ROLL_LABELS.nameSeparator}${announcedName}`;
+
+  // Ключ окна — по участнику: мастер бросает за нескольких подряд, и окна
+  // должны стоять рядом, а повторный клик по тому же участнику — поднимать
+  // уже открытое окно, а не плодить второе
+  const modalId = openDiceRollWindow(
+    {
+      title: INITIATIVE_ROLL_LABELS.title,
+      // Имя участника: в трекере их много — без него не видно, за кого
+      // открыто окно. Окно видит только бросающий, поэтому имя настоящее.
+      actorName: entity.name,
+      rollLabel,
+      rollButtonText: INITIATIVE_ROLL_LABELS.button,
+      modifier,
+      initialRollMode,
+      onCheckRoll: (result: CheckRollResult) => {
+        onRolled({
+          roll: result.natural,
+          modifier: result.modifier,
+          announced: true,
+        });
+      },
+    },
+    { modalKey },
+  );
+
+  onCancelled(() => {
+    // Окно того же участника могло быть открыто раньше: менеджер вернул null и
+    // лишь поднял его наверх, а закрывать всё равно нужно именно это окно.
+    const openedModalId =
+      modalId
+      ?? modals.value.find((modal) => modal.props._modalKey === modalKey)?.id;
+
+    if (openedModalId) {
+      closeModal(openedModalId);
+    }
+  });
+
+  // Окно того же участника уже открыто — менеджер поднял его наверх. Бросок всё
+  // равно за системой: мгновенный бросок ядра «вторым» тут был бы подлогом.
+  return true;
+}

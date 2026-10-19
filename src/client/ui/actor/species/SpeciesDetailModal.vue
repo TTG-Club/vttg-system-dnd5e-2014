@@ -1,36 +1,63 @@
 <script setup lang="ts">
-  import type { AbilityType } from '@vtt/shared';
   import type {
+    ActiveEffect,
     DamageDefenseKind,
     SpeciesDefinition,
     SpeciesFeatureChoice,
   } from '@vtt/shared/system/dnd.js';
 
-  import { typedObjectEntries } from '@vtt/shared';
-  import {
-    ABILITY_LABELS,
-    CONDITIONS,
-    DAMAGE_DEFENSE_KIND_LABELS,
-    DAMAGE_TYPE_LABELS,
-  } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
-  import { useSourceLabels } from '@/systems/dnd5e/composables/useSourceLabel';
+  import { useChatStore } from '@/stores/chatStore';
+  import {
+    DAMAGE_DEFENSE_KIND_LABELS,
+    DAMAGE_TYPE_LABELS,
+    formatSpeciesSizeWithHeight,
+    getConditionEntry,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { CREATURE_SIZE_LABELS, CREATURE_TYPE_LABELS } from '../constants';
+  import { useSpeciesCatalog } from '../../../composables/useSpeciesCatalog';
+  import { copySpeciesToWorkshop } from '../../../composables/workshopCopy';
+  import {
+    COPY_TO_ITEMS_LABEL,
+    CREATURE_SIZE_LABELS,
+    CREATURE_TYPE_LABELS,
+    GRANT_FIELD_LABELS,
+    GRANT_SECTION_LABELS,
+    LEVEL_BADGE_SUFFIX,
+    SELECT_FOR_ACTOR_LABEL,
+    SPECIES_DETAIL_LABELS,
+    SPECIES_FORM_LABELS,
+  } from '../constants';
+  import EffectsBySubscriptionBadge from '../EffectsBySubscriptionBadge.vue';
+  import ItemEffectsView from '../ItemEffectsView.vue';
+  import SourceBadge from '../SourceBadge.vue';
 
   const props = defineProps<{
     open: boolean;
     speciesDefinition: SpeciesDefinition | null;
     zIndex?: number;
     positionOffset?: number;
+    /** Показать кнопку «Выбрать» (окно открыто из выбора вида для персонажа) */
+    showSelectButton?: boolean;
+    /**
+     * Показать кнопки копирования в «Мастерскую» — у вида и у каждого его
+     * подвида (окно открыто из компендиума)
+     */
+    showCopyButton?: boolean;
+    /** Пак записи; пусто — не известен, подвиды берутся из первого пака с ней */
+    packId?: string;
   }>();
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
     'bring-to-front': [];
+    /** Вид копируют в «Мастерскую» */
+    'copy': [];
+    /** Запись выбрана для листа персонажа */
+    'select': [];
   }>();
 
   const initialPosition = computed(() =>
@@ -38,8 +65,6 @@
       ? { x: props.positionOffset, y: props.positionOffset }
       : undefined,
   );
-
-  const { getSourceLabel } = useSourceLabels();
 
   const displayType = computed(() => {
     if (!props.speciesDefinition) {
@@ -56,32 +81,16 @@
       return '';
     }
 
+    const heights = props.speciesDefinition.heights;
+
     return props.speciesDefinition.size
-      .map((sizeValue) => CREATURE_SIZE_LABELS[sizeValue] || sizeValue)
-      .join(' или ');
-  });
-
-  /**
-   * Повышение характеристик вида одной строкой: сначала фиксированные
-   * прибавки, затем выбор («+1 к двум на выбор»). Подвиды сюда не входят — их
-   * прибавки показываются вместе с самим подвидом.
-   */
-  const abilityGrantDisplay = computed(() => {
-    const grant = props.speciesDefinition?.abilityGrant;
-
-    if (!grant) {
-      return '';
-    }
-
-    const parts = typedObjectEntries<AbilityType, number>(grant.fixed ?? {})
-      .filter(([, bonus]) => Boolean(bonus))
-      .map(([ability, bonus]) => `${ABILITY_LABELS[ability] ?? ability} +${bonus}`);
-
-    if (grant.choice && grant.choice.count > 0) {
-      parts.push(`+${grant.choice.amount} к ${grant.choice.count} на выбор`);
-    }
-
-    return parts.join(', ');
+      .map((sizeValue) =>
+        formatSpeciesSizeWithHeight(
+          CREATURE_SIZE_LABELS[sizeValue] || sizeValue,
+          heights?.[sizeValue],
+        ),
+      )
+      .join(SPECIES_DETAIL_LABELS.sizeSeparator);
   });
 
   const speedDisplay = computed(() => {
@@ -90,22 +99,33 @@
     }
 
     const spd = props.speciesDefinition.speed;
-    const parts = [`Ходьба ${spd.walk} фт.`];
+
+    const parts = [
+      `${SPECIES_DETAIL_LABELS.speedWalk} ${spd.walk} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+    ];
 
     if (spd.fly) {
-      parts.push(`Полет ${spd.fly} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedFly} ${spd.fly} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     if (spd.swim) {
-      parts.push(`Плавание ${spd.swim} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedSwim} ${spd.swim} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     if (spd.climb) {
-      parts.push(`Лазание ${spd.climb} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedClimb} ${spd.climb} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     if (spd.burrow) {
-      parts.push(`Копание ${spd.burrow} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedBurrow} ${spd.burrow} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     return parts.join(', ');
@@ -119,9 +139,12 @@
 
     const grants: { title: string; desc: string }[] = [];
 
-    props.speciesDefinition.grants.forEach((grant) => {
+    (props.speciesDefinition.grants ?? []).forEach((grant) => {
       if (grant.type === 'darkvision') {
-        grants.push({ title: 'Тёмное зрение', desc: `${grant.range} фт.` });
+        grants.push({
+          title: SPECIES_DETAIL_LABELS.darkvision,
+          desc: `${grant.range} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+        });
       } else if (grant.type === 'damageDefense') {
         const typesByKind = new Map<DamageDefenseKind, string[]>();
 
@@ -141,13 +164,9 @@
       } else if (grant.type === 'conditionImmunity') {
         if (grant.conditions.length > 0) {
           grants.push({
-            title: 'Иммунитет к состояниям',
+            title: GRANT_FIELD_LABELS.conditionImmunities,
             desc: grant.conditions
-              .map(
-                (key) =>
-                  CONDITIONS.find((condition) => condition.key === key)?.nameRu
-                  ?? key,
-              )
+              .map((key) => getConditionEntry(key)?.nameRu ?? key)
               .join(', '),
           });
         }
@@ -156,28 +175,40 @@
         && (!grant.choices || grant.choices.count === 0)
       ) {
         if (grant.items.length > 0) {
-          grants.push({ title: 'Языки', desc: grant.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.languages,
+            desc: grant.items.join(', '),
+          });
         }
       } else if (
         grant.type === 'weaponProficiency'
         && (!grant.choices || grant.choices.count === 0)
       ) {
         if (grant.items.length > 0) {
-          grants.push({ title: 'Оружие', desc: grant.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.weapons,
+            desc: grant.items.join(', '),
+          });
         }
       } else if (
         grant.type === 'armorProficiency'
         && (!grant.choices || grant.choices.count === 0)
       ) {
         if (grant.items.length > 0) {
-          grants.push({ title: 'Снаряжение', desc: grant.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.equipment,
+            desc: grant.items.join(', '),
+          });
         }
       } else if (
         grant.type === 'toolProficiency'
         && (!grant.choices || grant.choices.count === 0)
       ) {
         if (grant.items.length > 0) {
-          grants.push({ title: 'Инструменты', desc: grant.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.tools,
+            desc: grant.items.join(', '),
+          });
         }
       }
     });
@@ -190,9 +221,11 @@
    * Каждая группа — это одна особенность-«развилка» (напр. «Наследие
    * драконорождённого») со списком своих вариантов-подвидов и тем, что они дают.
    */
-  const subspeciesGroups = computed(() => {
+  const subspeciesGroups = computed<
+    Array<{ featureName: string; choices: SpeciesFeatureChoice[] }>
+  >(() => {
     if (!props.speciesDefinition) {
-      return [] as { featureName: string; choices: SpeciesFeatureChoice[] }[];
+      return [];
     }
 
     return props.speciesDefinition.features
@@ -203,7 +236,41 @@
       }));
   });
 
-  const hasSubspecies = computed(() => subspeciesGroups.value.length > 0);
+  const speciesCatalog = useSpeciesCatalog();
+  const chatStore = useChatStore();
+
+  /**
+   * Подвиды отдельными записями (как на сайте TTG Club): из того же
+   * компендиума, что и вид, и скопированные в мир. У самого подвида своих
+   * подвидов нет.
+   */
+  const subspeciesRecords = computed<SpeciesDefinition[]>(() => {
+    const definition = props.speciesDefinition;
+
+    if (!definition || definition.parentKey) {
+      return [];
+    }
+
+    return speciesCatalog.subspeciesOf({
+      key: definition.key,
+      packId: props.packId,
+    });
+  });
+
+  const hasSubspecies = computed(
+    () =>
+      subspeciesGroups.value.length > 0 || subspeciesRecords.value.length > 0,
+  );
+
+  /**
+   * Копирует один подвид в «Мастерскую»: копия остаётся подвидом этого вида и
+   * помнит его компендиум.
+   *
+   * @param record - подвид показанного вида
+   */
+  function copySubspecies(record: SpeciesDefinition): void {
+    copySpeciesToWorkshop(chatStore.getSocket(), record, props.packId);
+  }
 
   /**
    * Краткие подписи защит подвида (сопротивления/иммунитеты/уязвимости и
@@ -222,11 +289,9 @@
     }
 
     for (const conditionKey of choice.conditionImmunities ?? []) {
-      const name =
-        CONDITIONS.find((condition) => condition.key === conditionKey)?.nameRu
-        ?? conditionKey;
+      const name = getConditionEntry(conditionKey)?.nameRu ?? conditionKey;
 
-      badges.push(`Иммунитет: ${name}`);
+      badges.push(`${SPECIES_DETAIL_LABELS.immunityPrefix}${name}`);
     }
 
     return badges;
@@ -238,17 +303,46 @@
       && props.speciesDefinition.features.length > 0,
   );
 
+  /**
+   * Эффекты вида и его умений одним списком.
+   *
+   * Вкладка появляется, только когда эффекты есть: у большинства видов их нет, и
+   * пустая вкладка была бы шумом в каждом окне.
+   */
+  const effects = computed<ActiveEffect[]>(() => {
+    const definition = props.speciesDefinition;
+
+    if (!definition) {
+      return [];
+    }
+
+    const collected = [...(definition.activeEffects ?? [])];
+
+    for (const feature of definition.features ?? []) {
+      collected.push(...(feature.activeEffects ?? []));
+    }
+
+    return collected;
+  });
+
   const tabItems = computed(() => {
     const items: { label: string; slot: string }[] = [
-      { label: 'Основная часть', slot: 'general' },
+      { label: SPECIES_DETAIL_LABELS.tabGeneral, slot: 'general' },
     ];
 
     if (hasFeatures.value) {
-      items.push({ label: 'Особенности', slot: 'features' });
+      items.push({ label: GRANT_SECTION_LABELS.features, slot: 'features' });
     }
 
     if (hasSubspecies.value) {
-      items.push({ label: 'Подвиды', slot: 'subspecies' });
+      items.push({
+        label: SPECIES_DETAIL_LABELS.tabSubspecies,
+        slot: 'subspecies',
+      });
+    }
+
+    if (effects.value.length > 0) {
+      items.push({ label: SPECIES_FORM_LABELS.tabEffects, slot: 'effects' });
     }
 
     return items;
@@ -258,7 +352,7 @@
 <template>
   <UDraggableModal
     :open="open"
-    :title="speciesDefinition?.name ?? 'Вид'"
+    :title="speciesDefinition?.name ?? SPECIES_DETAIL_LABELS.fallbackTitle"
     :subtitle="speciesDefinition?.nameEn || undefined"
     :initial-width="800"
     :initial-height="600"
@@ -272,12 +366,9 @@
     @bring-to-front="emit('bring-to-front')"
   >
     <template #header-actions>
-      <UBadge
-        v-if="getSourceLabel(speciesDefinition?.sourceKey)"
-        :label="getSourceLabel(speciesDefinition?.sourceKey)"
-        color="neutral"
-        variant="subtle"
-        size="sm"
+      <SourceBadge
+        :source-key="speciesDefinition?.sourceKey"
+        :source="speciesDefinition?.source"
       />
 
       <UBadge
@@ -287,6 +378,34 @@
         variant="subtle"
         size="sm"
       />
+
+      <EffectsBySubscriptionBadge :automation="speciesDefinition?.automation" />
+
+      <UTooltip
+        v-if="showCopyButton"
+        :text="COPY_TO_ITEMS_LABEL"
+      >
+        <UButton
+          icon="tabler:copy"
+          size="xs"
+          color="primary"
+          variant="soft"
+          @click.left.exact.prevent="emit('copy')"
+        />
+      </UTooltip>
+
+      <UTooltip
+        v-if="showSelectButton"
+        :text="SELECT_FOR_ACTOR_LABEL"
+      >
+        <UButton
+          icon="tabler:check"
+          size="xs"
+          color="primary"
+          variant="soft"
+          @click.left.exact.prevent="emit('select')"
+        />
+      </UTooltip>
     </template>
 
     <template #body>
@@ -312,8 +431,9 @@
               >
                 <span
                   class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-                  >Тип</span
                 >
+                  {{ SPECIES_DETAIL_LABELS.type }}
+                </span>
 
                 <p class="mt-0.5 text-sm font-semibold text-highlighted">
                   {{ displayType }}
@@ -326,8 +446,9 @@
               >
                 <span
                   class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-                  >Размер</span
                 >
+                  {{ SPECIES_DETAIL_LABELS.size }}
+                </span>
 
                 <p class="mt-0.5 text-sm font-semibold text-highlighted">
                   {{ displaySize }}
@@ -340,26 +461,12 @@
               >
                 <span
                   class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-                  >Скорость</span
                 >
+                  {{ SPECIES_DETAIL_LABELS.speed }}
+                </span>
 
                 <p class="mt-0.5 text-sm font-semibold text-highlighted">
                   {{ speedDisplay }}
-                </p>
-              </div>
-
-              <!-- Повышение характеристик -->
-              <div
-                v-if="abilityGrantDisplay"
-                class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
-              >
-                <span
-                  class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-                  >Характеристики</span
-                >
-
-                <p class="mt-0.5 text-sm font-semibold text-highlighted">
-                  {{ abilityGrantDisplay }}
                 </p>
               </div>
 
@@ -407,7 +514,7 @@
                   variant="subtle"
                   size="sm"
                 >
-                  {{ feature.level }} ур.
+                  {{ feature.level }}{{ LEVEL_BADGE_SUFFIX }}
                 </UBadge>
               </div>
 
@@ -417,7 +524,9 @@
                 v-if="feature.choices && feature.choices.length > 0"
                 class="mt-3 border-t border-default/50 pt-2 text-xs text-muted"
               >
-                <span class="font-medium text-toned">Подвиды: </span>
+                <span class="font-medium text-toned">
+                  {{ SPECIES_DETAIL_LABELS.subspeciesPrefix }}
+                </span>
                 {{ feature.choices.map((option) => option.name).join(', ') }}
               </div>
             </div>
@@ -430,6 +539,53 @@
           #subspecies
         >
           <div class="flex flex-col gap-5">
+            <!-- Подвиды отдельными записями -->
+            <div
+              v-if="subspeciesRecords.length > 0"
+              class="flex flex-col gap-3"
+            >
+              <div
+                v-for="record in subspeciesRecords"
+                :key="record.key"
+                class="rounded-lg border border-default/50 bg-elevated/30 p-3"
+              >
+                <div class="flex items-center gap-2">
+                  <span
+                    class="min-w-0 truncate text-sm font-medium text-primary"
+                  >
+                    {{ record.name }}
+                  </span>
+
+                  <span class="text-xs text-dimmed">{{ record.nameEn }}</span>
+
+                  <SourceBadge
+                    :source-key="record.sourceKey"
+                    :source="record.source"
+                  />
+
+                  <UTooltip
+                    v-if="showCopyButton"
+                    :text="SPECIES_DETAIL_LABELS.copySubspecies"
+                  >
+                    <UButton
+                      icon="tabler:copy"
+                      size="xs"
+                      color="primary"
+                      variant="ghost"
+                      class="ml-auto shrink-0"
+                      @click.left.exact.prevent="copySubspecies(record)"
+                    />
+                  </UTooltip>
+                </div>
+
+                <ItemDescriptionRenderer
+                  v-if="record.description"
+                  :content="record.description"
+                  class="mt-1"
+                />
+              </div>
+            </div>
+
             <div
               v-for="group in subspeciesGroups"
               :key="group.featureName"
@@ -446,7 +602,7 @@
                 :key="choice.key"
                 class="rounded-lg border border-default/50 bg-elevated/30 p-3"
               >
-                <span class="text-sm font-medium text-primary-400">
+                <span class="text-sm font-medium text-primary">
                   {{ choice.name }}
                 </span>
 
@@ -492,7 +648,7 @@
                         variant="subtle"
                         size="sm"
                       >
-                        {{ subFeature.level ?? 1 }} ур.
+                        {{ subFeature.level ?? 1 }}{{ LEVEL_BADGE_SUFFIX }}
                       </UBadge>
                     </div>
 
@@ -529,6 +685,14 @@
               </div>
             </div>
           </div>
+        </template>
+
+        <!-- Эффекты — только просмотр: их правит форма вида -->
+        <template #effects>
+          <ItemEffectsView
+            :effects="effects"
+            :owner-name="speciesDefinition?.name"
+          />
         </template>
       </UTabs>
     </template>

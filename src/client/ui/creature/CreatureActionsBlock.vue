@@ -1,41 +1,80 @@
 <script setup lang="ts">
-  import type { MeasurementTemplate, SceneEntity } from '@vtt/shared';
+  // Корневой вход `@nuxt/ui` — это Nuxt-модуль, типы компонентов он не отдаёт
+  import type { DropdownMenuItem } from '@nuxt/ui/components/DropdownMenu.vue';
+
   import type {
-    AttackRollMode,
-    Creature,
     CreatureAction,
-    Spell,
+    CreatureActionSectionKey,
+    DnDCreature,
   } from '@vtt/shared/system/dnd.js';
 
-  import type {
-    RolledSpellDamagePart,
-    SpellDamagePartInput,
-  } from '../../composables/useSpellResolution';
+  import type { SheetRowStat } from '../actor/sheetRowTypes';
 
-  import {
-    collectActiveEffects,
-    describeDamagePart,
-    getActionDescriptionMarkdown,
-    SPELL_DAMAGE_TEMPLATE_COLORS,
-    SPELL_TEMPLATE_DEFAULT_COLOR,
-  } from '@vtt/shared/system/dnd.js';
   import { computed, ref } from 'vue';
 
   import { startHotbarDrag } from '@/core/utils/hotbarDrag';
-  import { ContextMenuDangerItem } from '@/shared_ui/components';
-  import FieldGroupReset from '@/shared_ui/components/FieldGroupReset.vue';
+  import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
   import { useChatStore } from '@/stores/chatStore';
-  import { useSpellTemplateStore } from '@/stores/spellTemplateStore';
-  import { useTargetStore } from '@/stores/targetStore';
   import { useWorldStore } from '@/stores/worldStore';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+  import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
+  import {
+    AREA_SHAPE_LABELS,
+    creatureActionHasSave,
+    DEFAULT_REACH_FEET,
+    describeCreatureDamageCondition,
+    findCreatureActionBlock,
+    getActionDescriptionMarkdown,
+    hasCreatureActionRoll,
+    isDndCreature,
+    listCreatureDamageAlternatives,
+    listSourceDamageTypeChoices,
+    readAlternativeShownParts,
+    resolveCreatureActionAttackBonus,
+    resolveEntityActionBlocks,
+    SAVE_TYPE_LABELS,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { useBonusDamageParts } from '../../composables/useBonusDamageParts';
-  import { useSpellResolution } from '../../composables/useSpellResolution';
-  import DiceRollModal from '../actor/DiceRollModal.vue';
-  import { checkCreatureActionRangeOnScene } from './composables/useCreatureRangeCheck';
+  import { refuseAction } from '../../composables/actionRefusal';
+  import { startCreatureAction } from '../../composables/creatureActionRoll';
+  import {
+    formatDamagePartsText,
+    summarizeDamageParts,
+  } from '../../composables/creatureDamageChoice';
+  import {
+    formatDamageBonusLines,
+    formatDamageTileFormula,
+    resolveDamageStatIcon,
+  } from '../../composables/damageTypeChoice';
+  import { hasActionSelfEffects } from '../../composables/effectActivationUse';
+  import { isEntityOwnTurn } from '../../composables/encounterTurn';
+  import { listAmbientEffects } from '../../composables/useResolvedStats';
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import {
+    ABILITY_SHORT_LABELS,
+    DAMAGE_VARIANTS_STAT_ICON,
+    FILTER_ROW_CONTROL_SIZE,
+    MODAL_BUTTON_LABELS,
+    SHEET_ROW_MENU_LABELS,
+  } from '../actor/constants';
+  import {
+    formatAttackRange,
+    formatMeleeOrRangedDistances,
+  } from '../actor/utils/formatAttackDistances';
+  import { formatSignedNumber } from '../actor/utils/formatSignedNumber';
+  import {
+    CREATURE_ACTION_MENU_LABELS,
+    CREATURE_ACTIONS_BLOCK_LABELS,
+    CREATURE_DAMAGE_CHOICE_LABELS,
+    CREATURE_ICON,
+    CREATURE_RANGE_TYPE_LABELS,
+    CREATURE_ROW_ICONS,
+    CREATURE_ROW_STAT_HINTS,
+    CREATURE_ROW_STAT_LABELS,
+  } from './constants';
   import CreatureActionDetailModal from './CreatureActionDetailModal.vue';
   import CreatureActionFormModal from './CreatureActionFormModal.vue';
+  import CreatureActionRow from './CreatureActionRow.vue';
+  import CreatureTraitRow from './CreatureTraitRow.vue';
 
   type ActionMode = 'trait' | 'action';
 
@@ -44,6 +83,11 @@
     actions: CreatureAction[];
     isEditMode: boolean;
     legendaryCount?: number;
+    /**
+     * Преамбула раздела из статблока: когда и как существо тратит эти
+     * действия. Одного их числа для этого мало — условия у существ разные.
+     */
+    sectionDescription?: string;
     /** Режим: черта или действие (влияет на отображение боевых полей) */
     mode?: ActionMode;
     /** Режим только просмотр (компендиум) */
@@ -52,15 +96,36 @@
     creatureId?: string;
     /** Имя существа для подписи в hotbar */
     creatureName?: string;
+    /**
+     * Поиск по названию из ряда отбора вкладки. Сужает показ, но не сам список:
+     * правка и удаление идут по месту записи в исходном массиве.
+     */
+    search?: string;
+    /**
+     * Своя строка заголовка с кнопкой «Добавить». Разделов у вкладки действий
+     * несколько, и добавляют в каждый свой; у особенностей раздел один — там
+     * кнопка уезжает в общий ряд отбора, а заголовок не нужен вовсе.
+     */
+    showHeader?: boolean;
+    /**
+     * Раздел статблока: по нему видно, чем существо платит за запись, —
+     * реакции гаснут под «Электрошоком». Нет — трата хода не проверяется
+     * (особенности)
+     */
+    section?: CreatureActionSectionKey;
   }
 
   const props = withDefaults(defineProps<Props>(), {
     title: undefined,
     legendaryCount: undefined,
+    sectionDescription: '',
     mode: 'action',
     isReadOnly: false,
     creatureId: undefined,
     creatureName: undefined,
+    search: '',
+    showHeader: true,
+    section: undefined,
   });
 
   const emit = defineEmits<{
@@ -68,16 +133,53 @@
     'update:legendaryCount': [count: number];
   }>();
 
+  /** Запреты существа — одним расчётом на весь раздел; `null` — раздела нет */
+  const actionBlocks = computed(() => {
+    const creature = props.section ? getCreatureEntity() : null;
+
+    return creature
+      ? resolveEntityActionBlocks(creature, listAmbientEffects(creature.id))
+      : null;
+  });
+
+  /** Идёт ли ход существа: вне своего хода атака из «Действий» — реакция */
+  const isOwnTurn = computed(
+    () => props.creatureId === undefined || isEntityOwnTurn(props.creatureId),
+  );
+
+  /**
+   * Почему запись раздела сейчас не совершить: запрет траты либо вторая
+   * атака действием под «одной атакой за ход».
+   *
+   * @param action - запись статблока
+   * @returns причина словами либо `null`, если действие доступно
+   */
+  function blockOf(action: CreatureAction): string | null {
+    const { section } = props;
+
+    return section && actionBlocks.value
+      ? findCreatureActionBlock(
+          actionBlocks.value,
+          section,
+          action,
+          isOwnTurn.value,
+        )
+      : null;
+  }
+
   const systemDataStore = useSystemDataStore();
   const chatStore = useChatStore();
-  const targetStore = useTargetStore();
   const worldStore = useWorldStore();
-  const spellTemplateStore = useSpellTemplateStore();
 
-  const { buildCreatureRollSetup, buildTargetHpContext } =
-    useBonusDamageParts();
-
-  const { resolveSpellDamageWithParts } = useSpellResolution();
+  /**
+   * Счётчик легендарных действий за раунд: «3/раунд». Хвост встаёт сразу за
+   * числом, поэтому запись собирается строкой, а не шаблоном: подстановки
+   * подряд форматтер вправе разорвать переносом, и Vue развёл бы их пробелом.
+   */
+  const legendaryPerRound = computed(
+    () =>
+      `${props.legendaryCount}${CREATURE_ACTIONS_BLOCK_LABELS.legendaryPerRoundSuffix}`,
+  );
 
   // ── Просмотр действия (модалка) ──────────────────────────────────────────
 
@@ -171,181 +273,69 @@
   }
 
   /**
-   * Сводка урона/лечения действия для inline-отображения: формула (без токенов)
-   * и локализованные типы. Единая со заклинаниями/оружием система damageParts.
+   * Сводка урона/лечения действия: формула (без токенов) и локализованные типы.
+   * Единая со заклинаниями/оружием система damageParts. Плитка всегда
+   * компактна — в ней формула урона, который бросается всегда. Добавки по
+   * условию («+1к8, если атакующий окровавлен») и варианты (урон «или», тип на
+   * выбор) в плитку не пишутся: их может быть сколько угодно. О них говорит
+   * значок, а сами они — в подсказке отдельными строками. Так строка выглядит
+   * одинаково, как бы ни был записан урон.
    *
    * @param action - действие существа
-   * @returns формула и подпись типов или null (нет частей урона)
+   * @returns формула плитки, строки подсказки и значок; null — нет частей урона
    */
   function actionDamageSummary(
     action: CreatureAction,
-  ): { formula: string; typeLabel: string } | null {
-    const parts = action.damageParts ?? [];
+  ): { formula: string; tooltip: string; icon?: string } | null {
+    const base = summarizeDamageParts(
+      action.damageParts ?? [],
+      getDamageTypeLabel,
+    );
 
-    if (parts.length === 0) {
-      return null;
+    const bonusLines = formatDamageBonusLines(base?.conditionalFormulas ?? []);
+
+    const alternatives = listCreatureDamageAlternatives(action);
+
+    if (alternatives.length === 0) {
+      return base
+        ? {
+            formula: formatDamageTileFormula(base.baseFormula),
+            tooltip: [base.typeLabel, ...bonusLines]
+              .filter((line) => line.length > 0)
+              .join(CREATURE_DAMAGE_CHOICE_LABELS.hintSeparator),
+            icon: resolveDamageStatIcon(
+              listSourceDamageTypeChoices(action).length > 0,
+              bonusLines.length > 0,
+            ),
+          }
+        : null;
     }
 
-    const infos = parts.map((part) => describeDamagePart(part));
-
-    const typeKeys = [...new Set(infos.flatMap((info) => info.types))];
+    const hints = alternatives.map(
+      (alternative) =>
+        `${CREATURE_DAMAGE_CHOICE_LABELS.orPrefix}${formatDamagePartsText(
+          readAlternativeShownParts(alternative),
+          getDamageTypeLabel,
+        )}${CREATURE_DAMAGE_CHOICE_LABELS.hintSeparator}${describeCreatureDamageCondition(
+          alternative,
+        )}`,
+    );
 
     return {
-      formula: infos.map((info) => info.formula).join(' + '),
-      typeLabel: typeKeys.map((key) => getDamageTypeLabel(key)).join(', '),
+      formula: base
+        ? formatDamageTileFormula(base.baseFormula)
+        : CREATURE_DAMAGE_CHOICE_LABELS.noDamage,
+      tooltip: [base?.typeLabel ?? '', ...bonusLines, ...hints]
+        .filter((line) => line.length > 0)
+        .join(CREATURE_DAMAGE_CHOICE_LABELS.hintSeparator),
+      icon: DAMAGE_VARIANTS_STAT_ICON,
     };
-  }
-
-  /** Основной тип урона действия (для цвета шаблона и подписи броска) */
-  function actionPrimaryType(action: CreatureAction): string | undefined {
-    const first = action.damageParts?.[0];
-
-    return first ? describeDamagePart(first).types[0] : undefined;
-  }
-
-  /** Есть ли у действия спасбросок (заменяет бросок попадания) */
-  function actionHasSave(action: CreatureAction): boolean {
-    return !!action.saveType && action.saveType !== 'none';
-  }
-
-  /**
-   * Проверяет, есть ли у действия боевые параметры (атака, урон или спасбросок)
-   * @param action - действие
-   */
-  function hasAttackParams(action: CreatureAction): boolean {
-    return !!(
-      action.attackBonus !== undefined
-      || (action.damageParts && action.damageParts.length > 0)
-      || actionHasSave(action)
-    );
-  }
-
-  /**
-   * Проверяет, есть ли у действия эффекты
-   * @param action - действие
-   */
-  function hasEffects(action: CreatureAction): boolean {
-    return !!(action.activeEffects && action.activeEffects.length > 0);
-  }
-
-  // ── Контекстное меню (ПКМ) ──────────────────────────────────────────────
-
-  const isContextMenuOpen = ref(false);
-  const contextMenuX = ref(0);
-  const contextMenuY = ref(0);
-  const contextMenuIndex = ref(-1);
-
-  /**
-   * Открывает контекстное меню по ПКМ
-   * @param event - событие contextmenu
-   * @param index - индекс действия
-   */
-  function openContextMenu(event: MouseEvent, index: number): void {
-    if (props.isReadOnly) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-
-    contextMenuX.value = event.clientX;
-    contextMenuY.value = event.clientY;
-    contextMenuIndex.value = index;
-    isContextMenuOpen.value = true;
-  }
-
-  /** Закрывает контекстное меню */
-  function closeContextMenu(): void {
-    isContextMenuOpen.value = false;
-    contextMenuIndex.value = -1;
-  }
-
-  /**
-   * Обработчик «Атаковать» из контекстного меню
-   */
-  function handleContextAttack(): void {
-    const action = props.actions[contextMenuIndex.value];
-
-    closeContextMenu();
-
-    if (action) {
-      openRollModal(action);
-    }
-  }
-
-  /**
-   * Обработчик «Редактировать» из контекстного меню
-   */
-  function handleContextEdit(): void {
-    const index = contextMenuIndex.value;
-
-    closeContextMenu();
-    openEditForm(index);
-  }
-
-  /**
-   * Обработчик «Поделиться в чат» из контекстного меню
-   */
-  function handleContextShare(): void {
-    const action = props.actions[contextMenuIndex.value];
-
-    closeContextMenu();
-
-    if (!action) {
-      return;
-    }
-
-    const featurePayload = {
-      name: action.name,
-      description: getActionDescriptionMarkdown(action),
-      featureType: props.mode === 'trait' ? 'feat' : 'feature',
-    };
-
-    chatStore.sendItemCard({
-      cardType: 'feature',
-      title: action.name,
-      payload: JSON.stringify(featurePayload),
-    });
-  }
-
-  /**
-   * Обработчик «Удалить» из контекстного меню
-   */
-  function handleContextDelete(): void {
-    const index = contextMenuIndex.value;
-
-    closeContextMenu();
-    removeAction(index);
   }
 
   // ── Броски урона ────────────────────────────────────────────────────────
 
-  const isRollModalOpen = ref(false);
-
-  const rollConfig = ref({
-    title: '',
-    name: '',
-    formula: '',
-    rollButtonText: 'Атаковать',
-    attackModifier: undefined as number | undefined,
-    initialRollMode: 'normal' as AttackRollMode,
-    incomingAttackType: undefined as 'melee' | 'ranged' | 'spell' | undefined,
-    damageType: undefined as string | undefined,
-    damageParts: [] as SpellDamagePartInput[],
-    evaluateBonusDamageParts: undefined as
-      | ((context: {
-          hasAdvantage: boolean;
-          hasDisadvantage: boolean;
-        }) => SpellDamagePartInput[])
-      | undefined,
-    onRollParts: undefined as
-      | ((parts: RolledSpellDamagePart[]) => void)
-      | undefined,
-    onHit: undefined as (() => void) | undefined,
-  });
-
-  /** Существо-источник действий (для casterId, эффектов, @-переменных) */
-  function getCreatureEntity(): Creature | null {
+  /** Существо-источник действий (для запретов трат хода) */
+  function getCreatureEntity(): DnDCreature | null {
     if (!props.creatureId) {
       return null;
     }
@@ -353,202 +343,40 @@
     const worldId = worldStore.connectionState.currentWorldId;
     const world = worldStore.worlds.find((entry) => entry.id === worldId);
 
-    return (
-      world?.creatures?.find((entry) => entry.id === props.creatureId) ?? null
+    // Стор хоста хранит сущности в нейтральной форме — D&D-форму подтверждает
+    // гвард, как и везде на границе с хостом.
+    const found = world?.creatures?.find(
+      (entry) => entry.id === props.creatureId,
     );
-  }
 
-  /** Сущности текущего мира (акторы + существа) — цели применения */
-  function getCurrentWorldEntities(): SceneEntity[] {
-    const worldId = worldStore.connectionState.currentWorldId;
-    const world = worldStore.worlds.find((entry) => entry.id === worldId);
-
-    if (!world) {
-      return [];
-    }
-
-    return [...(world.actors ?? []), ...(world.creatures ?? [])];
+    return found && isDndCreature(found) ? found : null;
   }
 
   /**
-   * Открывает модалку броска для действия. Атаки идут с броском попадания,
-   * действия со спасброском/областью — без него (цель кидает спас). Перед
-   * прямой атакой проверяется дистанция; для области сначала размещается шаблон.
+   * Совершает действие — общим путём действия существа, тем же, что у
+   * горячей панели: отказ — уведомлением, запись без броска и эффектов —
+   * карточкой в чат.
    *
-   * @param action - действие существа
+   * @param sourceAction - действие существа; эффекты — до выбора варианта
    */
-  function openRollModal(action: CreatureAction): void {
-    if (!hasAttackParams(action)) {
+  function openRollModal(sourceAction: CreatureAction): void {
+    if (!props.creatureId) {
       return;
     }
 
-    const creature = getCreatureEntity();
-
-    if (!creature) {
-      return;
-    }
-
-    // Проверка дистанции — только для прямых атак (область таргетится шаблоном)
-    let isDisadvantage = false;
-
-    if (!action.areaOfEffect && targetStore.targetTokenId && props.creatureId) {
-      const rangeCheck = checkCreatureActionRangeOnScene(
-        action,
-        props.creatureId,
-        targetStore.targetTokenId,
-      );
-
-      if (rangeCheck && !rangeCheck.allowed) {
-        chatStore.sendMessage(
-          `⛔ ${action.name}: цель вне досягаемости (${rangeCheck.distance} ${rangeCheck.unitLabel})`,
-          'text',
-        );
-
-        return;
-      }
-
-      if (rangeCheck?.disadvantage) {
-        isDisadvantage = true;
-      }
-    }
-
-    // Область: сначала размещаем шаблон у токена существа, затем кидаем урон
-    if (action.areaOfEffect) {
-      const color =
-        SPELL_DAMAGE_TEMPLATE_COLORS[actionPrimaryType(action) ?? '']
-        ?? SPELL_TEMPLATE_DEFAULT_COLOR;
-
-      spellTemplateStore.requestPlacement(
-        action.areaOfEffect,
-        color,
-        props.creatureId,
-        (templateId) =>
-          startActionRoll(action, creature, isDisadvantage, templateId),
-        null,
-      );
-
-      return;
-    }
-
-    startActionRoll(action, creature, isDisadvantage, undefined);
-  }
-
-  /**
-   * Готовит и открывает DiceRollModal для действия (многочастный путь).
-   *
-   * @param action - действие существа
-   * @param creature - существо-источник
-   * @param isDisadvantage - стартовать с помехой (проверка дистанции)
-   * @param templateId - id размещённого AoE-шаблона (если действие с областью)
-   */
-  function startActionRoll(
-    action: CreatureAction,
-    creature: Creature,
-    isDisadvantage: boolean,
-    templateId: string | undefined,
-  ): void {
-    const usesSaveOrArea = actionHasSave(action) || !!action.areaOfEffect;
-
-    const effects = collectActiveEffects(creature);
-
-    // Состояние HP цели для @target.* — только у одиночной цели (не у области)
-    const targetHp = action.areaOfEffect ? undefined : buildTargetHpContext();
-
-    const targetIsFull = targetHp
-      ? targetHp.currentHp >= targetHp.maxHp
-      : undefined;
-
-    const setup = buildCreatureRollSetup({
-      action,
-      creature,
-      effects,
-      targetIsFull,
+    startCreatureAction(sourceAction, {
+      creatureId: props.creatureId,
+      section: props.section,
+      refuse: refuseAction,
+      announce: shareActionToChat,
     });
-
-    // Эффекты действия (статус/урон со своим applySave) обрабатывает
-    // оркестратор per-target через `pseudoSpell.activeEffects` (выставлено в
-    // buildCreatureRollSetup) — единый путь со заклинаниями и оружием.
-    rollConfig.value = {
-      title: usesSaveOrArea ? action.name : `Атака — ${action.name}`,
-      name: action.name,
-      formula: setup.baseParts[0]?.formula ?? '',
-      rollButtonText: usesSaveOrArea ? 'Бросить урон' : 'Атаковать',
-      attackModifier: usesSaveOrArea ? undefined : action.attackBonus,
-      initialRollMode: isDisadvantage ? 'disadvantage' : 'normal',
-      incomingAttackType: action.rangeType === 'ranged' ? 'ranged' : 'melee',
-      damageType: actionPrimaryType(action),
-      damageParts: setup.baseParts,
-      evaluateBonusDamageParts: setup.evaluateBonusDamageParts,
-      onRollParts: (parts: RolledSpellDamagePart[]) =>
-        applyActionParts(
-          action,
-          creature,
-          setup.pseudoSpell,
-          parts,
-          templateId,
-        ),
-      // Попадание идёт многочастным путём (`onRollParts`), отдельного
-      // обработчика у действия существа нет — но ключ обязателен, конфиг броска
-      // описан с полным набором полей.
-      onHit: undefined,
-    };
-
-    isRollModalOpen.value = true;
   }
 
   /**
-   * Применяет брошенные части урона действия через многочастный оркестратор:
-   * спасброски целей (одиночная цель или AoE-шаблон), защиты по типу, единый
-   * HP-апдейт и одно сообщение в чат.
-   *
-   * @param action - действие существа (источник DC спасброска)
-   * @param creature - существо-источник (casterId для self-частей)
-   * @param pseudoSpell - псевдо-заклинание действия (saveType/saveEffect/эффекты)
-   * @param parts - брошенные части урона
-   * @param templateId - id размещённого AoE-шаблона (если был)
-   */
-  function applyActionParts(
-    action: CreatureAction,
-    creature: Creature,
-    pseudoSpell: Spell,
-    parts: RolledSpellDamagePart[],
-    templateId: string | undefined,
-  ): void {
-    const actors = getCurrentWorldEntities();
-    const socket = chatStore.getSocket();
-
-    let cachedTemplate: MeasurementTemplate | null = null;
-
-    if (templateId) {
-      cachedTemplate = spellTemplateStore.getPlacedTemplate(templateId) ?? null;
-      spellTemplateStore.removePlacedTemplate(templateId);
-    }
-
-    if (actors.length > 0 && socket) {
-      void resolveSpellDamageWithParts(
-        {
-          spell: pseudoSpell,
-          damageTotal: 0,
-          spellSaveDC: action.saveDC ?? 10,
-          actors,
-          socket,
-          casterId: creature.id,
-        },
-        parts,
-        { scene: worldStore.currentScene, cachedTemplate },
-      );
-    }
-
-    if (templateId) {
-      spellTemplateStore.deleteTemplate(templateId);
-    }
-  }
-
-  /**
-   * Обрабатывает клик по строке действия:
-   * - В режиме редактирования — открывает форму
-   * - В остальных случаях — открывает модалку просмотра (бросок запускается
-   *   отдельной кнопкой в начале строки)
+   * Обрабатывает нажатие по строке действия:
+   * - в режиме редактирования — открывает форму;
+   * - в остальных случаях — открывает карточку просмотра (бросок запускается
+   *   значком в начале строки или плиткой параметра).
    *
    * @param action - действие существа
    * @param index - индекс действия
@@ -562,12 +390,37 @@
   }
 
   /**
-   * Можно ли запустить бросок действия прямо из строки (есть боевые параметры,
-   * не компендиум, известно существо-источник).
+   * Можно ли совершить запись прямо из строки: не компендиум, известно
+   * существо-источник, и есть что делать — бросок, эффекты на себя или трата
+   * хода раздела статблока. Последнее даёт кнопку и записи без броска
+   * («Ловкий побег»): иначе её бонусное действие не отметить, и «Замедление»
+   * пропустило бы после неё удар.
+   *
    * @param action - действие существа
+   * @returns `true`, если запись можно совершить
    */
   function canUseAction(action: CreatureAction): boolean {
-    return !props.isReadOnly && !!props.creatureId && hasAttackParams(action);
+    return (
+      !props.isReadOnly
+      && !!props.creatureId
+      && (hasCreatureActionRoll(action)
+        || hasActionSelfEffects(action)
+        || props.section !== undefined)
+    );
+  }
+
+  /**
+   * Подпись применения записи: «Атаковать» — только у атаки, в том числе без
+   * записанного бонуса; спасбросок, область, автопопадание и запись без
+   * броска «Используют».
+   *
+   * @param action - действие существа
+   * @returns подпись кнопки или пункта меню
+   */
+  function getUseLabel(action: CreatureAction): string {
+    return resolveCreatureActionAttackBonus(action) !== undefined
+      ? CREATURE_ACTION_MENU_LABELS.attack
+      : CREATURE_ACTION_MENU_LABELS.use;
   }
 
   /** Показывать ли кнопку «Атаковать» в модалке просмотра действия */
@@ -575,15 +428,21 @@
     () => !!detailAction.value && canUseAction(detailAction.value),
   );
 
+  /** Подпись кнопки применения в модалке просмотра */
+  const detailUseLabel = computed(() =>
+    detailAction.value ? getUseLabel(detailAction.value) : undefined,
+  );
+
   /**
    * Обрабатывает ввод количества легендарных действий
    * @param event - событие ввода
    */
   function handleLegendaryCountInput(event: Event): void {
-    emit(
-      'update:legendaryCount',
-      Number((event.target as HTMLInputElement).value),
-    );
+    if (!(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+
+    emit('update:legendaryCount', Number(event.target.value));
   }
 
   /**
@@ -602,31 +461,293 @@
       id: `${props.creatureId}-${action.name.replace(/\\s+/g, '-')}`,
       type: 'creature-action',
       label,
-      icon: 'tabler:alien',
+      icon: CREATURE_ICON,
       ref: action.name,
       actorId: props.creatureId,
     });
   }
+
+  /**
+   * Отправляет карточку записи в чат.
+   * @param action - действие или особенность существа
+   */
+  function shareActionToChat(action: CreatureAction): void {
+    chatStore.sendItemCard({
+      cardType: 'feature',
+      title: action.name,
+      payload: JSON.stringify({
+        name: action.name,
+        description: getActionDescriptionMarkdown(action),
+        featureType: props.mode === 'trait' ? 'feat' : 'feature',
+      }),
+    });
+  }
+
+  // ── Сборка строк списка ─────────────────────────────────────────────────
+
+  /**
+   * Значок записи: он говорит, чем запись занята в бою. Пассивной особенности
+   * достаётся звезда — бросать у неё нечего.
+   *
+   * @param action - запись существа
+   * @returns имя значка
+   */
+  function getActionIcon(action: CreatureAction): string {
+    if (props.mode === 'trait') {
+      return CREATURE_ROW_ICONS.trait;
+    }
+
+    if (action.areaOfEffect) {
+      return CREATURE_ROW_ICONS.area;
+    }
+
+    if (creatureActionHasSave(action)) {
+      return CREATURE_ROW_ICONS.save;
+    }
+
+    if (resolveCreatureActionAttackBonus(action) !== undefined) {
+      return CREATURE_ROW_ICONS.attack;
+    }
+
+    return CREATURE_ROW_ICONS.plain;
+  }
+
+  /**
+   * Подпись под названием: вид дальности и досягаемость либо область. Собрана
+   * так же, как подпись предмета на листе персонажа, — категория и вид записи.
+   *
+   * @param action - запись существа
+   * @returns подпись вида «Ближний бой, досягаемость 10 фт.» или
+   *   «Рукопашная или дальнобойная, 5 фт. / 30/120 фт.»
+   */
+  function getActionSubtitle(action: CreatureAction): string {
+    const unit = DISTANCE_UNIT_SHORT[action.distanceUnit ?? 'ft'];
+
+    if (action.areaOfEffect) {
+      const shape =
+        AREA_SHAPE_LABELS[action.areaOfEffect.shape]
+        ?? action.areaOfEffect.shape;
+
+      return `${shape} ${action.areaOfEffect.size} ${unit}`;
+    }
+
+    if (!action.rangeType) {
+      return '';
+    }
+
+    const kind = CREATURE_RANGE_TYPE_LABELS[action.rangeType];
+
+    if (action.rangeType === 'meleeOrRanged') {
+      return `${kind}, ${formatMeleeOrRangedDistances({
+        reach: action.reach ?? DEFAULT_REACH_FEET,
+        range: action.range,
+        unitLabel: unit,
+      })}`;
+    }
+
+    if (action.rangeType === 'ranged') {
+      if (!action.range) {
+        return kind;
+      }
+
+      return `${kind}, ${formatAttackRange(action.range, unit)}`;
+    }
+
+    return `${kind}${CREATURE_ACTIONS_BLOCK_LABELS.reachPrefix}${action.reach ?? DEFAULT_REACH_FEET} ${unit}`;
+  }
+
+  /**
+   * Плитки параметров строки: боевой параметр записи (бонус атаки либо
+   * спасбросок цели), затем урон. Порядок тот же, что и у оружия на листе.
+   *
+   * @param action - запись существа
+   * @returns плитки в порядке показа
+   */
+  function getActionStats(action: CreatureAction): SheetRowStat[] {
+    const stats: SheetRowStat[] = [];
+    const rollable = canUseAction(action);
+    // Нет бонуса в данных — плитка всё равно показывает атаку, с +0
+    const attackBonus = resolveCreatureActionAttackBonus(action);
+
+    if (creatureActionHasSave(action) && action.saveType) {
+      stats.push({
+        key: 'save',
+        label: CREATURE_ROW_STAT_LABELS.save,
+        value:
+          `${ABILITY_SHORT_LABELS[action.saveType] ?? ''} ${action.saveDC ?? '?'}`.trim(),
+        tooltip: `${CREATURE_ROW_STAT_HINTS.save}: ${SAVE_TYPE_LABELS[action.saveType]}`,
+        accent: true,
+        rollable,
+      });
+    } else if (attackBonus !== undefined) {
+      stats.push({
+        key: 'attack',
+        label: CREATURE_ROW_STAT_LABELS.attack,
+        value: formatSignedNumber(attackBonus),
+        tooltip: CREATURE_ROW_STAT_HINTS.attack,
+        accent: true,
+        rollable,
+      });
+    }
+
+    const damage = actionDamageSummary(action);
+
+    if (damage) {
+      stats.push({
+        key: 'damage',
+        label: CREATURE_ROW_STAT_LABELS.damage,
+        value: damage.formula,
+        tooltip: damage.tooltip,
+        accent: true,
+        rollable,
+        icon: damage.icon,
+      });
+    }
+
+    return stats;
+  }
+
+  /**
+   * Пункты меню строки. Меню одно на правую кнопку мыши и на «⋮» в конце
+   * строки: два набора действий у одной строки расходились бы.
+   *
+   * Группы разделяются чертой: сверху игровое действие записью, ниже —
+   * действия над самой записью, последним — удаление.
+   *
+   * @param action - запись существа
+   * @param index - место записи в списке
+   * @returns группы пунктов для `UContextMenu` и `UDropdownMenu`
+   */
+  function getActionMenuItems(
+    action: CreatureAction,
+    index: number,
+  ): DropdownMenuItem[][] {
+    const groups: DropdownMenuItem[][] = [];
+
+    if (canUseAction(action)) {
+      groups.push([
+        {
+          label: getUseLabel(action),
+          icon: 'tabler:swords',
+          onSelect: () => openRollModal(action),
+        },
+      ]);
+    }
+
+    const sheetActions: DropdownMenuItem[] = [];
+
+    if (!props.isReadOnly) {
+      sheetActions.push({
+        label: SHEET_ROW_MENU_LABELS.edit,
+        icon: 'tabler:edit',
+        onSelect: () => openEditForm(index),
+      });
+    }
+
+    sheetActions.push({
+      label: SHEET_ROW_MENU_LABELS.share,
+      icon: 'tabler:message-share',
+      onSelect: () => shareActionToChat(action),
+    });
+
+    groups.push(sheetActions);
+
+    if (!props.isReadOnly) {
+      groups.push([
+        {
+          label: SHEET_ROW_MENU_LABELS.remove,
+          icon: 'tabler:trash',
+          color: 'error',
+          onSelect: () => removeAction(index),
+        },
+      ]);
+    }
+
+    return groups;
+  }
+
+  /** Отбор по названию идёт: список сужен рядом отбора вкладки */
+  const isSearching = computed(() => props.search.trim() !== '');
+
+  /**
+   * Строки списка, уже собранные для показа. Место записи в исходном массиве
+   * остаётся при строке: по нему идут правка и удаление, и поиск его не сдвигает.
+   *
+   * Собираются вычислимым, а не вызовами из шаблона: подписи и плитки зависят
+   * от справочников мира, и из шаблона они шли бы на каждую перерисовку.
+   */
+  const actionRows = computed(() => {
+    const query = props.search.trim().toLowerCase();
+
+    return props.actions
+      .map((action, index) => ({ action, index }))
+      .filter(
+        ({ action }) =>
+          !query
+          || action.name.toLowerCase().includes(query)
+          || (action.nameEn ?? '').toLowerCase().includes(query),
+      )
+      .map(({ action, index }) => ({
+        key: `${index}-${action.name}`,
+        action,
+        index,
+        icon: getActionIcon(action),
+        subtitle: getActionSubtitle(action),
+        stats: getActionStats(action),
+        menuItems: getActionMenuItems(action, index),
+        canUse: canUseAction(action),
+        canDrag: !props.isEditMode && !!props.creatureId,
+        blockedReason: blockOf(action),
+      }));
+  });
+
+  /**
+   * Раздел на виду. Под поиском пустой раздел уезжает целиком: заголовок без
+   * единой строки только сбивал бы с толку. Без поиска в режиме правки он
+   * остаётся — иначе в пустой раздел нечем было бы добавить запись.
+   */
+  const isVisible = computed(
+    () =>
+      actionRows.value.length > 0 || (props.isEditMode && !isSearching.value),
+  );
+
+  /**
+   * Промежуток между строками: карточки действий стоят просторнее плашек
+   * особенностей — ровно как снаряжение и особенности на листе персонажа.
+   */
+  const listClass = computed(() =>
+    props.mode === 'trait' ? 'flex flex-col gap-1' : 'flex flex-col gap-2',
+  );
+
+  // Кнопка «Добавить» вкладки особенностей стоит в общем ряду отбора, а форма
+  // записи живёт здесь — открывать её оттуда больше нечем
+  defineExpose({ openCreateForm });
 </script>
 
 <template>
   <div
-    v-if="isEditMode || actions.length > 0"
-    class="space-y-2"
+    v-if="isVisible"
+    class="flex flex-col"
   >
-    <!-- Заголовок секции -->
-    <div class="flex items-center justify-between">
+    <!-- Заголовок раздела — тот же разделитель, что и у групп снаряжения на
+      листе персонажа. Кнопка «Добавить» стоит в его правом краю: ряд отбора
+      один на вкладку, а разделов на ней несколько. У раздела без названия вне
+      правки листа строка пустая — её не рисуем вовсе -->
+    <div
+      v-if="showHeader && (title || (isEditMode && !isReadOnly))"
+      class="mb-1 flex min-h-7 items-center justify-between gap-2"
+    >
       <div class="flex items-center gap-1.5">
-        <h3
+        <h4
           v-if="title"
-          class="text-sm font-bold tracking-wider text-highlighted uppercase"
+          class="text-xs font-semibold tracking-wider text-muted uppercase"
         >
           {{ title }}
-        </h3>
+        </h4>
 
         <!-- Счётчик легендарных действий -->
         <template v-if="legendaryCount !== undefined">
-          <span class="text-xs text-muted">({{ legendaryCount }}/раунд)</span>
+          <span class="text-xs text-dimmed">({{ legendaryPerRound }})</span>
 
           <input
             v-if="isEditMode"
@@ -640,239 +761,60 @@
         </template>
       </div>
 
-      <button
-        v-if="isEditMode"
-        type="button"
-        class="flex items-center gap-1 rounded-full border border-dashed border-muted px-2 py-0.5 text-muted transition-colors hover:border-primary hover:text-primary"
+      <UButton
+        v-if="isEditMode && !isReadOnly"
+        icon="tabler:plus"
+        color="primary"
+        variant="soft"
+        :size="FILTER_ROW_CONTROL_SIZE"
         @click.left.exact.prevent="openCreateForm"
       >
-        <UIcon
-          name="tabler:plus"
-          class="size-3.5"
-        />
-
-        <span class="text-xs">Добавить</span>
-      </button>
+        {{ MODAL_BUTTON_LABELS.add }}
+      </UButton>
     </div>
 
-    <!-- Список действий -->
-    <div class="space-y-1">
-      <UFieldGroup
-        v-for="(action, index) in actions"
-        :key="index"
-        size="lg"
-        class="group flex w-full"
+    <!-- Преамбула раздела: стоит под заголовком, а не в первой записи, —
+      она объясняет весь раздел, а не одно действие -->
+    <ItemDescriptionRenderer
+      v-if="sectionDescription"
+      :content="sectionDescription"
+      class="mb-2 text-xs wrap-break-word text-dimmed"
+    />
+
+    <!-- Список записей. У особенности боевых чисел нет — ей достаётся плашка
+      вместо карточки, как и особенностям листа персонажа -->
+    <div :class="listClass">
+      <template
+        v-for="row in actionRows"
+        :key="row.key"
       >
-        <!-- Использовать действие (бросок) -->
-        <UTooltip
-          v-if="canUseAction(action)"
-          text="Использовать"
-        >
-          <UButton
-            icon="tabler:current-location"
-            color="primary"
-            variant="soft"
-            @click.left.exact.prevent.stop="openRollModal(action)"
-          />
-        </UTooltip>
-
-        <!-- Основная часть: имя + параметры (клик = просмотр/редактирование) -->
-        <UButton
-          color="neutral"
-          variant="soft"
-          class="min-w-0 flex-1 justify-start gap-3"
-          :draggable="!isEditMode && !!creatureId"
-          @click.left.exact.prevent="handleActionClick(action, index)"
-          @contextmenu="openContextMenu($event, index)"
-          @dragstart="handleDragStart($event, action)"
-        >
-          <!-- Сброс контекста группы: бейджи внутри кнопки-члена UFieldGroup
-               иначе наследуют «склейку» и теряют скругление -->
-          <FieldGroupReset>
-            <!-- Сетка с фиксированными колонками: боевые параметры
-                 выравниваются по столбцам между строками (как в снаряжении) -->
-            <div
-              class="grid w-full min-w-0 items-center gap-x-3"
-              :style="{
-                gridTemplateColumns:
-                  'minmax(0, 1fr) 3.5rem 4.5rem 7rem 5.5rem 2.75rem',
-              }"
-            >
-              <!-- col 1: Название -->
-              <span
-                class="col-start-1 min-w-0 truncate text-left text-sm font-medium text-highlighted"
-              >
-                {{ action.name }}
-              </span>
-
-              <!-- Боевые параметры -->
-              <template v-if="hasAttackParams(action)">
-                <!-- col 2: Тип дальности -->
-                <span
-                  v-if="action.rangeType"
-                  class="col-start-2 text-xs text-dimmed"
-                >
-                  {{ action.rangeType === 'ranged' ? 'Дальн.' : 'Ближн.' }}
-                </span>
-
-                <!-- col 3: Бонус к попаданию / Спасбросок -->
-                <div class="col-start-3 flex">
-                  <UBadge
-                    v-if="
-                      action.attackBonus !== undefined && !actionHasSave(action)
-                    "
-                    color="neutral"
-                    variant="subtle"
-                    size="sm"
-                    class="font-mono"
-                  >
-                    {{ action.attackBonus >= 0 ? '+' : ''
-                    }}{{ action.attackBonus }}
-                  </UBadge>
-
-                  <UBadge
-                    v-else-if="actionHasSave(action)"
-                    color="error"
-                    variant="subtle"
-                    size="sm"
-                    class="font-mono"
-                  >
-                    Спас {{ action.saveDC ?? '?' }}
-                  </UBadge>
-                </div>
-
-                <!-- col 4: Урон / лечение (формула) -->
-                <div
-                  v-if="actionDamageSummary(action)"
-                  class="col-start-4 flex min-w-0"
-                >
-                  <UBadge
-                    color="neutral"
-                    variant="subtle"
-                    size="sm"
-                    class="font-mono"
-                  >
-                    {{ actionDamageSummary(action)!.formula }}
-                  </UBadge>
-                </div>
-
-                <!-- col 5: Тип урона -->
-                <span
-                  v-if="actionDamageSummary(action)?.typeLabel"
-                  :title="actionDamageSummary(action)!.typeLabel"
-                  class="col-start-5 truncate text-xs text-dimmed"
-                >
-                  {{ actionDamageSummary(action)!.typeLabel }}
-                </span>
-              </template>
-
-              <!-- col 6: Эффекты -->
-              <div class="col-start-6 flex justify-end">
-                <UBadge
-                  v-if="hasEffects(action)"
-                  color="warning"
-                  variant="subtle"
-                  size="sm"
-                >
-                  <UIcon
-                    name="tabler:sparkles"
-                    class="mr-0.5 size-3"
-                  />
-                  {{ action.activeEffects!.length }}
-                </UBadge>
-              </div>
-            </div>
-          </FieldGroupReset>
-        </UButton>
-
-        <!-- Редактировать (режим редактирования) -->
-        <UButton
-          v-if="isEditMode && !isReadOnly"
-          icon="tabler:pencil"
-          color="neutral"
-          variant="soft"
-          title="Редактировать"
-          @click.left.exact.prevent.stop="openEditForm(index)"
+        <CreatureTraitRow
+          v-if="mode === 'trait'"
+          :action="row.action"
+          :menu-items="row.menuItems"
+          :is-edit-mode="isEditMode"
+          :is-read-only="isReadOnly"
+          @open="openDetailModal(row.action)"
+          @edit="openEditForm(row.index)"
+          @delete="removeAction(row.index)"
         />
 
-        <!-- Удалить (режим редактирования) -->
-        <UButton
-          v-if="isEditMode && !isReadOnly"
-          icon="tabler:trash"
-          color="error"
-          variant="soft"
-          title="Удалить"
-          @click.left.exact.prevent.stop="removeAction(index)"
+        <CreatureActionRow
+          v-else
+          :action="row.action"
+          :icon="row.icon"
+          :subtitle="row.subtitle"
+          :stats="row.stats"
+          :menu-items="row.menuItems"
+          :can-use="row.canUse"
+          :can-drag="row.canDrag"
+          :blocked-reason="row.blockedReason"
+          @open="handleActionClick(row.action, row.index)"
+          @use="openRollModal(row.action)"
+          @dragstart="handleDragStart($event, row.action)"
         />
-      </UFieldGroup>
+      </template>
     </div>
-
-    <!-- Контекстное меню (ПКМ) -->
-    <Teleport to="body">
-      <div
-        v-if="isContextMenuOpen"
-        class="fixed inset-0 z-10000"
-        @click.left.exact.prevent="closeContextMenu"
-        @contextmenu.prevent="closeContextMenu"
-      >
-        <div
-          class="absolute min-w-[180px] rounded-lg border border-default bg-default py-1 shadow-xl"
-          :style="{ left: `${contextMenuX}px`, top: `${contextMenuY}px` }"
-          @click.stop
-        >
-          <!-- Атаковать -->
-          <button
-            v-if="
-              contextMenuIndex >= 0
-              && hasAttackParams(actions[contextMenuIndex])
-            "
-            class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-            @click.left.exact.prevent="handleContextAttack"
-          >
-            <UIcon
-              name="tabler:swords"
-              class="h-4 w-4 text-muted"
-            />
-            Атаковать
-          </button>
-
-          <!-- Редактировать -->
-          <button
-            class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-            @click.left.exact.prevent="handleContextEdit"
-          >
-            <UIcon
-              name="tabler:edit"
-              class="h-4 w-4 text-muted"
-            />
-            Редактировать
-          </button>
-
-          <!-- Поделиться в чат -->
-          <button
-            class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-            @click.left.exact.prevent="handleContextShare"
-          >
-            <UIcon
-              name="tabler:message-share"
-              class="h-4 w-4 text-muted"
-            />
-            Поделиться в чат
-          </button>
-
-          <!-- Разделитель -->
-          <div class="mx-2 my-1 border-t border-default/50" />
-
-          <!-- Удалить -->
-          <ContextMenuDangerItem
-            icon="tabler:trash"
-            @click="handleContextDelete"
-          >
-            Удалить
-          </ContextMenuDangerItem>
-        </div>
-      </div>
-    </Teleport>
 
     <!-- Модалка создания/редактирования -->
     <CreatureActionFormModal
@@ -883,28 +825,13 @@
       @save="handleActionSave"
     />
 
-    <DiceRollModal
-      v-model:open="isRollModalOpen"
-      :formula="rollConfig.formula"
-      :title="rollConfig.title"
-      :roll-label="rollConfig.name"
-      :attack-modifier="rollConfig.attackModifier"
-      :initial-roll-mode="rollConfig.initialRollMode"
-      :incoming-attack-type="rollConfig.incomingAttackType"
-      :damage-type="rollConfig.damageType"
-      :roll-button-text="rollConfig.rollButtonText"
-      :damage-parts="rollConfig.damageParts"
-      :evaluate-bonus-damage-parts="rollConfig.evaluateBonusDamageParts"
-      :on-roll-parts="rollConfig.onRollParts"
-      :on-hit="rollConfig.onHit"
-    />
-
     <!-- Модалка просмотра действия -->
     <CreatureActionDetailModal
       v-model:open="isDetailOpen"
       :action="detailAction ?? null"
       :mode="mode"
       :show-attack-button="canAttackFromDetail"
+      :attack-button-label="detailUseLabel"
       @attack="handleDetailAttack"
     />
   </div>

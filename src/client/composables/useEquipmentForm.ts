@@ -1,22 +1,33 @@
 import type {
-  EquipmentCategory,
+  AmmunitionType,
   EquipmentCategoryDefinition,
   ItemRarity,
+  SourceDefinition,
 } from '@vtt/shared';
 import type {
   ActiveEffect,
   CurrencyType,
-  GameItem,
+  DnDEquipmentCategory,
+  DnDGameItem,
 } from '@vtt/shared/system/dnd.js';
+
+import { computed, ref, watch } from 'vue';
 
 import {
   DEFAULT_CURRENCY,
+  FALLBACK_SOURCE_KEY,
   isDnDEffect,
   parseCost,
 } from '@vtt/shared/system/dnd.js';
-import { computed, ref, watch } from 'vue';
 
-import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+import { useSystemDataStore } from '../stores/systemDataStore';
+import { useItemUsesForm } from './useItemUsesForm';
+
+/**
+ * Тип экипировки, с которым открывается форма создания, если вызвавший не
+ * попросил другой. Лёгкая броня — самый частый случай.
+ */
+const DEFAULT_CREATE_CATEGORY: DnDEquipmentCategory = 'light';
 
 /**
  * Composable для логики формы доспеха.
@@ -26,17 +37,24 @@ import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
  *
  * @param getArmor - функция получения текущего редактируемого доспеха (null = создание)
  * @param getIsOpen - функция получения флага открытости модалки
+ * @param getCreateCategory - тип экипировки для формы СОЗДАНИЯ (правка берёт тип
+ *   из самой записи). Через него меню «Мастерской» открывает форму сразу
+ *   безделушкой, а не снаряжением, у которого тип меняют руками.
+ * @param getCreateMagical - отметить запись магической при СОЗДАНИИ. Тем же
+ *   меню «Мастерской» открывается пункт «Магический предмет».
  */
 export function useEquipmentForm(
-  getArmor: () => GameItem | null,
+  getArmor: () => DnDGameItem | null,
   getIsOpen: () => boolean,
+  getCreateCategory: () => DnDEquipmentCategory | undefined = () => undefined,
+  getCreateMagical: () => boolean | undefined = () => undefined,
 ) {
   // --- Reactive-поля формы ---
   const name = ref('');
   const nameEn = ref('');
   const description = ref('');
   const baseType = ref('');
-  const equipmentCategory = ref<EquipmentCategory>('light');
+  const equipmentCategory = ref<DnDEquipmentCategory>('light');
   const baseArmorAC = ref(10);
   const maxDexBonus = ref<number | null>(null);
   const selectedEquipmentProperties = ref<string[]>([]);
@@ -44,13 +62,21 @@ export function useEquipmentForm(
   const weight = ref(0);
   const costValue = ref(0);
   const costCurrency = ref<CurrencyType>(DEFAULT_CURRENCY);
-  const sourceKey = ref('hb');
+  const sourceKey = ref<string | undefined>(FALLBACK_SOURCE_KEY);
+  const source = ref<SourceDefinition | undefined>(undefined);
   const isSRD = ref(false);
   const magicAttunement = ref<'none' | 'required' | 'optional'>('none');
   const isAttuned = ref(false);
+  const activeWhenCarried = ref(false);
   const magicBonus = ref(0);
   const rarity = ref<ItemRarity>('none');
   const activeEffects = ref<ActiveEffect[]>([]);
+  const itemUses = useItemUsesForm();
+  const consumable = ref(false);
+
+  // Тип боеприпаса формой не правится: он нужен лишь автоподбору стрел из
+  // компендиума и сохраняется как пришёл
+  const ammunitionType = ref<AmmunitionType | undefined>(undefined);
 
   /**
    * Помеха скрытности — вычисляемое на основе selectedEquipmentProperties
@@ -124,14 +150,6 @@ export function useEquipmentForm(
     systemDataStore.armorBaseTypes.map((bt) => ({
       label: bt.name,
       value: bt.key,
-    })),
-  );
-
-  /** Опции источников контента */
-  const sourceOptions = computed(() =>
-    systemDataStore.sources.map((src) => ({
-      label: `${src.name} (${src.abbreviation})`,
-      value: src.key,
     })),
   );
 
@@ -241,7 +259,8 @@ export function useEquipmentForm(
 
         costValue.value = parsed.value;
         costCurrency.value = parsed.currency;
-        sourceKey.value = armor.sourceKey ?? 'hb';
+        sourceKey.value = armor.sourceKey ?? FALLBACK_SOURCE_KEY;
+        source.value = armor.source;
         isSRD.value = armor.isSRD ?? false;
 
         // Синхронизируем свойства в selectedEquipmentProperties
@@ -267,33 +286,55 @@ export function useEquipmentForm(
 
         magicAttunement.value = armor.magicAttunement ?? 'none';
         isAttuned.value = armor.isAttuned ?? false;
+        activeWhenCarried.value = armor.activeWhenCarried ?? false;
         magicBonus.value = armor.magicBonus ?? 0;
         rarity.value = armor.rarity ?? 'none';
 
         activeEffects.value = [...(armor.activeEffects || [])].filter(
           isDnDEffect,
         );
+
+        itemUses.loadItemUses(armor.uses);
+        consumable.value = armor.consumable ?? false;
+        ammunitionType.value = armor.ammunitionType;
       } else {
         // Дефолты для создания
         name.value = '';
         nameEn.value = '';
         description.value = '';
         baseType.value = '';
-        equipmentCategory.value = 'light';
-        baseArmorAC.value = 11;
+
+        const createCategory = getCreateCategory() ?? DEFAULT_CREATE_CATEGORY;
+
+        equipmentCategory.value = createCategory;
+
+        // КД по умолчанию есть только у настоящей брони: у прочей экипировки
+        // поле скрыто, и 11 ушло бы в сохранённую запись незамеченным.
+        baseArmorAC.value = ARMOR_KEYS.has(createCategory) ? 11 : 0;
         maxDexBonus.value = null;
         strengthRequirement.value = 0;
         weight.value = 0;
         costValue.value = 0;
         costCurrency.value = DEFAULT_CURRENCY;
-        sourceKey.value = 'hb';
+        sourceKey.value = FALLBACK_SOURCE_KEY;
+        source.value = undefined;
         isSRD.value = false;
-        selectedEquipmentProperties.value = [];
+
+        // Свойство «магическое» — единственное, что форма проставляет сама:
+        // им пункт меню «Магический предмет» и отличается от «Снаряжения».
+        selectedEquipmentProperties.value = getCreateMagical()
+          ? ['magical']
+          : [];
+
         magicAttunement.value = 'none';
         isAttuned.value = false;
+        activeWhenCarried.value = false;
         magicBonus.value = 0;
         rarity.value = 'none';
         activeEffects.value = [];
+        itemUses.resetItemUses();
+        consumable.value = false;
+        ammunitionType.value = undefined;
       }
     },
     { immediate: true },
@@ -303,7 +344,7 @@ export function useEquipmentForm(
    * Собирает объект GameItem из текущих полей формы
    * @returns объект GameItem для отправки на сервер
    */
-  function buildArmor(): GameItem {
+  function buildArmor(): DnDGameItem {
     const armor = getArmor();
 
     return {
@@ -312,7 +353,8 @@ export function useEquipmentForm(
       nameEn: nameEn.value.trim() || undefined,
       description: description.value,
       type: 'equipment',
-      quantity: 1,
+      // Стопка зелий и стрел не должна сбрасываться правкой записи
+      quantity: armor?.quantity ?? 1,
       weight: weight.value,
       cost:
         costValue.value > 0
@@ -328,6 +370,7 @@ export function useEquipmentForm(
       strengthRequirement:
         strengthRequirement.value > 0 ? strengthRequirement.value : undefined,
       sourceKey: sourceKey.value || undefined,
+      source: source.value,
       isSRD: isSRD.value || undefined,
       isReadOnly: false,
       isAdamantine: isAdamantine.value || undefined,
@@ -338,8 +381,13 @@ export function useEquipmentForm(
           ? magicAttunement.value
           : undefined,
       isAttuned: isMagical.value && isAttuned.value ? true : undefined,
+      activeWhenCarried:
+        isMagical.value && activeWhenCarried.value ? true : undefined,
       magicBonus:
         isMagical.value && magicBonus.value > 0 ? magicBonus.value : undefined,
+      uses: itemUses.buildItemUses(),
+      consumable: consumable.value || undefined,
+      ammunitionType: ammunitionType.value,
       activeEffects:
         activeEffects.value.length > 0 ? activeEffects.value : undefined,
     };
@@ -360,22 +408,25 @@ export function useEquipmentForm(
     costValue,
     costCurrency,
     sourceKey,
+    source,
     isSRD,
     isAdamantine,
     isMagical,
     isFocus,
     magicAttunement,
     isAttuned,
+    activeWhenCarried,
     magicBonus,
     rarity,
     activeEffects,
+    consumable,
+    ...itemUses,
 
     // Computed
     isShield,
     isActualArmor,
     categoryOptions,
     baseTypeOptions,
-    sourceOptions,
     equipmentPropertyOptions,
     selectedEquipmentProperties,
 

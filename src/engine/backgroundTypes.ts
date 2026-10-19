@@ -1,48 +1,23 @@
 /**
- * Типы данных предысторий D&D 5e (PHB 2014)
+ * Типы данных предысторий D&D 5e (PHB 2024)
  *
  * Определяет структуру данных предыстории в компендиуме (BackgroundDefinition)
  * и запись на акторе (ActorBackgroundEntry).
- *
- * Отличие от редакции 2024: предыстория НЕ повышает характеристики (это делает
- * вид) и не выдаёт черту, зато несёт собственную особенность и таблицы
- * характера — черты, идеалы, привязанности и слабости.
  */
 
-import type { AbilityType, SkillType } from '@vtt/shared';
+import type { AbilityType, SkillType, SourceDefinition } from '@vtt/shared';
+
 import type { ActiveEffect } from './activeEffectTypes.js';
 import type { FeatData } from './featTypes.js';
+import type { StartingEquipmentOption } from './startingEquipment.js';
 
 /** Ключ предыстории (string для поддержки пользовательских предысторий) */
 export type BackgroundKey = string;
 
-/**
- * Особенность предыстории — сюжетная способность без числовой механики
- * («Приют верующего» у Прислужника). В редакции 2024 особенности у предысторий
- * нет вовсе, здесь она обязательна.
- */
-export interface BackgroundFeature {
-  /** Название особенности */
-  name: string;
-  /** Описание (может содержать Markdown) */
-  description: string;
-}
-
-/**
- * Таблицы характера предыстории: игрок бросает кубик или выбирает строку.
- *
- * Механики за ними нет — это опора для отыгрыша, поэтому все списки
- * необязательны и хранятся как есть, без нумерации: номер строки — её индекс.
- */
-export interface BackgroundPersonality {
-  /** Черты характера (в PHB — таблица d8) */
-  traits?: string[];
-  /** Идеалы (d6) */
-  ideals?: string[];
-  /** Привязанности (d6) */
-  bonds?: string[];
-  /** Слабости (d6) */
-  flaws?: string[];
+/** Грант повышения характеристик предыстории */
+export interface BackgroundAbilityGrant {
+  /** 3 характеристики, между которыми распределяется +2/+1 или +1/+1/+1 */
+  abilities: AbilityType[];
 }
 
 /** Грант навыков предыстории */
@@ -59,10 +34,38 @@ export interface BackgroundToolGrant {
   choices?: { count: number; from: string[] };
 }
 
-/** Вариант стартового снаряжения */
-export interface BackgroundEquipmentOption {
-  /** Описание варианта снаряжения (текст) */
-  description: string;
+/** Грант черты предыстории */
+export interface BackgroundFeatGrant {
+  /** ID черты в feats.json (фиксированная черта, если нет выбора) */
+  featId?: string;
+  /** Список ID черт для выбора (если предыстория допускает альтернативы) */
+  featChoices?: string[];
+  /** Русское название черты (для отображения, когда featId единственный до выбора) */
+  featName: string;
+  /** Англ. название (для отображения) */
+  featNameEn?: string;
+  /**
+   * Класс, который предыстория называет за игрока: «Мудрец» даёт «Посвящённого в магию
+   * (Волшебник)» — список заклинаний задан самой предысторией, и спрашивать его в мастере
+   * незачем. Канонический ключ класса (`wizard`) или его название; пусто — класс называет
+   * игрок.
+   */
+  featClassKey?: string;
+  /**
+   * То же уточнение, как его называет TTG Club (`Background.featSuffix`) — названием
+   * класса («Волшебник»). Отдельным полем, потому что записи компендиума пишет выгрузка,
+   * а не наша форма: свести их в одно поле значило бы править чужую запись при чтении.
+   */
+  featSuffix?: string;
+}
+
+/**
+ * Вариант стартового снаряжения предыстории.
+ *
+ * Позиции ({@link StartingEquipmentOption.items}) необязательны: без них
+ * вариант только показывается строкой, как было до их появления.
+ */
+export interface BackgroundEquipmentOption extends StartingEquipmentOption {
   /** Стоимость альтернативы в зм (вариант Б) */
   goldAlternative?: number;
 }
@@ -79,19 +82,26 @@ export interface BackgroundDefinition {
   nameEn: string;
   /** Описание (может содержать Markdown) */
   description: string;
-  /** Ключ источника-книги из sources.json (напр. 'phb', 'dmg') */
+  /** Ключ источника-книги — аббревиатура в нижнем регистре (напр. 'phb', 'dmg') */
   sourceKey?: string;
+  /** Название источника, если его нет ни во встроенном справочнике, ни в паке */
+  source?: SourceDefinition;
   /** Принадлежит ли к SRD */
   isSRD?: boolean;
+  /**
+   * `false` — запись вне SRD скачана без подписки TTG, и источник вырезал её
+   * эффекты (остальное на месте). У полных записей поля нет.
+   */
+  automation?: boolean;
 
+  /** Повышение характеристик */
+  abilityGrant: BackgroundAbilityGrant;
   /** Навыки */
   skillGrant: BackgroundSkillGrant;
   /** Владение инструментами */
   toolGrant: BackgroundToolGrant;
-  /** Особенность предыстории */
-  feature: BackgroundFeature;
-  /** Таблицы характера (черты, идеалы, привязанности, слабости) */
-  personality?: BackgroundPersonality;
+  /** Черта */
+  featGrant: BackgroundFeatGrant;
   /** Варианты стартового снаряжения */
   equipmentOptions: BackgroundEquipmentOption[];
 
@@ -114,12 +124,20 @@ export interface BackgroundDefinition {
 export interface ActorBackgroundEntry {
   /** Ключ предыстории */
   backgroundKey: string;
+  /** Компендиум, из которого взята предыстория; см. {@link ActorClassEntry.packId} */
+  packId?: string;
   /** Русское название */
   backgroundName: string;
+  /** Выбранное распределение характеристик: { strength: 2, wisdom: 1 } */
+  abilityChoices: Partial<Record<AbilityType, number>>;
   /** Навыки, полученные от предыстории */
   skillChoices: SkillType[];
   /** Выбранные инструменты (если был выбор) */
   toolChoices: string[];
+  /** ID присвоенной черты на акторе (для удаления при замене) */
+  grantedFeatId?: string;
+  /** Название присвоенной черты (для отображения на листе) */
+  grantedFeatName?: string;
 
   // --- Применённые расширенные дары (`featData`) — для ТОЧНОГО отката ---
   // Хранятся именно применённые значения, а не пере-выводятся из определения
@@ -137,8 +155,8 @@ export interface ActorBackgroundEntry {
   /** Языки от `featData`. */
   languages?: string[];
   /**
-   * Синтетическое имя-источник заклинаний, выданных `featData` предыстории —
-   * для снятия ровно её заклинаний на откате.
+   * Синтетическое имя-источник заклинаний, выданных СОБСТВЕННЫМ `featData`
+   * предыстории (отличное от имени черты-происхождения) — для снятия на откате.
    */
   ownGrantedSpellSource?: string;
   /** Тёмное зрение, поднятое предысторией (футы) — справочно (не понижается). */

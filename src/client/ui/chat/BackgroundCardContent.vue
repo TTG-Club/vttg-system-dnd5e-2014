@@ -6,25 +6,36 @@
   import CardErrorFallback from '@/shared_ui/components/CardErrorFallback.vue';
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
 
+  import { isNamedCardEntry, parseCardPayload } from './cardPayload';
+  import { BACKGROUND_CARD_LABELS } from './consts';
+
   const props = defineProps<{
     /** Сериализованные данные (JSON-строка) */
     payload: string;
   }>();
 
+  /**
+   * Проверяет, что нагрузка — предыстория в объёме, который показывает карточка.
+   *
+   * @param value - разобранная нагрузка
+   * @returns `true`, если запись пригодна для показа
+   */
+  function isBackgroundCardEntry(
+    value: unknown,
+  ): value is BackgroundDefinition {
+    return isNamedCardEntry(value);
+  }
+
   /** Десериализованная предыстория */
-  const item = computed<BackgroundDefinition | null>(() => {
-    try {
-      return JSON.parse(props.payload) as BackgroundDefinition;
-    } catch {
-      return null;
-    }
-  });
+  const item = computed<BackgroundDefinition | null>(() =>
+    parseCardPayload(props.payload, isBackgroundCardEntry),
+  );
 </script>
 
 <template>
   <div
     v-if="item"
-    class="overflow-hidden rounded-lg border border-teal-500/30"
+    class="overflow-hidden rounded-lg border border-source/30"
   >
     <!-- Заголовок -->
     <div class="flex items-center gap-2 bg-elevated/60 px-3 py-2">
@@ -37,11 +48,13 @@
 
     <!-- Тело карточки -->
     <div
-      class="flex flex-col gap-2 border-t border-teal-500/30 bg-default/40 px-3 py-2"
+      class="flex flex-col gap-2 border-t border-source/30 bg-default/40 px-3 py-2"
     >
       <!-- Мета-строка -->
       <div class="flex items-center gap-2 text-xs">
-        <span class="font-medium text-teal-400">Предыстория </span>
+        <span class="font-medium text-source">{{
+          BACKGROUND_CARD_LABELS.kind
+        }}</span>
       </div>
 
       <!-- Описание -->
@@ -57,6 +70,6 @@
   <!-- Fallback при ошибке десериализации -->
   <CardErrorFallback
     v-else
-    message="Ошибка отображения карточки предыстории"
+    :message="BACKGROUND_CARD_LABELS.error"
   />
 </template>

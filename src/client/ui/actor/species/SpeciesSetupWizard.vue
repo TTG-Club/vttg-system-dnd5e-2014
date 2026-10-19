@@ -1,24 +1,35 @@
 <script setup lang="ts">
-  import type { AbilityType, TypedWebSocketClient } from '@vtt/shared';
-  import type { Actor, SpeciesDefinition } from '@vtt/shared/system/dnd.js';
+  import type { TypedWebSocketClient } from '@vtt/shared';
+  import type { DnDActor, SpeciesDefinition } from '@vtt/shared/system/dnd.js';
 
-  import { computed, toRef, watch } from 'vue';
+  import { computed, ref, toRef, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
 
-  import { useSpeciesGrantedSpellsResolver } from '../../../composables/useSpeciesGrantedSpellsResolver';
+  import { useFeatChoiceFeats } from '../../../composables/useFeatChoiceFeats';
+  import { useFeatChoiceSpells } from '../../../composables/useFeatChoiceSpells';
+  import { useGrantedSpellsResolver } from '../../../composables/useGrantedSpellsResolver';
+  import { MODAL_BUTTON_LABELS, SPECIES_WIZARD_LABELS } from '../constants';
   import { useSpeciesWizard } from './useSpeciesWizard';
-  import WizardStepAbilities from './WizardStepAbilities.vue';
   import WizardStepFeatures from './WizardStepFeatures.vue';
   import WizardStepGrants from './WizardStepGrants.vue';
   import WizardStepOverview from './WizardStepOverview.vue';
+  import WizardStepSubspecies from './WizardStepSubspecies.vue';
 
   const props = defineProps<{
     open: boolean;
-    actor: Actor;
+    actor: DnDActor;
     speciesDefinition: SpeciesDefinition | null;
+    /** Пак записи вида: ложится на запись актора */
+    packId?: string;
+    /** Подвид, выбранный до мастера: шаг подвида открывается уже с ним */
+    subspeciesKey?: string | null;
     previousSpeciesDefinition?: SpeciesDefinition | null;
+    /** Прежний подвид-запись — для точного отката при смене вида */
+    previousSubspeciesDefinition?: SpeciesDefinition | null;
+    /** Все записи видов (мир + компендиум) — из них собираются подвиды */
+    speciesRecords: SpeciesDefinition[];
     /** Сокет для загрузки granted-заклинаний из компендиума */
     socket: TypedWebSocketClient | null;
   }>();
@@ -26,8 +37,8 @@
   const emit = defineEmits<{
     'update:open': [value: boolean];
     'apply': [
-      systemUpdates: Partial<Actor['system']>,
-      rootUpdates: Partial<Actor>,
+      systemUpdates: Partial<DnDActor['system']>,
+      rootUpdates: Partial<DnDActor>,
     ];
   }>();
 
@@ -38,6 +49,34 @@
 
   const actorRef = computed(() => props.actor);
   const speciesDefRef = computed(() => props.speciesDefinition);
+  const speciesRecordsRef = computed(() => props.speciesRecords);
+
+  /**
+   * Черты компендиума — пул выбора черты в дарах вида («Универсальность»
+   * человека просит черту происхождения) и записи черт, выдаваемых без выбора.
+   * Мастеру они нужны дважды: пикеру — показать список, `buildUpdates` — взять
+   * дары выбранной черты, поэтому каталог создаётся до мастера и отдаётся ему.
+   */
+  const needsFeats = ref(false);
+
+  /**
+   * Ключи черт, которые дары вида выдают без выбора. Заполняются после создания
+   * мастера: он строит дары из каталога, который грузится здесь.
+   */
+  const grantedFeatIds = ref<string[]>([]);
+
+  const { feats: featChoiceFeats } = useFeatChoiceFeats(
+    toRef(props, 'socket'),
+    // Открытое окно — часть надобности: закрытый мастер сбрасывает ответы о
+    // компендиуме, и следующий вид спросит заново
+    computed(() => needsFeats.value && props.open),
+    toRef(props, 'packId'),
+    {
+      actorId: computed(() => props.actor.id),
+      featIds: grantedFeatIds,
+      grantedBy: computed(() => props.speciesDefinition?.name ?? ''),
+    },
+  );
 
   const {
     state,
@@ -49,25 +88,73 @@
     canProceed,
     isFinalStep,
     grantedSpellSources,
-    abilityIncreases,
+    subspeciesOptions,
+    featDataSources,
+    featPickChoices,
+    grantedFeatQuestions,
+    needsCompendiumFeats,
+    proficiencyBonus,
     buildUpdates,
-  } = useSpeciesWizard(actorRef, speciesDefRef);
+  } = useSpeciesWizard(
+    actorRef,
+    speciesDefRef,
+    speciesRecordsRef,
+    featChoiceFeats,
+    computed(() => props.packId),
+    computed(() => props.subspeciesKey ?? null),
+  );
+
+  watch(
+    featDataSources,
+    (sources) => {
+      grantedFeatIds.value = sources.flatMap((source) =>
+        (source.featData.grantedFeats ?? []).map(
+          (grantedRef) => grantedRef.featId,
+        ),
+      );
+    },
+    { immediate: true },
+  );
+
+  // Надобность каталога знает мастер, а грузит его composable выше: связываем
+  // их через флаг — иначе получилась бы ссылка на ещё не созданный мастер
+  watch(needsCompendiumFeats, (value) => (needsFeats.value = value), {
+    immediate: true,
+  });
 
   /**
-   * Записывает выбор характеристик обратно в состояние мастера.
-   *
-   * @param selections - выбор по каждой группе (индекс группы → характеристики)
+   * Выдача особенностей вида: своим паком заклинания без названного пака
+   * считается пак вида.
    */
-  function handleAbilitySelections(
-    selections: Record<number, AbilityType[]>,
-  ): void {
-    state.value = { ...state.value, abilitySelections: selections };
-  }
+  const speciesSpellSources = computed(() =>
+    grantedSpellSources.value.map((source) => ({
+      ...source,
+      packId: source.packId ?? props.packId,
+    })),
+  );
 
   /** Granted-заклинания особенностей вида с данными из компендиума (по пакам) */
-  const { resolvedGrantedSpells } = useSpeciesGrantedSpellsResolver(
+  const { resolvedGrantedSpells, finalizeForActor } = useGrantedSpellsResolver(
     toRef(props, 'socket'),
-    grantedSpellSources,
+    speciesSpellSources,
+  );
+
+  /**
+   * Все вопросы одним списком — только для загрузки каталога заклинаний: пул
+   * выбора и проверка готовности обязаны смотреть на один и тот же список.
+   * Вопросы выбранной черты сюда тоже входят: «Посвящённый в магию» черта
+   * происхождения, и заговоры ей выбирают прямо здесь.
+   */
+  const allPreparedFeatChoices = computed(() => [
+    ...featDataSources.value.flatMap((source) => source.preparedChoices),
+    ...featPickChoices.value.flatMap((pick) => pick.ownChoices),
+    ...grantedFeatQuestions.value.flatMap((granted) => granted.ownChoices),
+  ]);
+
+  /** Заклинания каталога для выборов даров (заговор эльфа и подобные) */
+  const { spells: featChoiceSpells } = useFeatChoiceSpells(
+    toRef(props, 'socket'),
+    allPreparedFeatChoices,
   );
 
   watch(
@@ -89,7 +176,7 @@
     currentStepIndex.value = index;
   }
 
-  function handleApply() {
+  async function handleApply(): Promise<void> {
     if (!canProceed.value) {
       return;
     }
@@ -101,9 +188,13 @@
       return;
     }
 
+    // Заклинания из нескольких компендиумов игрок выбирает здесь же, до записи
+    const grantedSpells = await finalizeForActor(props.actor.id);
+
     const { systemUpdates, rootUpdates } = buildUpdates(
       props.previousSpeciesDefinition,
-      resolvedGrantedSpells.value,
+      grantedSpells,
+      props.previousSubspeciesDefinition,
     );
 
     emit('apply', systemUpdates, rootUpdates);
@@ -120,7 +211,7 @@
     :min-width="800"
     :initial-width="800"
     :min-height="400"
-    title="Настройка вида"
+    :title="SPECIES_WIZARD_LABELS.title"
     :z-index="Z_INDEX.MODAL_ELEVATED * 2"
   >
     <template #body>
@@ -135,7 +226,9 @@
               {{ speciesDefinition.name }}
             </h3>
 
-            <p class="text-sm text-dimmed">Создание персонажа</p>
+            <p class="text-sm text-dimmed">
+              {{ SPECIES_WIZARD_LABELS.subtitle }}
+            </p>
           </div>
         </div>
 
@@ -153,9 +246,7 @@
               v-if="stepIdx > 0"
               class="h-px flex-1"
               :class="
-                stepIdx <= currentStepIndex
-                  ? 'bg-primary-500/60'
-                  : 'bg-accented/50'
+                stepIdx <= currentStepIndex ? 'bg-primary/60' : 'bg-accented/50'
               "
             />
 
@@ -164,7 +255,7 @@
               class="flex items-center gap-1.5 rounded-full px-2 py-1 text-xs transition-colors"
               :class="[
                 stepIdx === currentStepIndex
-                  ? 'bg-primary-500/20 text-primary-400 ring-1 ring-primary-500/40'
+                  ? 'bg-primary/20 text-primary ring-1 ring-primary/40'
                   : stepIdx < currentStepIndex
                     ? 'bg-success/10 text-healing'
                     : 'text-dimmed',
@@ -181,11 +272,17 @@
         </div>
 
         <!-- Контент текущего шага -->
-        <div class="min-h-[200px]">
+        <div class="min-h-50">
           <WizardStepOverview
             v-if="activeStepKey === 'overview'"
             v-model:state="state"
             :species-definition="speciesDefinition"
+          />
+
+          <WizardStepSubspecies
+            v-if="activeStepKey === 'subspecies'"
+            v-model:state="state"
+            :subspecies-options="subspeciesOptions"
           />
 
           <WizardStepGrants
@@ -199,13 +296,13 @@
             v-model:state="state"
             :species-definition="speciesDefinition"
             :granted-spells="resolvedGrantedSpells"
-          />
-
-          <WizardStepAbilities
-            v-if="activeStepKey === 'abilities'"
-            :increases="abilityIncreases"
-            :selections="state.abilitySelections"
-            @update:selections="handleAbilitySelections"
+            :actor="actor"
+            :proficiency-bonus="proficiencyBonus"
+            :feat-data-sources="featDataSources"
+            :feat-choice-spells="featChoiceSpells"
+            :feat-picks="featPickChoices"
+            :granted-feat-questions="grantedFeatQuestions"
+            :feat-choice-feats="featChoiceFeats"
           />
         </div>
       </div>
@@ -230,7 +327,7 @@
           :class="{ invisible: currentStepIndex === 0 }"
           @click.left.exact.prevent="prevStep"
         >
-          Назад
+          {{ MODAL_BUTTON_LABELS.back }}
         </UButton>
 
         <div class="flex gap-2">
@@ -239,7 +336,7 @@
             color="neutral"
             @click.left.exact.prevent="handleCancel"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -248,7 +345,7 @@
             :disabled="!canProceed"
             @click.left.exact.prevent="nextStep"
           >
-            Далее
+            {{ MODAL_BUTTON_LABELS.next }}
             <template #trailing>
               <UIcon name="tabler:arrow-right" />
             </template>
@@ -260,7 +357,7 @@
             :disabled="!canProceed"
             @click.left.exact.prevent="handleApply"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

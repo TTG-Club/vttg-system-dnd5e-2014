@@ -1,0 +1,3246 @@
+/**
+ * Диспетчер срабатываний эффекта: один исполнитель вместо отдельного на каждое
+ * поле.
+ *
+ * На границе хода (`processTurnEffects`) и при входе или выходе из зоны и ауры
+ * (`applyEntryEffect`) эффекты читаются как срабатывания
+ * (`collectEffectTriggers`), и действия выполняются одними функциями: спасбросок,
+ * урон и лечение по гейтам, снятие эффекта, длящаяся копия. Порядок и итоги те
+ * же, что у прежних интерпретаторов полей, — их фиксируют
+ * `tests/effectTriggerBaseline.test.mjs` и `tests/effectSaves.test.mjs`.
+ */
+
+import type { EffectDuration } from '@vtt/shared';
+
+import type { ActiveEffect, EffectSaveTiming } from './activeEffectTypes.js';
+import type { CreatureCategory } from './creatureTypes.js';
+import type {
+  DnDEquipmentCategory,
+  DnDGameItem,
+  DnDSceneEntity,
+} from './dndEntities.js';
+import type { PreparedTriggerSource } from './effectPay.js';
+import type { CarriedEffectSourceKind } from './effectPipeline.js';
+import type { UnresolvedSaveDc } from './effectSaveDcProblem.js';
+import type {
+  EffectTempHpMode,
+  EffectTrigger,
+  EffectTriggerAction,
+  EffectTriggerApplyTagAction,
+  EffectTriggerAttackRole,
+  EffectTriggerDispelAction,
+  EffectTriggerEvent,
+  EffectTriggerKillAction,
+  EffectTriggerMoveAction,
+  EffectTriggerMoveAreaAction,
+  EffectTriggerNotifyAction,
+  EffectTriggerRestoreAction,
+  EffectTriggerReviveAction,
+  EffectTriggerSave,
+  EffectTriggerSaveMode,
+  EffectTriggerTempHpAction,
+} from './effectTriggerTypes.js';
+import type { SaveDamageDefense } from './saveDamage.js';
+import type { SceneSight } from './sceneSight.js';
+import type { TriggerEventData } from './triggerConditions.js';
+import type {
+  EffectSaveSpec,
+  EntryEffectOptions,
+  EntryEffectResult,
+  SkippedFormulaReporter,
+  TurnDamageOutcome,
+  TurnEffectsOptions,
+  TurnEffectsResult,
+  TurnHealingOutcome,
+  TurnSaveOutcome,
+} from './turnEffects.js';
+
+import { generateId } from '@vtt/shared';
+
+import { resolveActionCostBlock } from './actionRestrictions.js';
+import {
+  ACTIVE_EFFECT_ID_PREFIX,
+  isEffectDormant,
+  listLiveEffects,
+  removeOrSwitchOffEffects,
+} from './activeEffectTypes.js';
+import { resolveAreaShift } from './areaShift.js';
+import { combineRollMode } from './attackUtils.js';
+import { DEATH_CONDITION_KEY } from './conditionKeys.js';
+import {
+  buildConditionActiveEffect,
+  clampExhaustionLevel,
+  getEntityExhaustionLevel,
+} from './conditionTemplates.js';
+import {
+  resolveEntityCreatureType,
+  resolveEntityExtraCreatureTypes,
+} from './creatureTypeGate.js';
+import {
+  findFirstDiceTerm,
+  formatDiceFormula,
+  rollDamageFormula,
+} from './diceFormula.js';
+import {
+  hasLastingEffectPayload,
+  isImmuneToCondition,
+  mergeAppliedEffects,
+} from './effectAutomation.js';
+import { advanceEffectChangeSteps } from './effectChangeSteps.js';
+import { bindLivePaid } from './effectPaidTokens.js';
+import {
+  buildTriggerPayContext,
+  payTriggerPrice,
+  planEffectPay,
+  settleUnaskedTriggerPay,
+} from './effectPay.js';
+import {
+  collectActiveEffects,
+  collectRollConditionFlags,
+  getEntityConditionImmunities,
+  listCarriedEffectEntries,
+  listTraitEffects,
+  resolveActorStats,
+} from './effectPipeline.js';
+import {
+  bindTriggerSourceSaveDcs,
+  resolveSaveDc,
+} from './effectSaveDcOwner.js';
+import {
+  findUnresolvedSaveDc,
+  formatUnresolvedSaveDcNote,
+} from './effectSaveDcProblem.js';
+import { advanceEffectStage, formatEffectStageLabel } from './effectStages.js';
+import {
+  isClientAttackRollTrigger,
+  isLegacyTrigger,
+  listEffectEventTriggers,
+  listEffectListTriggers,
+  readEffectLandingTrigger,
+  resolveGateScale,
+  resolveTriggerActionGate,
+  turnTriggerEventOf,
+} from './effectTriggers.js';
+import {
+  CHOICE_TRIGGER_RECIPIENT,
+  DEFAULT_CAST_OWNER,
+  DEFAULT_NOTIFY_TARGET,
+  DEFAULT_TEMP_HP_MODE,
+  DEFAULT_TRIGGER_ATTACK_ROLE,
+  DEFAULT_TRIGGER_REST_TYPE,
+  MAX_HP_REDUCTION_NEVER_ENDS,
+  MIN_REVIVE_HP,
+  PRESENCE_TRIGGER_EVENTS,
+  triggerAsksPermission,
+  triggerChanceHolds,
+} from './effectTriggerTypes.js';
+import {
+  buildTriggerUsageScope,
+  canTakeTriggerUse,
+  hasEffectCharge,
+  takeEffectCharge,
+  takeTriggerUse,
+} from './effectTriggerUsage.js';
+import {
+  findSceneToken,
+  resolveForcedMoveOptions,
+  resolveForcedMoveOrigin,
+  resolveForcedMovePosition,
+} from './forcedMovement.js';
+import {
+  evaluateFormula,
+  substituteFormulaVariables,
+} from './formulaParser.js';
+import { withTempHpGainBonus } from './healingLimits.js';
+import {
+  resolveEntityCurrentHp,
+  resolveEntityMaxHp,
+  resolveEntityTempHp,
+  writeEntityHitPoints,
+} from './hitPoints.js';
+import { bindOwnEffectFormulas } from './ownEffectFormulas.js';
+import { buildResolvedFormulaContext } from './resolvedFormulaContext.js';
+import { pickSaveAbility } from './saveAbilityChoice.js';
+import { MIN_SPELL_SLOT_LEVEL } from './spellSlotTable.js';
+import {
+  countEffectTag,
+  isTriggerConditionMet,
+  withCombatRound,
+  withSceneSight,
+} from './triggerConditions.js';
+import { TRIGGER_ASK_CHAT_NOTES } from './triggerPrompt.js';
+import {
+  applyDamageToEntity,
+  applyTurnHealing,
+  buildApplySaveSpec,
+  buildEffectSavingThrowContext,
+  formatSkippedFormulaNote,
+  resolveEffectMagicCircumstances,
+  restoreEntityHitPoints,
+  rollEffectDamage,
+  rollEffectHealing,
+  rollEffectSaveOutcome,
+  rollEffectSaveWithContext,
+  stampAppliedEffect,
+  withInitializedDuration,
+} from './turnEffects.js';
+
+/** Срабатывание на субъекте вместе с эффектом, откуда оно пришло */
+export interface EffectTriggerSource {
+  effect: ActiveEffect;
+  trigger: EffectTrigger;
+  /** Аура чужого токена: самого эффекта на субъекте нет */
+  ambient: boolean;
+  /**
+   * Эффект лежит на субъекте (`activeEffects`) — его можно снять. У черты
+   * существа, ауры и эффекта зоны при входе экземпляра нет.
+   */
+  instance: boolean;
+  /** Источник эффекта для счётчика лимита */
+  scope: string;
+}
+
+/**
+ * Срабатывание хода, чей спасбросок спросят у игрока. Этап: урон ждёт ответа
+ * (`damage`) либо снятие и наложение (`effects`).
+ */
+export interface DeferredTurnTrigger extends EffectTriggerSource {
+  stage: 'damage' | 'effects' | 'choice' | 'ask';
+  /**
+   * Данные события границы хода: спасбросок, который спросят у игрока, считает
+   * по ним режим «если…» так же, как бросок сервера
+   */
+  eventData: TriggerEventData;
+}
+
+/**
+ * Пропускает ли событие срабатывание: условие выполняется, и лимит не
+ * исчерпан. Условие проверяется первым — невыполненное условие не тратит
+ * «раз в ход».
+ *
+ * Срабатывание, которое сперва спросит человека (`hold`), лимит и заряд только
+ * проверяет: их тратит согласие ({@link takeTriggerAdmission}), а не вопрос —
+ * иначе отказ съедал бы «раз в ход» и реакцию раунда.
+ *
+ * Срабатывание со спасброском, чью Сл не из чего посчитать, не выполняется:
+ * бросок против нуля был бы успехом у любого. Об отказе пишется строка в
+ * сводку — молча такое срабатывание не пропадает; лимит и заряд оно не тратит.
+ *
+ * @param entity - субъект срабатывания
+ * @param source - срабатывание с источником
+ * @param eventData - данные события для условия
+ * @param inCombat - идёт ли у субъекта бой (лимит хода и раунда)
+ * @param hold - только проверить лимит и заряд, не тратя их
+ * @param collectNote - куда писать, почему срабатывание пропущено; нет —
+ *   сообщать некому
+ * @returns `true`, если срабатывание выполняется
+ */
+export function admitTrigger(
+  entity: DnDSceneEntity,
+  source: EffectTriggerSource,
+  eventData: TriggerEventData = {},
+  inCombat?: boolean,
+  hold = false,
+  collectNote?: (note: string) => void,
+): boolean {
+  // Порядок проверок — от самой дешёвой отмены к самой дорогой: невыполненное
+  // условие не должно тратить ни «раз в ход», ни заряд эффекта
+  const passes =
+    isTriggerConditionMet(entity, source.trigger, {
+      ...eventData,
+      sourceId: source.effect.sourceActorId,
+    })
+    && triggerChanceHolds(source.trigger)
+    // Реакцию и бонусное действие под запретом не тратят: срабатывание не
+    // выполняется и лимит не расходует
+    && resolveActionCostBlock(entity, source.trigger.cost) === null;
+
+  if (!passes) {
+    return false;
+  }
+
+  const unresolvedDc = findUnresolvedTriggerSaveDc(entity, source, eventData);
+
+  if (unresolvedDc) {
+    collectNote?.(formatUnresolvedSaveDcNote(source.effect.name, unresolvedDc));
+
+    return false;
+  }
+
+  if (hold) {
+    return (
+      canTakeTriggerUse(entity, source.scope, source.trigger, inCombat)
+      && (!source.instance || hasEffectCharge(entity, source.effect.id))
+    );
+  }
+
+  return takeTriggerAdmission(entity, source, inCombat);
+}
+
+/**
+ * Сл спасброска срабатывания, которую не из чего посчитать.
+ *
+ * Считается так же, как её посчитает бросок: формула — по субъекту, на
+ * котором эффект (`bindTriggerSourceSaveDcs`), остаток — по данным события.
+ * Спасбросок с готовым исходом («автоматический провал, если…») Сл не читает.
+ *
+ * @param entity - субъект срабатывания
+ * @param source - срабатывание с источником
+ * @param eventData - данные события
+ * @returns что не посчиталось либо `null`
+ */
+function findUnresolvedTriggerSaveDc(
+  entity: DnDSceneEntity,
+  source: EffectTriggerSource,
+  eventData: TriggerEventData,
+): UnresolvedSaveDc | null {
+  if (
+    !source.trigger.save
+    || !triggerSaveNeedsRoll(source.trigger, entity, eventData)
+  ) {
+    return null;
+  }
+
+  const { save } = bindTriggerSourceSaveDcs(source, entity).trigger;
+
+  return save
+    ? findUnresolvedSaveDc(
+        save,
+        resolveTriggerSaveDc(save, { entity, eventData }),
+      )
+    : null;
+}
+
+/**
+ * Тратит лимит «не чаще N раз» и заряд эффекта — то, что срабатывание,
+ * спросившее человека, оставило до его согласия.
+ *
+ * @param entity - субъект срабатывания (меняется)
+ * @param source - срабатывание с источником
+ * @param inCombat - идёт ли у субъекта бой (лимит хода и раунда)
+ * @returns `true`, если лимит и заряд ещё были
+ */
+export function takeTriggerAdmission(
+  entity: DnDSceneEntity,
+  source: EffectTriggerSource,
+  inCombat?: boolean,
+): boolean {
+  return (
+    takeTriggerUse(entity, source.scope, source.trigger, inCombat)
+    && (!source.instance || takeEffectCharge(entity, source.effect.id))
+  );
+}
+
+/**
+ * Есть ли у срабатывания что-то кроме урона: снятие или наложение.
+ *
+ * @param trigger - срабатывание
+ * @returns `true`, если есть действие не урона
+ */
+export function triggerHasEffects(trigger: EffectTrigger): boolean {
+  return trigger.actions.some((action) => action.type !== 'damage');
+}
+
+/** Событие, чьи данные читает Сл срабатывания формулой */
+export interface TriggerSaveEvent {
+  /** Кто бросает: формула читает и его лист */
+  entity: DnDSceneEntity;
+  /** Данные события */
+  eventData: TriggerEventData;
+}
+
+/**
+ * Сл спасброска срабатывания: формулой, если она есть и посчиталась, иначе
+ * число.
+ *
+ * Формула считается по бросающему как по владельцу: срабатывание, которое
+ * достаётся другому, получает числа владельца раньше
+ * (`bindTriggerSourceSaveDcs`), и у него осталась разве что `@damage`.
+ *
+ * @param save - спасбросок срабатывания
+ * @param event - кто бросает и данные события
+ * @returns сложность
+ */
+export function resolveTriggerSaveDc(
+  save: EffectTriggerSave,
+  event?: TriggerSaveEvent,
+): number {
+  return resolveSaveDc(save, event?.entity, event?.eventData.damage?.amount);
+}
+
+/** Кость автоматического успеха спасброска — условная */
+const AUTO_SAVE_SUCCESS_ROLL = 20;
+
+/** Кость автоматического провала спасброска — условная */
+const AUTO_SAVE_FAILURE_ROLL = 1;
+
+/**
+ * Режим спасброска из пары «преимущество / помеха»: вместе они гасят друг
+ * друга.
+ *
+ * @param advantage - есть преимущество
+ * @param disadvantage - есть помеха
+ * @returns режим либо `undefined`, если бросок обычный
+ */
+function toSaveMode(
+  advantage: boolean,
+  disadvantage: boolean,
+): EffectTriggerSaveMode | undefined {
+  const mode = combineRollMode(advantage, disadvantage);
+
+  return mode === 'normal' ? undefined : mode;
+}
+
+/**
+ * Режим спасброска срабатывания: постоянный вместе с теми, что дают
+ * выполненные условия.
+ *
+ * Преимущество и помеха гасят друг друга — то же правило, что у бросающего,
+ * поэтому два правила с разными исходами дают обычный бросок.
+ *
+ * @param save - спасбросок срабатывания
+ * @param event - кто бросает и данные события
+ * @returns режим либо `undefined`, если бросок обычный
+ */
+function resolveTriggerSaveMode(
+  save: EffectTriggerSave,
+  event?: TriggerSaveEvent,
+): EffectTriggerSaveMode | undefined {
+  const modes = [
+    ...(save.mode ? [save.mode] : []),
+    ...(save.modeIf ?? [])
+      .filter(
+        (rule) =>
+          event !== undefined
+          && isTriggerConditionMet(
+            event.entity,
+            { condition: rule.condition },
+            event.eventData,
+          ),
+      )
+      .map((rule) => rule.mode),
+  ];
+
+  return toSaveMode(
+    modes.includes('advantage'),
+    modes.includes('disadvantage'),
+  );
+}
+
+/** Флаг «урон носителя — спасбросок концентрации цели с помехой» */
+export const CONCENTRATION_DISADVANTAGE_FLAG =
+  'damage.concentrationDisadvantage';
+
+/**
+ * Даёт ли нанёсший урон помеху на спасбросок концентрации: флаг на нём самом,
+ * безусловный либо с условием о цели («существо из вашего Гримуара»).
+ *
+ * @param attacker - кто нанёс урон
+ * @param victim - кто бросает спасбросок концентрации
+ * @returns `true`, если спасбросок идёт с помехой
+ */
+function imposesConcentrationDisadvantage(
+  attacker: DnDSceneEntity,
+  victim: DnDSceneEntity,
+): boolean {
+  if (
+    resolveActorStats(attacker).activeFlags.has(CONCENTRATION_DISADVANTAGE_FLAG)
+  ) {
+    return true;
+  }
+
+  return collectRollConditionFlags(collectActiveEffects(attacker), {
+    hasAdvantage: false,
+    hasDisadvantage: false,
+    target: {
+      currentHp: resolveEntityCurrentHp(victim),
+      maxHp: resolveEntityMaxHp(victim),
+      creatureType: resolveEntityCreatureType(victim),
+      extraCreatureTypes: resolveEntityExtraCreatureTypes(victim),
+      entityId: victim.id,
+    },
+  }).includes(CONCENTRATION_DISADVANTAGE_FLAG);
+}
+
+/**
+ * Автоматический исход спасброска срабатывания: провал главнее успеха —
+ * «автопровал» состояний и здесь считается первым.
+ *
+ * @param save - спасбросок срабатывания
+ * @param event - кто бросает и данные события
+ * @returns `true`/`false` — готовый исход; `null` — бросать по-настоящему
+ */
+export function resolveTriggerAutoSaveOutcome(
+  save: EffectTriggerSave,
+  event?: TriggerSaveEvent,
+): boolean | null {
+  if (!event) {
+    return null;
+  }
+
+  /**
+   * Выполнено ли условие автоматического исхода.
+   *
+   * @param condition - условие строкой словаря
+   * @returns `true`, если условие выполнено
+   */
+  const met = (condition: string | undefined): boolean =>
+    condition !== undefined
+    && isTriggerConditionMet(event.entity, { condition }, event.eventData);
+
+  if (met(save.autoFailIf)) {
+    return false;
+  }
+
+  return met(save.autoSuccessIf) ? true : null;
+}
+
+/**
+ * Что бросать для спасброска срабатывания. Спасбросок, от которого зависит
+ * только урон, — не против состояния: состояние им не накладывается и не
+ * снимается.
+ *
+ * @param effect - эффект
+ * @param trigger - его срабатывание
+ * @param event - кто бросает и данные события (Сл формулой)
+ * @returns спецификация либо `null`, если спасброска нет
+ */
+export function buildTriggerSaveSpec(
+  effect: ActiveEffect,
+  trigger: EffectTrigger,
+  event?: TriggerSaveEvent,
+): EffectSaveSpec | null {
+  if (!trigger.save) {
+    return null;
+  }
+
+  const ownMode = resolveTriggerSaveMode(trigger.save, event);
+
+  // «Наносите урон существу, поддерживающему концентрацию, — оно совершает
+  // спасбросок концентрации с помехой»: помеху даёт тот, кто нанёс урон
+  const mode =
+    effect.concentration
+    && event?.eventData.other
+    && imposesConcentrationDisadvantage(event.eventData.other, event.entity)
+      ? toSaveMode(ownMode === 'advantage', true)
+      : ownMode;
+
+  // Спасбросок концентрации — не против магии: «Мантия сопротивления
+  // заклинаниям» его не облегчает, «Боевой заклинатель» — да
+  const base = {
+    effectName: effect.name,
+    // «Сила или Ловкость»: бросающий берёт лучшую из названных
+    ability: pickSaveAbility(event?.entity, trigger.save),
+    dc: resolveTriggerSaveDc(trigger.save, event),
+    ...(mode ? { mode } : {}),
+    ...(effect.concentration
+      ? { againstMagic: false, againstConcentration: true }
+      : resolveEffectMagicCircumstances(effect)),
+    ...(effect.sourceCreatureType
+      ? { sourceCreatureType: effect.sourceCreatureType }
+      : {}),
+  };
+
+  return triggerHasEffects(trigger)
+    ? { ...base, againstCondition: effect.conditionKey }
+    : base;
+}
+
+/**
+ * Исход спасброска срабатывания для применения и чата. У спасброска против
+ * урона в исходе записано, что даёт успех.
+ *
+ * @param trigger - срабатывание
+ * @param save - брошенный спасбросок
+ * @returns исход
+ */
+export function toTriggerSaveOutcome(
+  trigger: EffectTrigger,
+  save: TurnSaveOutcome,
+): TurnSaveOutcome {
+  if (!trigger.save || triggerHasEffects(trigger)) {
+    return save;
+  }
+
+  const halfOnSave = trigger.actions.some(
+    (action) => action.type === 'damage' && action.halfOnSave === true,
+  );
+
+  return { ...save, damageOnSuccess: halfOnSave ? 'half' : 'negate' };
+}
+
+/**
+ * Доля действия при исходе спасброска: 0 — не выполняется, 0.5 — половина урона,
+ * 1 — полностью.
+ *
+ * @param trigger - срабатывание
+ * @param action - действие
+ * @param passed - пройден ли спасбросок (без спасброска — нет)
+ * @param defense - защиты бросившего («Увёртливость»)
+ * @returns доля
+ */
+export function resolveTriggerActionScale(
+  trigger: EffectTrigger,
+  action: EffectTriggerAction,
+  passed: boolean,
+  defense?: SaveDamageDefense,
+): number {
+  return resolveGateScale(
+    resolveTriggerActionGate(trigger, action),
+    passed,
+    action.type === 'damage' && action.halfOnSave === true,
+    defense,
+  );
+}
+
+/** Что известно броску урона и лечения срабатывания */
+export interface TriggerRollOptions {
+  /**
+   * Субъект — цель атаки, попавшей критически: кости урона удваиваются
+   */
+  critical?: boolean;
+  /**
+   * Куда писать строки сводки: слагаемое с неподставленным `@`-токеном бросок
+   * пропускает, и молча терять его нельзя
+   */
+  collectNote?: (note: string) => void;
+}
+
+/**
+ * Получатель пропущенных слагаемых срабатывания: превращает их в строки
+ * сводки с именем эффекта.
+ *
+ * @param effect - эффект срабатывания
+ * @param collectNote - куда писать строки сводки; нет — сообщать некому
+ * @returns получатель либо `undefined`
+ */
+function toSkippedReporter(
+  effect: ActiveEffect,
+  collectNote: ((note: string) => void) | undefined,
+): SkippedFormulaReporter | undefined {
+  return collectNote
+    ? (formula) => collectNote(formatSkippedFormulaNote(effect.name, formula))
+    : undefined;
+}
+
+/**
+ * Катает урон срабатывания по исходу спасброска; урон не применяется —
+ * вызывающий списывает хиты одним изменением.
+ *
+ * @param entity - субъект
+ * @param effect - эффект
+ * @param trigger - срабатывание
+ * @param passed - пройден ли спасбросок
+ * @param stats - resolved-статы субъекта (защиты от урона)
+ * @param options - крит атаки и куда сообщить о непосчитанном слагаемом
+ * @returns исход урона либо `null`
+ */
+export function rollTriggerDamage(
+  entity: DnDSceneEntity,
+  effect: ActiveEffect,
+  trigger: EffectTrigger,
+  passed: boolean,
+  stats: ReturnType<typeof resolveActorStats>,
+  options: TriggerRollOptions = {},
+): TurnDamageOutcome | null {
+  let outcome: TurnDamageOutcome | null = null;
+
+  const defense = trigger.save
+    ? {
+        flags: stats.activeFlags,
+        ability: trigger.save.ability,
+        againstMagic: resolveEffectMagicCircumstances(effect).againstMagic,
+      }
+    : undefined;
+
+  for (const action of trigger.actions) {
+    if (action.type !== 'damage') {
+      continue;
+    }
+
+    const scale = resolveTriggerActionScale(trigger, action, passed, defense);
+
+    if (scale <= 0) {
+      continue;
+    }
+
+    const rolled = rollEffectDamage(effect.name, action.parts, stats, entity, {
+      scale,
+      critical: options.critical,
+      reportSkipped: toSkippedReporter(effect, options.collectNote),
+    });
+
+    if (!rolled) {
+      continue;
+    }
+
+    outcome = outcome
+      ? {
+          effectName: outcome.effectName,
+          total: outcome.total + rolled.total,
+          types: [...new Set([...outcome.types, ...rolled.types])],
+          values: [...outcome.values, ...rolled.values],
+          rolls: [...outcome.rolls, ...rolled.rolls],
+        }
+      : rolled;
+  }
+
+  return outcome;
+}
+
+/**
+ * Катает лечение срабатывания: лечащие части урона не зависят от спасброска
+ * («Регенерация» лечит и без броска).
+ *
+ * @param effect - эффект
+ * @param trigger - срабатывание
+ * @param collectNote - куда писать о слагаемом, которое не посчиталось
+ * @returns исход лечения либо `null`
+ */
+export function rollTriggerHealing(
+  effect: ActiveEffect,
+  trigger: EffectTrigger,
+  collectNote?: (note: string) => void,
+): TurnHealingOutcome | null {
+  const parts = trigger.actions.flatMap((action) =>
+    action.type === 'damage' ? action.parts : [],
+  );
+
+  return parts.length > 0
+    ? rollEffectHealing(
+        effect.name,
+        parts,
+        toSkippedReporter(effect, collectNote),
+      )
+    : null;
+}
+
+/**
+ * Действия срабатывания, которые источник может выполнить: снять эффект можно,
+ * только если он лежит на субъекте.
+ *
+ * @param source - срабатывание с источником
+ * @returns действия
+ */
+function listSourceActions(source: EffectTriggerSource): EffectTriggerAction[] {
+  return source.trigger.actions.filter(
+    (action) =>
+      (action.type !== 'removeSelf' && action.type !== 'endCast')
+      || source.instance,
+  );
+}
+
+/**
+ * Есть ли у источника урон или лечение.
+ *
+ * @param source - срабатывание с источником
+ * @returns `true`, если есть действие урона
+ */
+function sourceHasDamage(source: EffectTriggerSource): boolean {
+  return listSourceActions(source).some((action) => action.type === 'damage');
+}
+
+/**
+ * Срабатывание-счётчик: оно только ставит отметки. Отметку этого события
+ * считают пороги `self.tagCount[...]` у урона того же события, поэтому такие
+ * срабатывания выполняются до этапа урона.
+ *
+ * @param source - срабатывание с источником
+ * @returns `true`, если все выполнимые действия — постановка отметки
+ */
+function sourceOnlyCountsTags(source: EffectTriggerSource): boolean {
+  const actions = listSourceActions(source);
+
+  return (
+    actions.length > 0 && actions.every((action) => action.type === 'applyTag')
+  );
+}
+
+/**
+ * Есть ли у источника выполнимые действия кроме урона.
+ *
+ * @param source - срабатывание с источником
+ * @returns `true`, если есть снятие или наложение
+ */
+function sourceHasEffects(source: EffectTriggerSource): boolean {
+  return listSourceActions(source).some((action) => action.type !== 'damage');
+}
+
+/**
+ * Источник эффекта для счётчика лимита: копия эффекта зоны считается по зоне —
+ * тогда вход в зону и начало хода в ней делят один лимит.
+ *
+ * @param effect - эффект на субъекте
+ * @returns источник
+ */
+export function resolveEffectUsageScope(effect: ActiveEffect): string {
+  return effect.origin === 'area' && effect.originId
+    ? buildTriggerUsageScope('area', effect.originId)
+    : effect.id;
+}
+
+/** Откуда у субъекта эффект со срабатываниями */
+export interface EffectTriggerSourceKind {
+  /** Аура чужого токена */
+  ambient: boolean;
+  /** Эффект лежит на субъекте — его можно снять */
+  instance: boolean;
+  /**
+   * Источник для счётчика лимита.
+   *
+   * @param effect - эффект
+   * @returns источник
+   */
+  scopeOf: (effect: ActiveEffect) => string;
+}
+
+/** Виды источников срабатываний у субъекта */
+export const EFFECT_TRIGGER_SOURCE_KINDS = {
+  /** Эффект на самом субъекте */
+  instance: {
+    ambient: false,
+    instance: true,
+    scopeOf: resolveEffectUsageScope,
+  },
+  /** Черта существа */
+  trait: {
+    ambient: false,
+    instance: false,
+    scopeOf: (effect) => buildTriggerUsageScope('trait', effect.id),
+  },
+  /** Работающий предмет */
+  item: {
+    ambient: false,
+    instance: false,
+    scopeOf: (effect) => buildTriggerUsageScope('item', effect.id),
+  },
+  /** Аура чужого токена «пока внутри» */
+  aura: {
+    ambient: true,
+    instance: false,
+    scopeOf: (effect) => buildTriggerUsageScope('aura', effect.id),
+  },
+} satisfies Record<string, EffectTriggerSourceKind>;
+
+/**
+ * Срабатывания эффектов одного вида источника.
+ *
+ * Свои эффекты носителя (его эффекты, надетые предметы, черты существа)
+ * получают его числа и выборы в формулах и условиях срабатываний
+ * (`bindOwnEffectFormulas`): постоянный эффект никто не накладывал, и
+ * подставить их больше некому. Ауре чужого токена числа её носителя подставил
+ * сбор аур — владельца у такого вызова нет.
+ *
+ * @param effects - эффекты
+ * @param kind - откуда эффекты у субъекта
+ * @param triggersOf - какие срабатывания эффекта нужны
+ * @param owner - носитель, он же владелец эффектов; нет — числа уже подставлены
+ * @returns срабатывания с источником
+ */
+export function buildTriggerSources(
+  effects: readonly ActiveEffect[],
+  kind: EffectTriggerSourceKind,
+  triggersOf: (effect: ActiveEffect) => readonly EffectTrigger[],
+  owner?: DnDSceneEntity,
+): EffectTriggerSource[] {
+  // Подставлять есть смысл только там, где на это событие что-то сработает
+  const listening = effects.filter((effect) => triggersOf(effect).length > 0);
+  const bound = owner ? bindOwnEffectFormulas(listening, owner) : listening;
+
+  return bound.flatMap((rawEffect) => {
+    // Потраченное при включении (`@paid.*`) — в формулы срабатываний: у
+    // эффекта без оплаты это тот же объект
+    const effect = bindLivePaid(rawEffect);
+
+    return triggersOf(effect).map((trigger) => ({
+      effect,
+      trigger,
+      ambient: kind.ambient,
+      instance: kind.instance,
+      scope: kind.scopeOf(effect),
+    }));
+  });
+}
+
+/** Вид источника срабатываний у вложенной записи носителя */
+const CARRIED_TRIGGER_SOURCE_KINDS: Record<
+  CarriedEffectSourceKind,
+  EffectTriggerSourceKind
+> = {
+  item: EFFECT_TRIGGER_SOURCE_KINDS.item,
+  trait: EFFECT_TRIGGER_SOURCE_KINDS.trait,
+};
+
+/**
+ * Срабатывания события на всём, что действует вместе с носителем: его
+ * собственные эффекты, надетые и настроенные предметы, черты существа. Так
+ * собираются события о поступках носителя — бросок атаки, отдых, лечение,
+ * путь, снятое состояние, поверженная цель: постоянный эффект предмета слышит
+ * их так же, как эффект умения. Снять себя и потратить заряд может только
+ * эффект, лежащий на носителе сам; у предмета и черты снимать нечего.
+ *
+ * @param entity - носитель
+ * @param triggersOf - какие срабатывания эффекта нужны
+ * @returns срабатывания с источником: свои эффекты, затем предметы и черты
+ */
+export function listCarrierEventSources(
+  entity: DnDSceneEntity,
+  triggersOf: (effect: ActiveEffect) => readonly EffectTrigger[],
+): EffectTriggerSource[] {
+  return [
+    ...buildTriggerSources(
+      listLiveEffects(entity),
+      EFFECT_TRIGGER_SOURCE_KINDS.instance,
+      triggersOf,
+      entity,
+    ),
+    ...listCarriedEffectEntries(entity).flatMap((entry) =>
+      buildTriggerSources(
+        [entry.effect],
+        CARRIED_TRIGGER_SOURCE_KINDS[entry.sourceKind],
+        triggersOf,
+        entity,
+      ),
+    ),
+  ];
+}
+
+/**
+ * Снимает с сущности эффекты по id одной записью.
+ *
+ * @param entity - сущность (мутируется)
+ * @param effectIds - id снимаемых эффектов
+ */
+export function removeEffectsById(
+  entity: DnDSceneEntity,
+  effectIds: ReadonlySet<string>,
+): void {
+  if (effectIds.size === 0) {
+    return;
+  }
+
+  entity.activeEffects = removeOrSwitchOffEffects(
+    entity.activeEffects ?? [],
+    (effect) => effectIds.has(effect.id),
+  );
+}
+
+/**
+ * Срабатывания, переносимые на копию эффекта: срабатывание, которое накладывает
+ * саму копию или реагирует на вход, выход и наложение, принадлежит источнику —
+ * на копии оно повторяло бы наложение на каждом ходу.
+ *
+ * @param effect - исходный эффект
+ * @returns срабатывания копии либо `undefined`
+ */
+function listCopiedTriggers(effect: ActiveEffect): EffectTrigger[] | undefined {
+  const kept = (effect.triggers ?? []).filter(
+    (trigger) =>
+      !PRESENCE_TRIGGER_EVENTS.includes(trigger.event)
+      && trigger.event !== 'applied'
+      && !trigger.actions.some((action) => action.type === 'applySelf'),
+  );
+
+  return kept.length > 0 ? kept : undefined;
+}
+
+/**
+ * Длящаяся копия эффекта на субъекте: своя длительность, без разовой нагрузки и
+ * без ауры источника.
+ *
+ * @param effect - эффект, чью нагрузку накладывают
+ * @param sourceAreaId - зона заклинания, из которой пришёл эффект
+ * @returns копия
+ */
+function buildEffectStatusCopy(
+  effect: ActiveEffect,
+  sourceAreaId: string | undefined,
+): ActiveEffect {
+  return withInitializedDuration({
+    ...effect,
+    id: generateId(ACTIVE_EFFECT_ID_PREFIX),
+    origin: 'condition',
+    originId: undefined,
+    areaTrigger: undefined,
+    transfer: false,
+    // Своя длительность: копия не должна делить счётчик с эффектом зоны
+    duration: { ...effect.duration },
+    // Разовая нагрузка уже отыграна — на длящейся копии её не оставляем
+    damageParts: undefined,
+    // Концентрацию держит заклинатель, а не копия на субъекте
+    concentration: undefined,
+    applySave: undefined,
+    // Аура остаётся у источника: без сброса цель сама начала бы её излучать
+    // (у копии нет `areaTrigger`, и она стала бы постоянной аурой)
+    aura: undefined,
+    effectTarget: undefined,
+    triggers: listCopiedTriggers(effect),
+    // Статус от зоны заклинания кончается вместе с заклинанием — с зоной
+    endsWithAreaId: effect.magical && sourceAreaId ? sourceAreaId : undefined,
+  });
+}
+
+/** Срок отметки по умолчанию: до начала следующего хода носителя */
+const DEFAULT_TAG_DURATION: EffectDuration = {
+  type: 'turn',
+  turnAnchor: 'carrier',
+  turnTiming: 'start',
+};
+
+/** Срок формулой без своей единицы: число раундов */
+const FORMULA_ROUNDS_DURATION: EffectDuration = { type: 'rounds' };
+
+/**
+ * Отметка на субъекте: эффект без нагрузки с ключом, который читают условия.
+ *
+ * @param action - действие «Отметка»
+ * @returns эффект отметки
+ */
+function buildTagEffect(action: EffectTriggerApplyTagAction): ActiveEffect {
+  return withInitializedDuration({
+    id: generateId(ACTIVE_EFFECT_ID_PREFIX),
+    name: action.label ?? action.tag,
+    description: '',
+    disabled: false,
+    origin: 'condition',
+    transfer: false,
+    // Срок формулой без своей единицы — в раундах; бросается тут же, при
+    // наложении, как срок формулой у самого эффекта
+    duration:
+      action.duration
+      ?? (action.durationFormula
+        ? FORMULA_ROUNDS_DURATION
+        : DEFAULT_TAG_DURATION),
+    ...(action.durationFormula
+      ? { durationFormula: action.durationFormula }
+      : {}),
+    changes: [],
+    flags: [],
+    tag: action.tag,
+  });
+}
+
+/**
+ * Привязка наложенного к касту и зоне источника: состояние или отметка от
+ * эффекта заклинания уходят вместе с его кастом и зоной, как и копия эффекта.
+ *
+ * @param status - наложенное срабатыванием
+ * @param effect - эффект, чьё срабатывание наложило
+ * @param options - зона заклинания, из которой пришёл эффект, и отвязка от каста
+ * @returns наложенное с привязкой
+ */
+function bindStatusToSource(
+  status: ActiveEffect,
+  effect: ActiveEffect,
+  options: EntryEffectOptions,
+): ActiveEffect {
+  const { sourceAreaId } = options;
+
+  return {
+    ...status,
+    ...(effect.castId && !options.detachFromCast
+      ? { castId: effect.castId }
+      : {}),
+    ...(effect.magical ? { magical: effect.magical } : {}),
+    ...(effect.magical && sourceAreaId ? { endsWithAreaId: sourceAreaId } : {}),
+  };
+}
+
+/** Действие срабатывания, которое кладёт на субъекта длящийся эффект */
+type StatusTriggerAction = Extract<
+  EffectTriggerAction,
+  { type: 'applySelf' | 'applyTag' | 'applyCondition' | 'reduceMaxHp' }
+>;
+
+/** Ключ метки «Максимум хитов уменьшен»: уменьшения складываются в неё */
+export const MAX_HP_REDUCTION_TAG = 'maxHpReduction';
+
+/** Флаг «максимум хитов нельзя уменьшать» */
+export const MAX_HP_REDUCTION_BLOCKED_FLAG = 'hitPoints.maxReductionBlocked';
+
+/** Имя метки уменьшения максимума хитов в списке эффектов */
+const MAX_HP_REDUCTION_LABEL = 'Максимум хитов уменьшен';
+
+/** Приоритет строки уменьшения максимума: после прибавок эффектов */
+const MAX_HP_REDUCTION_PRIORITY = 50;
+
+/**
+ * Число действия срабатывания: на сколько уменьшается максимум, сколько
+ * временных хитов, сколько ресурса вернуть, какими станут хиты. Число, кости,
+ * формула с `@damage` или всё вместе («1к6 + @damage»). Кости бросаются после
+ * подстановки токенов — разбор формул костей не знает; формула без костей
+ * считается целиком, с функциями.
+ *
+ * @param entity - получатель
+ * @param amount - строка действия
+ * @param eventDamage - урон события
+ * @returns неотрицательное число
+ */
+function resolveActionAmount(
+  entity: DnDSceneEntity,
+  amount: string,
+  eventDamage: number | undefined,
+): number {
+  const formulaContext = {
+    ...buildResolvedFormulaContext(entity),
+    event: { damage: eventDamage ?? 0 },
+  };
+
+  let value = 0;
+
+  try {
+    const substituted = substituteFormulaVariables(amount, formulaContext);
+
+    value = findFirstDiceTerm(substituted)
+      ? rollDamageFormula(substituted).total
+      : evaluateFormula(amount, formulaContext);
+  } catch {
+    // Автор ошибся в формуле — максимум не трогаем
+    value = 0;
+  }
+
+  return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+/**
+ * Метка уменьшения максимума хитов: прежнее уменьшение плюс новое.
+ *
+ * @param entity - получатель
+ * @param action - действие
+ * @param eventDamage - урон события
+ * @returns метка либо `null`, если уменьшать нечего
+ */
+function buildMaxHpReduction(
+  entity: DnDSceneEntity,
+  action: Extract<EffectTriggerAction, { type: 'reduceMaxHp' }>,
+  eventDamage: number | undefined,
+): ActiveEffect | null {
+  const reduction = resolveActionAmount(entity, action.amount, eventDamage);
+
+  if (reduction <= 0) {
+    return null;
+  }
+
+  const previous = (entity.activeEffects ?? [])
+    .filter((effect) => effect.tag === MAX_HP_REDUCTION_TAG)
+    .flatMap((effect) => effect.changes)
+    .reduce((total, change) => total - Number(change.value), 0);
+
+  const endsOnRest = action.endsOnRest ?? DEFAULT_TRIGGER_REST_TYPE;
+
+  return {
+    ...buildTagEffect({
+      type: 'applyTag',
+      tag: MAX_HP_REDUCTION_TAG,
+      label: MAX_HP_REDUCTION_LABEL,
+      duration: { type: 'permanent' },
+    }),
+    changes: [
+      {
+        key: 'hitPoints.max',
+        mode: 'add',
+        value: String(-(previous + reduction)),
+        priority: MAX_HP_REDUCTION_PRIORITY,
+      },
+    ],
+    ...(endsOnRest === MAX_HP_REDUCTION_NEVER_ENDS
+      ? {}
+      : {
+          triggers: [
+            {
+              id: 'trigger_restore_max_hp',
+              event: 'rest',
+              ...(endsOnRest === DEFAULT_TRIGGER_REST_TYPE
+                ? {}
+                : { restType: endsOnRest }),
+              actions: [{ type: 'removeSelf' }],
+            },
+          ],
+        }),
+  };
+}
+
+/**
+ * Отметка действия: у счётчика — на ступень больше прежней.
+ *
+ * @param entity - получатель
+ * @param action - действие «Отметка»
+ * @returns отметка
+ */
+function buildActionTag(
+  entity: DnDSceneEntity,
+  action: EffectTriggerApplyTagAction,
+): ActiveEffect {
+  const tag = buildTagEffect(action);
+
+  if (!action.stack) {
+    return tag;
+  }
+
+  return { ...tag, tagStacks: countEffectTag(entity, action.tag) + 1 };
+}
+
+/**
+ * Что кладёт на субъекта действие наложения: копию эффекта, отметку или
+ * состояние.
+ *
+ * @param entity - получатель
+ * @param action - действие наложения
+ * @param effect - эффект, чьё срабатывание выполняется
+ * @param options - откуда пришли наложения
+ * @returns длящийся эффект либо `null`, если класть нечего
+ */
+function buildActionStatus(
+  entity: DnDSceneEntity,
+  action: StatusTriggerAction,
+  effect: ActiveEffect,
+  options: EntryEffectOptions,
+): ActiveEffect | null {
+  if (action.type === 'applySelf') {
+    const copy = buildEffectStatusCopy(effect, options.sourceAreaId);
+
+    // Копия без срабатываний входа и выхода может остаться пустой
+    return hasLastingEffectPayload(copy) ? copy : null;
+  }
+
+  if (action.type === 'applyTag') {
+    return bindStatusToSource(buildActionTag(entity, action), effect, options);
+  }
+
+  if (action.type === 'reduceMaxHp') {
+    // «Максимум хитов нельзя уменьшать» («Аура жизни»): уменьшение просто не
+    // ложится — снимать потом было бы нечего
+    if (
+      resolveActorStats(entity).activeFlags.has(MAX_HP_REDUCTION_BLOCKED_FLAG)
+    ) {
+      return null;
+    }
+
+    return buildMaxHpReduction(entity, action, options.eventDamage);
+  }
+
+  // Истощение не заменяется, а растёт: правила дают «одну степень», и поверх
+  // имеющейся это следующая. Без степени состояние легло бы первой и сняло бы
+  // уже накопленное
+  const exhaustionLevel =
+    action.conditionKey === 'exhaustion'
+      ? clampExhaustionLevel(getEntityExhaustionLevel(entity.activeEffects) + 1)
+      : undefined;
+
+  const condition = buildConditionActiveEffect(action.conditionKey, {
+    duration:
+      action.duration
+      ?? (action.durationFormula ? FORMULA_ROUNDS_DURATION : undefined),
+    ...(exhaustionLevel === undefined ? {} : { exhaustionLevel }),
+  });
+
+  if (!condition) {
+    return null;
+  }
+
+  // Выход самого состояния (захват) уступает выходу автора, а запертому
+  // состоянию не положен вовсе: его снимает только то, что наложило
+  const { escape: conditionEscape, ...conditionBase } = condition;
+  const escape = action.escape ?? (action.locked ? undefined : conditionEscape);
+
+  return bindStatusToSource(
+    withInitializedDuration({
+      ...conditionBase,
+      // Собственные срабатывания состояния: «Сон» кладёт «Бессознательного»,
+      // который снимает сам себя от урона. Заканчивать каст нельзя — он снял
+      // бы сон со всех целей сразу
+      ...(action.triggers ? { triggers: action.triggers } : {}),
+      ...(action.recurringSave ? { recurringSave: action.recurringSave } : {}),
+      // Срок формулой: «невидим на число раундов, равное потраченным костям»
+      ...(action.durationFormula
+        ? { durationFormula: action.durationFormula }
+        : {}),
+      // Запертое состояние снимает только то, что его наложило
+      ...(action.locked ? { conditionLocked: true as const } : {}),
+      // «Вырваться» у состояния, которое кладёт срабатывание: кнопка — на нём
+      ...(escape ? { escape } : {}),
+      // Флаги сверх самого состояния: «пока отравлена — без реакций»
+      ...(action.flags?.length
+        ? { flags: [...new Set([...condition.flags, ...action.flags])] }
+        : {}),
+      // «Спадает при выходе из зоны»: без зоны выходить не из чего, и пометка
+      // не ставится — состояние живёт обычным сроком
+      ...(action.endsOnExit && options.sourceAreaId
+        ? { endsOnExitAreaId: options.sourceAreaId }
+        : {}),
+    }),
+    effect,
+    options,
+  );
+}
+
+/**
+ * Адрес сообщения наложившему в сводке. Носителю адрес — его имя: он и есть
+ * субъект срабатывания
+ */
+const NOTIFY_SOURCE_ADDRESS = 'наложившему';
+
+/**
+ * Строка действия «Сообщить» для сводки чата: кому, что и (если просили)
+ * результат броска по таблице поведения.
+ *
+ * @param entity - субъект срабатывания
+ * @param effect - эффект, чьё срабатывание идёт
+ * @param action - действие «Сообщить»
+ * @returns строка сводки
+ */
+function formatNotifyNote(
+  entity: DnDSceneEntity,
+  effect: ActiveEffect,
+  action: EffectTriggerNotifyAction,
+): string {
+  const address =
+    (action.to ?? DEFAULT_NOTIFY_TARGET) === 'subject'
+      ? entity.name
+      : NOTIFY_SOURCE_ADDRESS;
+
+  const { roll } = action;
+  const rolled = roll ? rollDamageFormula(roll) : null;
+
+  const suffix =
+    roll && rolled ? ` (${formatDiceFormula(roll)}: ${rolled.total})` : '';
+
+  return `${effect.name} — ${address}: ${action.text}${suffix}`;
+}
+
+/**
+ * Переводит эффект носителя на следующую ступень.
+ *
+ * Ступени меняют сам эффект на сущности, поэтому эффект ищется на ней по id:
+ * снимок черты или чужой ауры переводить некуда.
+ *
+ * @param entity - носитель эффекта
+ * @param effect - эффект, чьё срабатывание идёт
+ * @param options - куда складывать строку сводки
+ * @returns `true`, если ступень сменилась
+ */
+function advanceCarrierStage(
+  entity: DnDSceneEntity,
+  effect: ActiveEffect,
+  options: EntryEffectOptions,
+): boolean {
+  const effects = entity.activeEffects ?? [];
+  const current = effects.find((entry) => entry.id === effect.id);
+
+  if (!current) {
+    return false;
+  }
+
+  const advanced = advanceEffectStage(current);
+
+  if (!advanced) {
+    return false;
+  }
+
+  entity.activeEffects = effects.map((entry) =>
+    entry.id === advanced.id ? advanced : entry,
+  );
+
+  const label = formatEffectStageLabel(advanced);
+
+  if (label) {
+    options.collectNote?.(`${advanced.name} — ${label}`);
+  }
+
+  return true;
+}
+
+/**
+ * Снимает с получателя состояния: одно по ключу или все.
+ *
+ * Снимается не метка, а эффект, который её несёт, — иначе состояние вернулось
+ * бы на следующем тике источника. Запертое состояние
+ * (`applyCondition.locked`) так не снимается: его снимает только то, что его
+ * наложило.
+ *
+ * Список типов сужает снятие до состояний, наложенных существами этих типов
+ * («перестаёт быть очарованной или испуганной такими существами»): тип
+ * наложившего записан на эффекте при наложении, без него состояние остаётся.
+ *
+ * @param entity - получатель (меняется)
+ * @param conditionKey - какое состояние; нет - все
+ * @param fromCreatureTypes - только наложенные существами этих типов
+ * @returns `true`, если что-то сняли
+ */
+function removeEntityConditions(
+  entity: DnDSceneEntity,
+  conditionKey: string | undefined,
+  fromCreatureTypes?: readonly CreatureCategory[],
+): boolean {
+  const effects = entity.activeEffects ?? [];
+
+  const kept = effects.filter(
+    (effect) =>
+      effect.conditionKey === undefined
+      || effect.conditionLocked === true
+      || (conditionKey !== undefined && effect.conditionKey !== conditionKey)
+      || (fromCreatureTypes !== undefined
+        && fromCreatureTypes.length > 0
+        && (effect.sourceCreatureType === undefined
+          || !fromCreatureTypes.includes(effect.sourceCreatureType))),
+  );
+
+  if (kept.length === effects.length) {
+    return false;
+  }
+
+  entity.activeEffects = kept;
+
+  return true;
+}
+
+/**
+ * Убивает получателя или возвращает его к жизни.
+ *
+ * @param entity - получатель (меняется)
+ * @param action - действие «Убить» или «Вернуть к жизни»
+ * @returns `true`, если состояние изменилось
+ */
+function applyLifeAction(
+  entity: DnDSceneEntity,
+  action: EffectTriggerKillAction | EffectTriggerReviveAction,
+): boolean {
+  if (action.type === 'kill') {
+    const dead = buildConditionActiveEffect(DEATH_CONDITION_KEY);
+
+    if (!dead) {
+      return false;
+    }
+
+    writeEntityHitPoints(entity, { current: 0, temp: 0 });
+
+    entity.activeEffects = mergeAppliedEffects(entity.activeEffects ?? [], [
+      dead,
+    ]);
+
+    return true;
+  }
+
+  const temp = resolveEntityTempHp(entity);
+  const maxHp = resolveEntityMaxHp(entity);
+
+  entity.activeEffects = (entity.activeEffects ?? []).filter(
+    (effect) => effect.conditionKey !== DEATH_CONDITION_KEY,
+  );
+
+  writeEntityHitPoints(entity, {
+    current: action.full ? maxHp : Math.min(action.hp ?? MIN_REVIVE_HP, maxHp),
+    temp,
+  });
+
+  return true;
+}
+
+/**
+ * Меняет временные хиты получателя.
+ *
+ * По правилам временные хиты не складываются, поэтому «Поставить» берёт
+ * большее. «Прибавить» и «Потратить» нужны там, где правила говорят иначе:
+ * щит из временных хитов, который расходуется.
+ *
+ * @param entity - получатель (меняется)
+ * @param action - действие «Временные хиты»
+ * @param options - урон события для `@damage`
+ * @returns `true`, если временные хиты изменились
+ */
+function applyTempHpAction(
+  entity: DnDSceneEntity,
+  action: EffectTriggerTempHpAction,
+  options: EntryEffectOptions,
+): boolean {
+  // «+5 к получаемым временным хитам» — и к выданным срабатыванием
+  const amount = withTempHpGainBonus(
+    entity,
+    resolveActionAmount(entity, action.amount, options.eventDamage),
+  );
+
+  const current = resolveEntityTempHp(entity);
+  const next = resolveNextTempHp(current, amount, action.mode);
+
+  if (next === current) {
+    return false;
+  }
+
+  writeEntityHitPoints(entity, {
+    current: resolveEntityCurrentHp(entity),
+    temp: next,
+  });
+
+  return true;
+}
+
+/**
+ * Сколько станет временных хитов.
+ *
+ * @param current - сколько их сейчас
+ * @param amount - число действия
+ * @param mode - что делает действие; нет - поставить
+ * @returns новое число временных хитов
+ */
+function resolveNextTempHp(
+  current: number,
+  amount: number,
+  mode: EffectTempHpMode | undefined,
+): number {
+  switch (mode ?? DEFAULT_TEMP_HP_MODE) {
+    case 'add':
+      return current + amount;
+    case 'spend':
+      return Math.max(0, current - amount);
+    default:
+      // Правило PHB: временные хиты не складываются, остаётся большее
+      return Math.max(current, amount);
+  }
+}
+
+/**
+ * Надетое, а не удерживаемое: доспех, щит, кольцо, одежда, чудесные предметы
+ * (плащ, сапоги, амулет). Их не роняют — доспех и щит снимают действием и
+ * дольше, а кольцо с плащом в руках не держат.
+ */
+const WORN_EQUIPMENT_CATEGORIES: ReadonlySet<DnDEquipmentCategory> = new Set([
+  'light',
+  'medium',
+  'heavy',
+  'shield',
+  'ring',
+  'clothing',
+  'wondrous',
+]);
+
+/**
+ * Держит ли существо предмет в руках: оружие, жезл, фокус, факел.
+ *
+ * Снаряжение без категории считается надетым: снять доспех по ошибке хуже,
+ * чем не уронить неизвестную вещь.
+ *
+ * @param item - предмет снаряжения
+ * @returns `true`, если предмет в руках
+ */
+function isItemHeld(item: DnDGameItem): boolean {
+  // Отметка «надет», а не «надет и не кончился»: кончившиеся метательные
+  // кинжалы в руке тоже роняют
+  if (!item.equipped) {
+    return false;
+  }
+
+  if (item.type !== 'equipment') {
+    return true;
+  }
+
+  return (
+    item.equipmentCategory !== undefined
+    && !WORN_EQUIPMENT_CATEGORIES.has(item.equipmentCategory)
+  );
+}
+
+/**
+ * Получатель роняет то, что держит в руках: удерживаемое снимается, надетое
+ * остаётся.
+ *
+ * @param entity - получатель (меняется)
+ * @returns `true`, если что-то сняли
+ */
+function dropHeldItems(entity: DnDSceneEntity): boolean {
+  const equipment = entity.equipment ?? [];
+
+  let dropped = false;
+
+  entity.equipment = equipment.map((item) => {
+    if (!isItemHeld(item)) {
+      return item;
+    }
+
+    dropped = true;
+
+    return { ...item, equipped: false };
+  });
+
+  return dropped;
+}
+
+/** Сколько возвращает действие «Вернуть ресурс» без поля `amount` */
+const DEFAULT_RESTORE_AMOUNT = 1;
+
+/**
+ * Возвращает получателю потраченный ресурс: ячейку заклинания или счётчик
+ * листа.
+ *
+ * @param entity - получатель (меняется)
+ * @param action - действие «Вернуть ресурс»
+ * @param options - урон события для `@damage`
+ * @returns `true`, если ресурс вернулся
+ */
+function restoreEntityResource(
+  entity: DnDSceneEntity,
+  action: EffectTriggerRestoreAction,
+  options: EntryEffectOptions,
+): boolean {
+  const amount =
+    action.amount === undefined
+      ? DEFAULT_RESTORE_AMOUNT
+      : resolveActionAmount(entity, action.amount, options.eventDamage);
+
+  if (action.what === 'counter') {
+    return action.set
+      ? setEntityCounter(entity, action.counter, amount)
+      : restoreEntityCounter(entity, action.counter, amount);
+  }
+
+  if (amount <= 0) {
+    return false;
+  }
+
+  const level = action.level ?? MIN_SPELL_SLOT_LEVEL;
+  const used = entity.system.spellSlotsUsed;
+
+  if (!Array.isArray(used) || (used[level - 1] ?? 0) <= 0) {
+    return false;
+  }
+
+  const next = [...used];
+
+  next[level - 1] = Math.max(0, (used[level - 1] ?? 0) - amount);
+  entity.system.spellSlotsUsed = next;
+
+  return true;
+}
+
+/**
+ * Меняет счётчик листа: новое значение считает вызывающий, а в пределах от
+ * нуля до максимума его держит эта функция.
+ *
+ * @param entity - получатель (меняется)
+ * @param counterKey - ключ счётчика; нет - менять нечего
+ * @param nextOf - новое значение по прежнему
+ * @returns `true`, если счётчик изменился
+ */
+function updateEntityCounter(
+  entity: DnDSceneEntity,
+  counterKey: string | undefined,
+  nextOf: (current: number) => number,
+): boolean {
+  const counters = entity.system.classCounters;
+
+  if (!counterKey || !Array.isArray(counters)) {
+    return false;
+  }
+
+  let changed = false;
+
+  entity.system.classCounters = counters.map((counter) => {
+    if (counter.counterKey !== counterKey) {
+      return counter;
+    }
+
+    const next = Math.min(counter.max, Math.max(0, nextOf(counter.current)));
+
+    if (next === counter.current) {
+      return counter;
+    }
+
+    changed = true;
+
+    return { ...counter, current: next };
+  });
+
+  return changed;
+}
+
+/**
+ * Возвращает единицы счётчика листа.
+ *
+ * @param entity - получатель (меняется)
+ * @param counterKey - ключ счётчика; нет - возвращать нечего
+ * @param amount - сколько вернуть
+ * @returns `true`, если счётчик изменился
+ */
+function restoreEntityCounter(
+  entity: DnDSceneEntity,
+  counterKey: string | undefined,
+  amount: number,
+): boolean {
+  return amount > 0
+    ? updateEntityCounter(entity, counterKey, (current) => current + amount)
+    : false;
+}
+
+/**
+ * Ставит счётчик листа в число — не выше его максимума: «новая трата ячейки
+ * заменяет прежние Очки мутации».
+ *
+ * @param entity - получатель (меняется)
+ * @param counterKey - ключ счётчика; нет - ставить нечего
+ * @param value - новое значение
+ * @returns `true`, если счётчик изменился
+ */
+function setEntityCounter(
+  entity: DnDSceneEntity,
+  counterKey: string | undefined,
+  value: number,
+): boolean {
+  return updateEntityCounter(entity, counterKey, () => value);
+}
+
+/**
+ * Заканчивает касты по их эффектам на получателе и снимает сами эффекты:
+ * остальное (эффекты каста на других существах, зоны) снимет конец каста.
+ *
+ * @param entity - получатель (меняется)
+ * @param ended - эффекты заканчиваемых кастов
+ * @param options - чем заканчивать каст
+ * @returns `true`, если хоть один каст закончен
+ */
+function endEntityCastEffects(
+  entity: DnDSceneEntity,
+  ended: readonly ActiveEffect[],
+  options: EntryEffectOptions,
+): boolean {
+  if (ended.length === 0) {
+    return false;
+  }
+
+  for (const effect of ended) {
+    options.endCast?.(effect);
+  }
+
+  const endedIds = new Set(ended.map((effect) => effect.id));
+
+  entity.activeEffects = (entity.activeEffects ?? []).filter(
+    (effect) => !endedIds.has(effect.id),
+  );
+
+  return true;
+}
+
+/**
+ * Заканчивает касты получателя: «прерывает концентрацию цели».
+ *
+ * @param entity - получатель (меняется)
+ * @param options - чем заканчивать каст
+ * @returns `true`, если хоть один каст закончен
+ */
+function endRecipientCasts(
+  entity: DnDSceneEntity,
+  options: EntryEffectOptions,
+): boolean {
+  const marks = (entity.activeEffects ?? []).filter(
+    (effect) => effect.concentration === true && effect.castId !== undefined,
+  );
+
+  return endEntityCastEffects(entity, marks, options);
+}
+
+/**
+ * Рассеивает чужие заклинания на получателе: снимает эффекты кастов не выше
+ * круга и заканчивает сами касты.
+ *
+ * @param entity - получатель (меняется)
+ * @param action - действие «Рассеять»
+ * @param options - чем заканчивать каст
+ * @returns `true`, если что-то рассеяли
+ */
+function dispelEntityCasts(
+  entity: DnDSceneEntity,
+  action: EffectTriggerDispelAction,
+  options: EntryEffectOptions,
+): boolean {
+  const effects = entity.activeEffects ?? [];
+
+  // Круг формулой («не выше круга вашей ячейки») — числом к этому времени:
+  // `@castLevel` подставлен при касте. Не посчиталась — круг числом
+  const byFormula = action.maxLevelFormula
+    ? resolveActionAmount(entity, action.maxLevelFormula, options.eventDamage)
+    : 0;
+
+  const maxLevel = byFormula > 0 ? byFormula : action.maxLevel;
+
+  const dispelled = effects.filter((effect) => {
+    if (effect.castId === undefined) {
+      return false;
+    }
+
+    return effect.castLevel === undefined
+      ? action.withoutLevel === true
+      : effect.castLevel <= maxLevel;
+  });
+
+  return endEntityCastEffects(entity, dispelled, options);
+}
+
+/**
+ * Двигает фишку получателя: толчок, притягивание, перенос.
+ *
+ * Ставит фишку ядро — система только считает точку. Нет сцены или нет
+ * возможности двигать (старое ядро) — действие молчит: двигать фишку сама
+ * система не вправе.
+ *
+ * @param entity - получатель
+ * @param action - действие «Переместить»
+ * @param effect - эффект, чьё срабатывание идёт
+ * @param options - сцена и возможность двигать
+ */
+function pushRecipient(
+  entity: DnDSceneEntity,
+  action: EffectTriggerMoveAction,
+  effect: ActiveEffect,
+  options: EntryEffectOptions,
+): void {
+  const { surroundings, moveToken } = options;
+
+  if (!surroundings || !moveToken) {
+    return;
+  }
+
+  const target = findSceneToken(surroundings, entity.id);
+
+  const origin = resolveForcedMoveOrigin(
+    action,
+    surroundings,
+    effect.sourceActorId,
+  );
+
+  if (!target || !origin) {
+    return;
+  }
+
+  const position = resolveForcedMovePosition(action, {
+    target,
+    origin,
+    gridSettings: surroundings.gridSettings,
+    targetFlags: resolveActorStats(entity).activeFlags,
+  });
+
+  if (position) {
+    moveToken(target.id, position, resolveForcedMoveOptions(action));
+  }
+}
+
+/**
+ * Сдвигает зону, которую оставил тот же каст, что и эффект: у зоны заклинания
+ * `source.castId`, у эффекта — `castId`.
+ *
+ * Вершины переносит ядро — система только считает смещение. Нет сцены, каста,
+ * зоны или возможности сдвигать (старое ядро) — действие молчит.
+ *
+ * @param entity - получатель: от него и к нему сдвигается зона
+ * @param action - действие «Сдвинуть зону»
+ * @param effect - эффект, чьё срабатывание идёт
+ * @param options - сцена, смещение носителя и возможность сдвигать
+ */
+function shiftCastArea(
+  entity: DnDSceneEntity,
+  action: EffectTriggerMoveAreaAction,
+  effect: ActiveEffect,
+  options: EntryEffectOptions,
+): void {
+  const { surroundings, moveArea } = options;
+  const castId = effect.castId;
+
+  if (!surroundings || !moveArea || !castId) {
+    return;
+  }
+
+  const recipient = findSceneToken(surroundings, entity.id) ?? undefined;
+
+  for (const area of surroundings.areas ?? []) {
+    if (area.source?.castId !== castId) {
+      continue;
+    }
+
+    const offset = resolveAreaShift(action, area, {
+      recipient,
+      movementOffset: options.movementOffset,
+      gridSettings: surroundings.gridSettings,
+    });
+
+    if (offset) {
+      moveArea(area.id, offset);
+    }
+  }
+}
+
+/**
+ * Даёт получателю героическое вдохновение.
+ *
+ * @param entity - получатель (меняется)
+ * @returns `true`, если вдохновения не было и оно появилось
+ */
+function grantEntityInspiration(entity: DnDSceneEntity): boolean {
+  if (entity.system.inspiration === true) {
+    return false;
+  }
+
+  entity.system.inspiration = true;
+
+  return true;
+}
+
+/**
+ * Выполняет действия срабатывания, кроме урона: накладывает копию эффекта,
+ * состояние (с проверкой иммунитета) или отметку и сообщает, снимается ли сам
+ * эффект.
+ * Снятие вызывающий делает сам — на границе хода оно идёт одной записью.
+ *
+ * Наложенное помнит наложившего исходный эффект: «до конца хода источника» и
+ * ход наложившего у копии считаются от него, а не от носителя.
+ *
+ * @param entity - субъект
+ * @param source - срабатывание с источником
+ * @param passed - пройден ли спасбросок
+ * @param options - откуда пришли наложения и чей сейчас ход
+ * @returns снимается ли эффект и было ли наложение
+ */
+export function applyTriggerEffectActions(
+  entity: DnDSceneEntity,
+  source: EffectTriggerSource,
+  passed: boolean,
+  options: EntryEffectOptions = {},
+): { removes: boolean; applied: boolean } {
+  let removes = false;
+  let applied = false;
+
+  for (const action of listSourceActions(source)) {
+    if (
+      action.type === 'damage'
+      || resolveTriggerActionScale(source.trigger, action, passed) <= 0
+    ) {
+      continue;
+    }
+
+    if (action.type === 'removeSelf') {
+      removes = true;
+
+      continue;
+    }
+
+    // Каст заканчивает ядро по всем существам; сам эффект снимается здесь же.
+    // Каст получателя — чужой: свой эффект от этого не снимается
+    if (action.type === 'endCast') {
+      if ((action.whose ?? DEFAULT_CAST_OWNER) === 'recipient') {
+        applied = endRecipientCasts(entity, options) || applied;
+
+        continue;
+      }
+
+      removes = true;
+      options.endCast?.(source.effect);
+
+      continue;
+    }
+
+    if (action.type === 'notify') {
+      options.collectNote?.(formatNotifyNote(entity, source.effect, action));
+
+      continue;
+    }
+
+    if (action.type === 'nextStage') {
+      applied = advanceCarrierStage(entity, source.effect, options) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'setHp') {
+      const maxHp = resolveEntityMaxHp(entity);
+
+      // Хиты формулой («5 × круг потраченной ячейки»): не посчиталась или
+      // дала ноль — берётся число действия
+      const computed =
+        action.formula === undefined
+          ? 0
+          : resolveActionAmount(entity, action.formula, options.eventDamage);
+
+      const value = computed > 0 ? computed : action.value;
+
+      writeEntityHitPoints(entity, {
+        current: action.toMax ? maxHp : Math.min(value, maxHp),
+        temp: resolveEntityTempHp(entity),
+      });
+
+      applied = true;
+
+      continue;
+    }
+
+    if (action.type === 'tempHp') {
+      applied = applyTempHpAction(entity, action, options) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'removeCondition') {
+      applied =
+        removeEntityConditions(
+          entity,
+          action.conditionKey,
+          action.fromCreatureTypes,
+        ) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'kill' || action.type === 'revive') {
+      applied = applyLifeAction(entity, action) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'dropHeld') {
+      applied = dropHeldItems(entity) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'restore') {
+      applied = restoreEntityResource(entity, action, options) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'dispel') {
+      applied = dispelEntityCasts(entity, action, options) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'grantInspiration') {
+      applied = grantEntityInspiration(entity) || applied;
+
+      continue;
+    }
+
+    if (action.type === 'move') {
+      // Перемещение меняет сцену, а не лист: сущность от него не «изменилась»
+      pushRecipient(entity, action, source.effect, options);
+
+      continue;
+    }
+
+    if (action.type === 'moveArea') {
+      // Сдвиг зоны тоже меняет сцену, а не лист
+      shiftCastArea(entity, action, source.effect, options);
+
+      continue;
+    }
+
+    const status = buildActionStatus(entity, action, source.effect, options);
+
+    // Иммунитет к состоянию — как при наложении атакой: срабатывание — такой
+    // же путь наложения, и обходить статблок оно не должно
+    const blocked =
+      status?.conditionKey !== undefined
+      && isImmuneToCondition(
+        getEntityConditionImmunities(
+          entity,
+          options.ambientEffects ?? [],
+          // Кто наложил эффект со срабатыванием — тот и накладывает состояние
+          source.effect.sourceCreatureType,
+        ),
+        status.conditionKey,
+      );
+
+    if (!status || blocked) {
+      continue;
+    }
+
+    // Правило PHB 2024 «Combining Game Effects»: одноимённый статус не
+    // стакается — повторное наложение обновляет его, а не плодит копии
+    entity.activeEffects = mergeAppliedEffects(entity.activeEffects ?? [], [
+      stampAppliedEffect(status, {
+        carrierId: entity.id,
+        sourceId: source.effect.sourceActorId,
+        activeTurnActorId: options.activeTurnActorId,
+      }),
+    ]);
+
+    // Хиты не выше уменьшенного максимума
+    if (action.type === 'reduceMaxHp') {
+      writeEntityHitPoints(entity, {
+        current: Math.min(
+          resolveEntityCurrentHp(entity),
+          resolveEntityMaxHp(entity),
+        ),
+        temp: resolveEntityTempHp(entity),
+      });
+    }
+
+    applied = true;
+  }
+
+  return { removes, applied };
+}
+
+/**
+ * Данные события границы хода для условий: урона и другой стороны здесь нет,
+ * но расстояние до наложившего известно, если ядро отдало сцену, а номер
+ * раунда — если идёт бой.
+ *
+ * @param source - срабатывание с источником
+ * @param options - настройки прогона
+ * @returns данные события
+ */
+function buildTurnEventData(
+  source: EffectTriggerSource,
+  options: TurnEffectsOptions,
+): TriggerEventData {
+  const sourceId = source.effect.sourceActorId;
+  const isSourceWithin = options.isSourceWithin;
+
+  const proximity: TriggerEventData =
+    sourceId && isSourceWithin
+      ? { isSourceWithin: (feet) => isSourceWithin(sourceId, feet) }
+      : {};
+
+  return withSceneSight(
+    withCombatRound(proximity, options.combatRound),
+    options.sight,
+  );
+}
+
+/**
+ * Срабатывания эффекта на событие хода: на ходу носителя — его собственные, на
+ * ходу наложившего (`options.sourceTurnActorId`) — «ход наложившего» эффектов,
+ * наложенных этим участником.
+ *
+ * «Ход наложившего», чей наложивший неизвестен или не в бою, идёт на ходу
+ * носителя: его ход не наступит, и срабатывание молчало бы всегда.
+ *
+ * @param effect - эффект
+ * @param event - начало или конец хода
+ * @param options - чей ход и участие наложившего в бою
+ * @returns срабатывания
+ */
+function listTurnTriggers(
+  effect: ActiveEffect,
+  event: EffectTriggerEvent,
+  options: Pick<TurnEffectsOptions, 'sourceTurnActorId' | 'isSourceInCombat'>,
+): EffectTrigger[] {
+  const sourceId = effect.sourceActorId;
+  const { sourceTurnActorId } = options;
+
+  const triggers = listEffectListTriggers(effect).filter(
+    (trigger) => trigger.event === event,
+  );
+
+  if (sourceTurnActorId !== undefined) {
+    return sourceId === sourceTurnActorId
+      ? triggers.filter((trigger) => trigger.turnOf === 'source')
+      : [];
+  }
+
+  const sourceTurnComes =
+    sourceId !== undefined && (options.isSourceInCombat?.(sourceId) ?? false);
+
+  return triggers.filter(
+    (trigger) => trigger.turnOf !== 'source' || !sourceTurnComes,
+  );
+}
+
+/**
+ * Прогоняет срабатывания сущности на границе хода (начало/конец): сперва урон и
+ * лечение (со спасброском против урона, если он задан), затем снятие и
+ * наложение (повторный спасбросок снимает эффект, «Зловоние» накладывает
+ * «Отравленный»).
+ *
+ * Источники: эффекты на самой сущности, черты существа и ауры чужих токенов
+ * «пока внутри». На ходу наложившего (`options.sourceTurnActorId`) — только
+ * срабатывания «ход наложившего» его эффектов и аур. Условие и лимит «не чаще
+ * N раз» проверяются перед срабатыванием.
+ * Спасбросок, который надо спросить у игрока, не бросается: срабатывание уходит
+ * в отложенные (`deferredTriggers` и прежние списки эффектов).
+ *
+ * Мутирует `entity.activeEffects`, `entity.system.hitPoints` и счётчики лимитов.
+ *
+ * @param entity - сущность, чей момент хода обрабатывается
+ * @param timing - момент: начало или конец хода
+ * @param options - какие спасброски отложить, ауры чужих токенов, чей ход
+ * @returns урон, исходы бросков и были ли изменения
+ */
+export function processTurnEffects(
+  entity: DnDSceneEntity,
+  timing: EffectSaveTiming,
+  options: TurnEffectsOptions = {},
+): TurnEffectsResult {
+  const event = turnTriggerEventOf(timing);
+  const ambientEffects = options.ambientEffects ?? [];
+
+  // Растущие изменения «каждый ход» двигаются в начале хода носителя — до
+  // срабатываний, чтобы те уже видели новое число
+  const stepped =
+    timing === 'startOfTurn'
+    && options.sourceTurnActorId === undefined
+    && advanceEffectChangeSteps(entity, 'turn');
+
+  /**
+   * Срабатывания эффекта на эту границу хода.
+   *
+   * @param effect - эффект
+   * @returns срабатывания
+   */
+  const turnTriggersOf = (effect: ActiveEffect): EffectTrigger[] =>
+    listTurnTriggers(effect, event, options);
+
+  const sources: EffectTriggerSource[] = [
+    ...buildTriggerSources(
+      entity.activeEffects ?? [],
+      EFFECT_TRIGGER_SOURCE_KINDS.instance,
+      turnTriggersOf,
+      entity,
+    ),
+    ...buildTriggerSources(
+      listTraitEffects(entity),
+      EFFECT_TRIGGER_SOURCE_KINDS.trait,
+      turnTriggersOf,
+      entity,
+    ),
+    // Аура «пока внутри» срабатывает на ходу того, кто в ней стоит
+    ...buildTriggerSources(
+      ambientEffects.filter(
+        (effect) => (effect.areaTrigger ?? 'stay') === 'stay',
+      ),
+      EFFECT_TRIGGER_SOURCE_KINDS.aura,
+      turnTriggersOf,
+    ),
+  ];
+
+  const result: TurnEffectsResult = {
+    changed: false,
+    damageTotal: 0,
+    saveOutcomes: [],
+    damageOutcomes: [],
+    healingOutcomes: [],
+    deferredSaveEffects: [],
+    deferredDamageSaveEffects: [],
+    deferredAmbientDamageSaveEffects: [],
+    deferredTriggers: [],
+    notes: [],
+  };
+
+  result.changed = stepped;
+
+  if (sources.length === 0) {
+    return result;
+  }
+
+  const stats = resolveActorStats(entity, [...ambientEffects]);
+
+  let savingThrowContext = buildEffectSavingThrowContext(
+    entity,
+    ambientEffects,
+  );
+
+  /** Спасброски этапа урона — наложение того же срабатывания идёт по ним */
+  const damageStageSaves = new Map<EffectTrigger, TurnSaveOutcome>();
+  const deferredSources = new Set<EffectTrigger>();
+  const allowedTriggers = new Set<EffectTrigger>();
+  const blockedTriggers = new Set<EffectTrigger>();
+
+  let usageChanged = false;
+
+  /**
+   * Проходит ли срабатывание по лимиту: первое прохождение отмечается в
+   * счётчике, проверка того же срабатывания на втором этапе — нет.
+   *
+   * @param source - срабатывание с источником
+   * @returns `true`, если срабатывание выполняется
+   */
+  const allowTrigger = (source: EffectTriggerSource): boolean => {
+    if (allowedTriggers.has(source.trigger)) {
+      return true;
+    }
+
+    // Срабатывание, которое спросит человека, лимит тратит уже по согласию
+    const asks = triggerAsksPermission(source.trigger);
+
+    if (
+      blockedTriggers.has(source.trigger)
+      || !admitTrigger(
+        entity,
+        source,
+        buildTurnEventData(source, options),
+        undefined,
+        asks,
+        (note) => result.notes.push(note),
+      )
+    ) {
+      blockedTriggers.add(source.trigger);
+
+      return false;
+    }
+
+    allowedTriggers.add(source.trigger);
+    usageChanged ||= !asks && source.trigger.limit !== undefined;
+
+    return true;
+  };
+
+  /**
+   * Кто бросает и данные события границы хода: без них режим спасброска по
+   * условию и автоматический исход не видели бы ни листа, ни раунда боя.
+   *
+   * @param source - срабатывание с источником
+   * @returns бросающий и данные события
+   */
+  const saveEventOf = (source: EffectTriggerSource): TriggerSaveEvent => ({
+    entity,
+    eventData: buildTurnEventData(source, options),
+  });
+
+  let appliedAny = false;
+
+  // 0a. «Спрашивать разрешения»: срабатывание не выполняется, пока человек не
+  // согласился. Этап идёт первым — согласие нужно и выбору цели, и урону.
+  // В набор попадают и согласие, и выбор: дальше по этапам такое срабатывание
+  // не идёт — его выполнит ответ
+  const humanAskedTriggers = new Set<EffectTrigger>();
+
+  for (const source of sources) {
+    const { effect, trigger, instance } = source;
+
+    if (
+      isEffectDormant(effect)
+      || !triggerAsksPermission(trigger)
+      || (instance && effect.aura && !effect.aura.applyToSelf)
+      || !allowTrigger(source)
+    ) {
+      continue;
+    }
+
+    result.deferredTriggers.push({
+      ...source,
+      stage: 'ask',
+      eventData: saveEventOf(source).eventData,
+    });
+
+    humanAskedTriggers.add(trigger);
+  }
+
+  // 0b. Получатель «по выбору»: кого задеть, решает человек. Ни урон, ни
+  // наложения на субъекте не выполняются — всё срабатывание ждёт ответа
+  for (const source of sources) {
+    const { effect, trigger, instance } = source;
+
+    if (
+      isEffectDormant(effect)
+      || humanAskedTriggers.has(trigger)
+      || trigger.recipient !== CHOICE_TRIGGER_RECIPIENT
+      || !trigger.choice
+      || (instance && effect.aura && !effect.aura.applyToSelf)
+      || !allowTrigger(source)
+    ) {
+      continue;
+    }
+
+    result.deferredTriggers.push({
+      ...source,
+      stage: 'choice',
+      eventData: saveEventOf(source).eventData,
+    });
+
+    humanAskedTriggers.add(trigger);
+  }
+
+  // 0. Отметки-счётчики. Порог `self.tagCount[...]` у урона этого же события
+  // обязан видеть отметку этого события: иначе «на третьем провале» урон ждал
+  // бы четвёртого — этап урона идёт раньше наложений
+  const countedTriggers = new Set<EffectTrigger>();
+
+  for (const source of sources) {
+    const { effect, trigger, instance } = source;
+
+    if (
+      isEffectDormant(effect)
+      || !sourceOnlyCountsTags(source)
+      || humanAskedTriggers.has(trigger)
+      || (instance && effect.aura && !effect.aura.applyToSelf)
+      || !allowTrigger(source)
+    ) {
+      continue;
+    }
+
+    let countedSave: TurnSaveOutcome | null = null;
+
+    const countedEvent = saveEventOf(source);
+    const countedSpec = buildTriggerSaveSpec(effect, trigger, countedEvent);
+
+    if (countedSpec) {
+      // Спасбросок спросят у игрока: отметка ляжет вместе с наложениями.
+      // Автоматический исход спрашивать не нужно — бросать нечего
+      if (
+        triggerSaveNeedsRoll(trigger, entity, countedEvent.eventData)
+        && options.deferRecurringSave?.(effect)
+      ) {
+        if (instance) {
+          result.deferredSaveEffects.push(effect);
+        }
+
+        result.deferredTriggers.push({
+          ...source,
+          stage: 'effects',
+          eventData: countedEvent.eventData,
+        });
+
+        deferredSources.add(trigger);
+
+        continue;
+      }
+
+      countedSave = toTriggerSaveOutcome(
+        trigger,
+        settleTriggerSaveRoll(
+          entity,
+          trigger,
+          countedSpec,
+          () =>
+            rollEffectSaveWithContext(countedSpec, stats, savingThrowContext),
+          countedEvent.eventData,
+        ),
+      );
+
+      result.saveOutcomes.push(countedSave);
+      damageStageSaves.set(trigger, countedSave);
+    }
+
+    const counted = applyTriggerEffectActions(
+      entity,
+      source,
+      countedSave?.passed ?? false,
+      {
+        ambientEffects,
+        activeTurnActorId: options.sourceTurnActorId ?? entity.id,
+        endCast: options.endCast,
+        surroundings: options.surroundings,
+        moveToken: options.moveToken,
+        moveArea: options.moveArea,
+        collectNote: (note) => result.notes.push(note),
+      },
+    );
+
+    appliedAny ||= counted.applied;
+    countedTriggers.add(trigger);
+  }
+
+  let healedTotal = 0;
+  let tempHpGranted = 0;
+
+  /**
+   * Строка сводки хода: слагаемое, которое бросок не посчитал.
+   *
+   * @param note - строка сводки
+   */
+  const collectTurnNote = (note: string): void => {
+    result.notes.push(note);
+  };
+
+  // 1. Урон и лечение
+  for (const source of sources) {
+    const { effect, trigger, ambient, instance } = source;
+
+    // Отключённый эффект не действует — значит, и не бьёт. Своя аура без
+    // «действует и на носителя» бьёт других, а не того, кто её излучает
+    if (
+      isEffectDormant(effect)
+      || !sourceHasDamage(source)
+      || humanAskedTriggers.has(trigger)
+      || (instance && effect.aura && !effect.aura.applyToSelf)
+      || !allowTrigger(source)
+    ) {
+      continue;
+    }
+
+    const healing = rollTriggerHealing(effect, trigger, collectTurnNote);
+
+    if (healing) {
+      result.healingOutcomes.push(healing);
+      healedTotal += healing.healed;
+      tempHpGranted = Math.max(tempHpGranted, healing.tempHp);
+    }
+
+    let save: TurnSaveOutcome | null = null;
+
+    const damageEvent = saveEventOf(source);
+    const spec = buildTriggerSaveSpec(effect, trigger, damageEvent);
+
+    if (spec) {
+      // Спасбросок спросят у игрока: урон ждёт ответа. Автоматический исход
+      // спрашивать не нужно — бросать нечего
+      if (
+        triggerSaveNeedsRoll(trigger, entity, damageEvent.eventData)
+        && options.deferRecurringDamageSave?.(effect)
+      ) {
+        if (ambient) {
+          result.deferredAmbientDamageSaveEffects.push(effect);
+        } else if (instance) {
+          result.deferredDamageSaveEffects.push(effect);
+        }
+
+        result.deferredTriggers.push({
+          ...source,
+          stage: 'damage',
+          eventData: damageEvent.eventData,
+        });
+
+        deferredSources.add(trigger);
+
+        continue;
+      }
+
+      save = toTriggerSaveOutcome(
+        trigger,
+        settleTriggerSaveRoll(
+          entity,
+          trigger,
+          spec,
+          () => rollEffectSaveWithContext(spec, stats, savingThrowContext),
+          damageEvent.eventData,
+        ),
+      );
+
+      result.saveOutcomes.push(save);
+      damageStageSaves.set(trigger, save);
+    }
+
+    const damage = rollTriggerDamage(
+      entity,
+      effect,
+      trigger,
+      save?.passed ?? false,
+      stats,
+      { collectNote: collectTurnNote },
+    );
+
+    if (damage) {
+      result.damageTotal += damage.total;
+      result.damageOutcomes.push(damage);
+    }
+  }
+
+  if (result.damageTotal > 0) {
+    applyDamageToEntity(entity, result.damageTotal);
+    // Урон мог опустить хиты — спасброски снятия считаются уже по новому
+    // состоянию сущности
+    savingThrowContext = buildEffectSavingThrowContext(entity, ambientEffects);
+  }
+
+  const healingApplied =
+    (healedTotal > 0 || tempHpGranted > 0)
+    && applyTurnHealing(entity, healedTotal, tempHpGranted);
+
+  // 2. Снятие и наложение
+  const removedIds = new Set<string>();
+
+  for (const source of sources) {
+    const { effect, trigger, instance } = source;
+
+    // Отключённый эффект не действует — и сам себя спасброском не снимает
+    if (
+      isEffectDormant(effect)
+      || !sourceHasEffects(source)
+      || humanAskedTriggers.has(trigger)
+      || countedTriggers.has(trigger)
+      || deferredSources.has(trigger)
+      || (instance && removedIds.has(effect.id))
+      || !allowTrigger(source)
+    ) {
+      continue;
+    }
+
+    let save = damageStageSaves.get(trigger) ?? null;
+
+    const effectsEvent = saveEventOf(source);
+    const spec = buildTriggerSaveSpec(effect, trigger, effectsEvent);
+
+    if (!save && spec) {
+      // Спасбросок спросят у игрока: до ответа эффект держится.
+      // Автоматический исход спрашивать не нужно — бросать нечего
+      if (
+        triggerSaveNeedsRoll(trigger, entity, effectsEvent.eventData)
+        && options.deferRecurringSave?.(effect)
+      ) {
+        if (instance) {
+          result.deferredSaveEffects.push(effect);
+        }
+
+        result.deferredTriggers.push({
+          ...source,
+          stage: 'effects',
+          eventData: effectsEvent.eventData,
+        });
+
+        continue;
+      }
+
+      save = toTriggerSaveOutcome(
+        trigger,
+        settleTriggerSaveRoll(
+          entity,
+          trigger,
+          spec,
+          () => rollEffectSaveWithContext(spec, stats, savingThrowContext),
+          effectsEvent.eventData,
+        ),
+      );
+
+      result.saveOutcomes.push(save);
+    }
+
+    const { removes, applied } = applyTriggerEffectActions(
+      entity,
+      source,
+      save?.passed ?? false,
+      {
+        ambientEffects,
+        activeTurnActorId: options.sourceTurnActorId ?? entity.id,
+        endCast: options.endCast,
+        surroundings: options.surroundings,
+        moveToken: options.moveToken,
+        moveArea: options.moveArea,
+        collectNote: (note) => result.notes.push(note),
+      },
+    );
+
+    appliedAny ||= applied;
+
+    if (removes) {
+      removedIds.add(effect.id);
+
+      // Снятый этой же серией эффект больше не даёт кубик следующим спасброскам
+      savingThrowContext = {
+        ...savingThrowContext,
+        effects: savingThrowContext.effects.filter(
+          (activeEffect) => activeEffect.id !== effect.id,
+        ),
+      };
+    }
+  }
+
+  removeEffectsById(entity, removedIds);
+
+  result.changed =
+    result.damageTotal > 0
+    || removedIds.size > 0
+    || healingApplied
+    || appliedAny
+    || usageChanged;
+
+  return result;
+}
+
+/**
+ * Применяет разовый эффект области/ауры (`enter`/`exit`) по УЖЕ известному
+ * исходу спасброска: наносит урон и, если у эффекта есть длящаяся нагрузка
+ * (флаги/changes/состояние), вешает её копию как самостоятельный эффект со своей
+ * длительностью.
+ *
+ * Что даёт успех спасброска, решают гейты разового срабатывания
+ * (`readEffectLandingTrigger`) — те же, что у эффекта, наложенного атакой:
+ * половина урона без эффекта, «эффект даже при успехе», «только при успехе».
+ *
+ * Спасбросок отделён от применения: его бросает сервер (авто-спасброски) или
+ * игрок по запросу, и применение одно на оба пути.
+ *
+ * Мутирует `entity.system.hitPoints` (урон) и `entity.activeEffects` (статус).
+ *
+ * @param entity - сущность, на которую действует эффект
+ * @param effect - эффект области/ауры
+ * @param saveOutcome - исход спасброска эффекта; `null` — спасброска нет
+ * @param options - откуда пришёл эффект
+ * @returns исходы урона и спасброска для подписи в чате
+ */
+export function applyEntryEffect(
+  entity: DnDSceneEntity,
+  effect: ActiveEffect,
+  saveOutcome: TurnSaveOutcome | null,
+  options: EntryEffectOptions = {},
+): EntryEffectResult {
+  const ambientEffects = options.ambientEffects ?? [];
+  const stats = resolveActorStats(entity, [...ambientEffects]);
+
+  const source: EffectTriggerSource = {
+    effect,
+    trigger: readEffectLandingTrigger(effect, 'enter'),
+    ambient: false,
+    instance: false,
+    scope: effect.id,
+  };
+
+  // Эффект области «приземлился» всегда: промаха у зоны нет, её защита —
+  // только собственный спасбросок эффекта
+  const passed = effect.applySave ? saveOutcome?.passed === true : false;
+
+  const rolled = rollTriggerDamage(
+    entity,
+    effect,
+    source.trigger,
+    passed,
+    stats,
+    { collectNote: options.collectNote },
+  );
+
+  if (rolled) {
+    applyDamageToEntity(entity, rolled.total);
+  }
+
+  const { applied } = applyTriggerEffectActions(entity, source, passed, {
+    ambientEffects,
+    sourceAreaId: options.sourceAreaId,
+    activeTurnActorId: options.activeTurnActorId,
+  });
+
+  return { damageOutcome: rolled, saveOutcome, statusApplied: applied };
+}
+
+/**
+ * Срабатывание разового эффекта области/ауры, спасбросок которого бросает сам
+ * сервер: у сущности авто-спасброски, либо ядро не умеет спросить игрока.
+ *
+ * @param entity - сущность, на которую действует эффект
+ * @param effect - эффект области/ауры (с `areaTrigger` `enter`/`exit`)
+ * @param options - откуда пришёл эффект
+ * @returns исходы урона и спасброска для подписи в чате
+ */
+export function resolveEntryEffect(
+  entity: DnDSceneEntity,
+  effect: ActiveEffect,
+  options: EntryEffectOptions = {},
+): EntryEffectResult {
+  const saveOutcome = effect.applySave
+    ? rollEffectSaveOutcome(
+        entity,
+        buildApplySaveSpec(effect, effect.applySave, entity),
+        options.ambientEffects,
+      )
+    : null;
+
+  return applyEntryEffect(entity, effect, saveOutcome, options);
+}
+
+/**
+ * Явные срабатывания эффекта на вход или выход из зоны. Разовое срабатывание
+ * старых полей (`areaTrigger`, спасбросок и урон эффекта) идёт своим путём —
+ * `applyEntryEffect`.
+ *
+ * @param effect - эффект зоны
+ * @param event - вход или выход
+ * @param scope - источник для счётчика лимита (`area:<зона>`)
+ * @returns срабатывания с источником
+ */
+export function listPresenceTriggerSources(
+  effect: ActiveEffect,
+  event: 'enter' | 'exit',
+  scope: string,
+): EffectTriggerSource[] {
+  return listEffectListTriggers(effect)
+    .filter((trigger) => !isLegacyTrigger(trigger) && trigger.event === event)
+    .map((trigger) => ({
+      effect,
+      trigger,
+      ambient: false,
+      instance: false,
+      scope,
+    }));
+}
+
+/**
+ * Бросает на сервере спасбросок срабатывания.
+ *
+ * @param entity - кто бросает
+ * @param source - срабатывание с источником
+ * @param ambientEffects - ауры чужих токенов
+ * @param eventData - данные события (Сл формулой)
+ * @returns исход либо `null`, если спасброска нет
+ */
+export function rollTriggerSave(
+  entity: DnDSceneEntity,
+  source: EffectTriggerSource,
+  ambientEffects: readonly ActiveEffect[] = [],
+  eventData: TriggerEventData = {},
+): TurnSaveOutcome | null {
+  const event = { entity, eventData };
+  const spec = buildTriggerSaveSpec(source.effect, source.trigger, event);
+
+  if (!spec) {
+    return null;
+  }
+
+  return toTriggerSaveOutcome(
+    source.trigger,
+    settleTriggerSaveRoll(
+      entity,
+      source.trigger,
+      spec,
+      () => rollEffectSaveOutcome(entity, spec, ambientEffects),
+      eventData,
+    ),
+  );
+}
+
+/**
+ * Готовый исход спасброска без броска: условие автоматического успеха или
+ * провала выполнено.
+ *
+ * Значения кости здесь условные — 20 и 1, как у автопровала состояний: в чат
+ * идёт исход, а не подложный бросок.
+ *
+ * @param spec - что бросали бы
+ * @param passed - прошёл ли спасбросок
+ * @returns исход спасброска
+ */
+function buildAutoSaveOutcome(
+  spec: EffectSaveSpec,
+  passed: boolean,
+): TurnSaveOutcome {
+  const roll = passed ? AUTO_SAVE_SUCCESS_ROLL : AUTO_SAVE_FAILURE_ROLL;
+
+  return {
+    effectName: spec.effectName,
+    ability: spec.ability,
+    dc: spec.dc,
+    roll,
+    total: roll,
+    passed,
+  };
+}
+
+/**
+ * Нужен ли спасброску срабатывания настоящий бросок: автоматический исход его
+ * заменяет, и спрашивать игрока тогда не о чем.
+ *
+ * @param trigger - срабатывание
+ * @param entity - кто бросал бы
+ * @param eventData - данные события
+ * @returns `true`, если бросок нужен
+ */
+export function triggerSaveNeedsRoll(
+  trigger: EffectTrigger,
+  entity: DnDSceneEntity,
+  eventData: TriggerEventData = {},
+): boolean {
+  return (
+    trigger.save === undefined
+    || resolveTriggerAutoSaveOutcome(trigger.save, { entity, eventData })
+      === null
+  );
+}
+
+/**
+ * Исход спасброска срабатывания: автоматический, если его условие выполнено,
+ * иначе — настоящий бросок.
+ *
+ * @param entity - кто бросает
+ * @param trigger - срабатывание
+ * @param spec - что бросают
+ * @param roll - настоящий бросок
+ * @param eventData - данные события
+ * @returns исход спасброска
+ */
+function settleTriggerSaveRoll(
+  entity: DnDSceneEntity,
+  trigger: EffectTrigger,
+  spec: EffectSaveSpec,
+  roll: () => TurnSaveOutcome,
+  eventData: TriggerEventData,
+): TurnSaveOutcome {
+  const auto = trigger.save
+    ? resolveTriggerAutoSaveOutcome(trigger.save, { entity, eventData })
+    : null;
+
+  return auto === null ? roll() : buildAutoSaveOutcome(spec, auto);
+}
+
+/**
+ * Выполняет срабатывание входа или выхода по известному исходу спасброска:
+ * урон, лечение и наложения.
+ *
+ * @param entity - субъект
+ * @param source - срабатывание с источником
+ * @param save - исход спасброска; `null` — спасброска нет
+ * @param options - откуда пришли наложения
+ * @returns исходы для чата
+ */
+export function settlePresenceTrigger(
+  entity: DnDSceneEntity,
+  source: EffectTriggerSource,
+  save: TurnSaveOutcome | null,
+  options: EntryEffectOptions = {},
+): EntryEffectResult {
+  return settleTriggerOutcome(entity, entity, source, save, options);
+}
+
+/** Что собирают срабатывания на самой сущности — для сводки в чате */
+export interface SelfTriggerReport {
+  /** Строки сводки: «Сообщить», следующая ступень, списанная цена */
+  notes: string[];
+  /** Исходы срабатываний: урон, лечение, спасброски */
+  results: EntryEffectResult[];
+}
+
+/**
+ * Ответы владельца на вопросы срабатываний, заданные заранее: ключ
+ * срабатывания ({@link selfTriggerKey}) — выбранные варианты цены; у
+ * срабатывания без цены набор пустой. Нет ключа — согласия нет.
+ */
+export type SelfTriggerAnswers = ReadonlyMap<string, ReadonlySet<string>>;
+
+/**
+ * Ключ срабатывания в ответах владельца: источник эффекта и срабатывание.
+ *
+ * @param source - срабатывание с источником
+ * @returns ключ
+ */
+export function selfTriggerKey(source: EffectTriggerSource): string {
+  return `${source.scope}|${source.trigger.id}`;
+}
+
+/**
+ * Цена срабатывания, о котором владельца спросили заранее: списывается по его
+ * ответу. Цена не по карману, согласия нет или выбранного варианта уже не
+ * стало — срабатывание не состоится, и об этом есть строка сводки.
+ *
+ * @param entity - субъект (меняется)
+ * @param source - срабатывание с источником
+ * @param pickIds - ответ владельца; нет — согласия не было
+ * @returns срабатывание с числами либо строка сводки — почему оно отменено
+ */
+function settleAnsweredTriggerPay(
+  entity: DnDSceneEntity,
+  source: EffectTriggerSource,
+  pickIds: ReadonlySet<string> | undefined,
+): PreparedTriggerSource | string {
+  const { pay } = source.trigger;
+  const { name } = source.effect;
+
+  const shortfall = pay
+    ? planEffectPay(entity, pay, buildTriggerPayContext(source)).shortfall
+    : null;
+
+  if (shortfall !== null) {
+    return `${name}: ${TRIGGER_ASK_CHAT_NOTES.unaffordable} (${shortfall})`;
+  }
+
+  if (!pickIds) {
+    return `${name}: ${TRIGGER_ASK_CHAT_NOTES.declined}`;
+  }
+
+  return (
+    payTriggerPrice(entity, source, pickIds)
+    ?? `${name}: ${TRIGGER_ASK_CHAT_NOTES.payGone}`
+  );
+}
+
+/** С чем выполняются срабатывания на самой сущности */
+export interface SelfTriggerOptions {
+  /** Номер идущего раунда: расписание «на раунде N» */
+  combatRound?: number;
+  /**
+   * Видимость и свет сцены: условия «вижу / не вижу», «на свету / в темноте».
+   * Без опции фактов нет, и такие части условия НЕ выполняются.
+   */
+  sight?: SceneSight;
+  /**
+   * Выбранные варианты цены срабатывания (окно оплаты на клиенте). Нет поля —
+   * цена без выбора списывается сама, а цена с выбором срабатывание отменяет
+   */
+  payPickIds?: ReadonlySet<string>;
+  /**
+   * Ответы владельца на вопросы срабатываний. Поле задано — срабатывание,
+   * которое спрашивает разрешения (галочка «спрашивать», цена «Реакция», цена
+   * ресурсом), выполняется только по ответу: без него оно отменяется со
+   * строкой в сводку, а не идёт молча и бесплатно. Так идёт «после отдыха».
+   * Нет поля — согласием служит само нажатие («При действии», включение)
+   */
+  answers?: SelfTriggerAnswers;
+  /** Куда складывать исходы и строки сводки; нет — они не нужны */
+  report?: SelfTriggerReport;
+}
+
+/**
+ * Выполняет срабатывания на самой сущности без второй стороны и без окна
+ * броска: условие и лимит, цена ресурсом, спасбросок броском системы,
+ * действия. Так идут «при включении», «При действии» и «после отдыха».
+ *
+ * У «после отдыха» согласием нажатие не служит: владельца спрашивают заранее
+ * (`askSelfTriggers`), и сюда приходят его ответы (`options.answers`).
+ *
+ * @param entity - субъект (меняется)
+ * @param sources - срабатывания с источниками
+ * @param options - раунд боя, выбор цены и сбор сводки
+ */
+export function settleSelfTriggerSources(
+  entity: DnDSceneEntity,
+  sources: readonly EffectTriggerSource[],
+  options: SelfTriggerOptions = {},
+): void {
+  const { report, payPickIds, answers } = options;
+
+  for (const source of sources) {
+    // О срабатывании спросили владельца заранее: решает его ответ
+    const answered =
+      answers !== undefined && triggerAsksPermission(source.trigger);
+
+    // Лимит и заряд срабатывание с ценой или вопросом тратит после оплаты и
+    // согласия: не хватило ресурса или отказались — «раз в ход» остаётся
+    const holds = source.trigger.pay !== undefined || answered;
+
+    if (
+      !admitTrigger(
+        entity,
+        source,
+        withSceneSight(withCombatRound({}, options.combatRound), options.sight),
+        undefined,
+        holds,
+        report ? (note) => report.notes.push(note) : undefined,
+      )
+    ) {
+      continue;
+    }
+
+    let prepared: PreparedTriggerSource | null;
+
+    if (answered) {
+      const settled = settleAnsweredTriggerPay(
+        entity,
+        source,
+        answers.get(selfTriggerKey(source)),
+      );
+
+      // Отменённое срабатывание видно в сводке: молча оно не пропадает
+      if (typeof settled === 'string') {
+        report?.notes.push(settled);
+
+        continue;
+      }
+
+      prepared = settled;
+    } else {
+      prepared = payPickIds
+        ? payTriggerPrice(entity, source, payPickIds)
+        : settleUnaskedTriggerPay(entity, source);
+    }
+
+    if (!prepared || (holds && !takeTriggerAdmission(entity, source))) {
+      continue;
+    }
+
+    report?.notes.push(...prepared.notes);
+
+    const result = settlePresenceTrigger(
+      entity,
+      prepared.source,
+      rollTriggerSave(entity, prepared.source),
+      report ? { collectNote: (note) => report.notes.push(note) } : {},
+    );
+
+    report?.results.push(result);
+  }
+}
+
+/**
+ * Выполняет срабатывание по известному исходу спасброска: урон, лечение и
+ * наложения достаются получателю, снятие — эффекту субъекта, если эффект лежит
+ * на нём сам.
+ *
+ * @param subject - субъект: на нём эффект
+ * @param recipient - получатель действий (субъект или другая сторона)
+ * @param source - срабатывание с источником
+ * @param save - исход спасброска получателя; `null` — спасброска нет
+ * @param options - откуда пришли наложения и чей сейчас ход
+ * @returns исходы для чата
+ */
+export function settleTriggerOutcome(
+  subject: DnDSceneEntity,
+  recipient: DnDSceneEntity,
+  source: EffectTriggerSource,
+  save: TurnSaveOutcome | null,
+  options: EntryEffectOptions = {},
+): EntryEffectResult {
+  const ambientEffects = options.ambientEffects ?? [];
+  const stats = resolveActorStats(recipient, [...ambientEffects]);
+  const passed = save?.passed ?? false;
+
+  const damage = rollTriggerDamage(
+    recipient,
+    source.effect,
+    source.trigger,
+    passed,
+    stats,
+    {
+      // Крит атаки удваивает кости только её цели
+      critical: options.criticalTargetId === recipient.id,
+      collectNote: options.collectNote,
+    },
+  );
+
+  if (damage) {
+    applyDamageToEntity(recipient, damage.total);
+  }
+
+  const healing = rollTriggerHealing(
+    source.effect,
+    source.trigger,
+    options.collectNote,
+  );
+
+  const restored = healing
+    ? restoreEntityHitPoints(recipient, healing.healed, healing.tempHp)
+    : null;
+
+  const healed =
+    restored !== null && (restored.healed > 0 || restored.tempHp > 0);
+
+  const { applied, removes } = applyTriggerEffectActions(
+    recipient,
+    source,
+    passed,
+    options,
+  );
+
+  const removed =
+    removes
+    && (subject.activeEffects ?? []).some(
+      (effect) => effect.id === source.effect.id,
+    );
+
+  if (removed) {
+    removeEffectsById(subject, new Set([source.effect.id]));
+  }
+
+  return {
+    damageOutcome: damage,
+    // В сводку — сколько восстановилось на деле; выпавшее — если влезло меньше
+    healingOutcome:
+      healing && restored
+        ? { ...healing, ...restored, rolled: healing.healed }
+        : null,
+    saveOutcome: save,
+    statusApplied: applied || healed || removed,
+  };
+}
+
+/** Что известно о броске атаки одной стороне */
+export interface AttackRollTriggerOptions {
+  /** Сторона участвует в идущем бою */
+  inCombat?: boolean;
+  /** Чей сейчас ход: срок наложенного состояния считается от него */
+  activeTurnActorId?: string | null;
+  /** Номер идущего раунда: расписание «на раунде N» */
+  combatRound?: number;
+  /**
+   * Видимость и свет сцены: условия «вижу / не вижу», «на свету / в темноте».
+   * Без опции фактов нет, и такие части условия НЕ выполняются.
+   */
+  sight?: SceneSight;
+  /** Другая сторона: цель для атакующего, атакующий для цели */
+  other?: DnDSceneEntity;
+  /** Режим броска атаки */
+  roll?: TriggerEventData['roll'];
+  /** Чем бьют: вид атаки и её характеристика — для условий об атаке */
+  attack?: TriggerEventData['attack'];
+}
+
+/** Итог срабатываний на броске атаки */
+export interface AttackRollTriggersResult {
+  /** Сущность изменилась: сняты или наложены эффекты, записан счётчик */
+  changed: boolean;
+  /** Изменились счётчики лимитов (`system.effectUsage`) */
+  usageChanged: boolean;
+}
+
+/** Где выполняется срабатывание броска атаки */
+export type AttackRollTriggerPlace = 'client' | 'server';
+
+/**
+ * Срабатывания броска атаки стороны на её эффектах, надетых предметах и
+ * чертах: те, что клиент выполняет до броска, либо те, что после броска
+ * выполняет сервер.
+ *
+ * @param entity - сторона атаки
+ * @param role - атакующий или цель
+ * @param place - где выполняется срабатывание
+ * @returns срабатывания с источником
+ */
+export function listAttackRollSources(
+  entity: DnDSceneEntity,
+  role: EffectTriggerAttackRole,
+  place: AttackRollTriggerPlace,
+): EffectTriggerSource[] {
+  return listCarrierEventSources(entity, (effect) =>
+    listEffectEventTriggers(effect, 'attackRoll').filter(
+      (trigger) =>
+        (trigger.role ?? DEFAULT_TRIGGER_ATTACK_ROLE) === role
+        && isClientAttackRollTrigger(trigger) === (place === 'client'),
+    ),
+  );
+}
+
+/**
+ * Срабатывания на броске атаки у одной стороны: атакующего (`attacker`, «своя
+ * следующая атака») или цели (`target`, «следующая атака по носителю»).
+ *
+ * Бросок атаки делает клиент, поэтому спасброска и урона тут нет: срабатывание
+ * со спасброском пропускается, из действий выполняются снятие и наложения.
+ * Мутирует сущность.
+ *
+ * @param entity - сторона атаки
+ * @param role - роль стороны
+ * @param options - бой, другая сторона и режим броска для условий
+ * @param options.inCombat - сторона участвует в идущем бою
+ * @param options.activeTurnActorId - чей сейчас ход
+ * @param options.other - другая сторона атаки
+ * @param options.roll - режим броска атаки
+ * @returns что изменилось
+ */
+export function runAttackRollTriggers(
+  entity: DnDSceneEntity,
+  role: EffectTriggerAttackRole,
+  options: AttackRollTriggerOptions = {},
+): AttackRollTriggersResult {
+  const usageBefore = JSON.stringify(entity.system.effectUsage ?? null);
+  const removedIds = new Set<string>();
+
+  const eventData = withSceneSight(
+    withCombatRound(
+      {
+        other: options.other,
+        roll: options.roll,
+        ...(options.attack ? { attack: options.attack } : {}),
+      },
+      options.combatRound,
+    ),
+    options.sight,
+  );
+
+  let applied = false;
+
+  for (const source of listAttackRollSources(entity, role, 'client')) {
+    if (!admitTrigger(entity, source, eventData, options.inCombat)) {
+      continue;
+    }
+
+    const result = applyTriggerEffectActions(entity, source, false, {
+      activeTurnActorId: options.activeTurnActorId,
+    });
+
+    if (result.removes) {
+      removedIds.add(source.effect.id);
+    }
+
+    applied ||= result.applied;
+  }
+
+  removeEffectsById(entity, removedIds);
+
+  const usageChanged =
+    JSON.stringify(entity.system.effectUsage ?? null) !== usageBefore;
+
+  return {
+    changed: removedIds.size > 0 || applied || usageChanged,
+    usageChanged,
+  };
+}

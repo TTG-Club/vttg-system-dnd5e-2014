@@ -7,18 +7,189 @@
  * Используется в dnd5eMacros.ts (хотбар) и DiceRollModal.vue (лист персонажа).
  */
 
-import type { DiceRollData, DistanceUnit } from '@vtt/shared';
+import type {
+  AbilityType,
+  DiceRollData,
+  DistanceUnit,
+  SkillType,
+  WeaponRangeType,
+} from '@vtt/shared';
 
-import type { CreatureAction } from './creatureTypes.js';
+import type {
+  EffectFlagKey,
+  EffectTargetKey,
+  ResolvedActorStats,
+} from './activeEffectTypes.js';
+import type { AttackChatKind } from './attackChatBlocks.js';
+import type { ConditionRef } from './conditionKeys.js';
+import type {
+  CreatureAction,
+  CreatureActionRangeType,
+} from './creatureTypes.js';
 import type { DamageApplyResult } from './damageUtils.js';
-import type { GameItem, Spell } from './dndEntities.js';
+import type { DnDGameItem, Spell } from './dndEntities.js';
+import type { EffectTriggerSaveMode } from './effectTriggerTypes.js';
+
+import { z } from 'zod';
 
 import { convertDistance } from '@vtt/shared';
+
+import {
+  buildSaveVsConditionFlag,
+  CONCENTRATION_SAVE_KEY,
+} from './activeEffectTypes.js';
+import {
+  buildAttackChatBlock,
+  buildDamageChatBlock,
+} from './attackChatBlocks.js';
+import { SPELL_SAVE_DC_BASE } from './consts.js';
 import { getShortDamageTypeLabel } from './damageConstants.js';
 import { formatDamageDefenseSuffix } from './damageUtils.js';
+import { formatDiceFormula } from './diceFormula.js';
+import {
+  getSkillAdvantageFlagKey,
+  getSkillDisadvantageFlagKey,
+} from './skills.js';
 
 /** Досягаемость по умолчанию в футах (рукопашные атаки и заклинания касания) */
 export const DEFAULT_REACH_FEET = 5;
+
+/**
+ * Дальность оружия или действия существа. «Рукопашная или дальнобойная»
+ * (`meleeOrRanged`) без выбора вида считается рукопашной — так она работала
+ * до выбора при броске; сам бросок идёт уже выбранным видом
+ * (`withCreatureActionAttackKind`).
+ */
+export type AttackRangeType = WeaponRangeType | CreatureActionRangeType;
+
+/**
+ * Форма d20-проверки, достаточная для натуральной кости: первая группа костей —
+ * базовая d20, за ней могут идти бонусные кости.
+ */
+const d20CheckRollSchema = z.object({
+  dice: z
+    .tuple([
+      z.object({
+        sides: z.literal(20),
+        values: z.array(z.number()),
+        dropped: z.array(z.number()),
+      }),
+    ])
+    .rest(z.unknown()),
+});
+
+/**
+ * Читает оставленную d20 из результата броска, не смешивая её с бонусными
+ * костями. Принимает и чужие данные — ответ другого клиента проверяется схемой,
+ * а не принимается на веру.
+ *
+ * @param rollData - результат d20-проверки, в том числе пришедший по сети
+ * @returns натуральная кость либо undefined, если единственной оставленной d20 нет
+ */
+export function parseNaturalD20Roll(rollData: unknown): number | undefined {
+  const parsed = d20CheckRollSchema.safeParse(rollData);
+
+  if (!parsed.success) {
+    return undefined;
+  }
+
+  const [baseDice] = parsed.data.dice;
+
+  // `dropped` хранит индексы костей, отброшенных преимуществом или помехой
+  const keptValues = baseDice.values.filter(
+    (_value, index) => !baseDice.dropped.includes(index),
+  );
+
+  return keptValues.length === 1 ? keptValues[0] : undefined;
+}
+
+/**
+ * Читает оставленную d20 собственного броска. Такой бросок собран формулой
+ * системы, и отсутствие d20 в нём — ошибка кода, а не данных.
+ *
+ * @param rollData - результат стандартной d20-проверки
+ * @returns натуральная кость, определяющая критический успех или промах
+ */
+export function getNaturalD20Roll(rollData: DiceRollData): number {
+  const naturalRoll = parseNaturalD20Roll(rollData);
+
+  if (naturalRoll === undefined) {
+    throw new Error(
+      'В результате проверки отсутствует единственная оставленная d20',
+    );
+  }
+
+  return naturalRoll;
+}
+
+/**
+ * Ключ бонусов атаки по дальности оружия или действия.
+ *
+ * @param rangeType - дальность оружия или действия
+ * @returns `attack.ranged` для дальнобойного, иначе `attack.melee`
+ */
+export function getAttackBonusKey(
+  rangeType: AttackRangeType | undefined,
+): EffectTargetKey {
+  return rangeType === 'ranged' ? 'attack.ranged' : 'attack.melee';
+}
+
+/**
+ * Вид атаки для флагов по дальности оружия или действия.
+ *
+ * @param rangeType - дальность оружия или действия
+ * @returns `ranged` для дальнобойного, иначе `melee`
+ */
+export function getAttackFlagCategory(
+  rangeType: AttackRangeType | undefined,
+): AttackFlagCategory {
+  return rangeType === 'ranged' ? 'ranged' : 'melee';
+}
+
+/** Вид атаки по ключу прибавки к атаке */
+const ATTACK_FLAG_CATEGORY_BY_KEY: Partial<
+  Record<EffectTargetKey, AttackFlagCategory>
+> = {
+  'attack.melee': 'melee',
+  'attack.ranged': 'ranged',
+  'attack.spell': 'spell',
+};
+
+/**
+ * Вид атаки, к броску которой относятся ключи прибавок.
+ *
+ * @param keys - ключи прибавок броска
+ * @returns вид атаки либо `undefined`, если бросок не атака
+ */
+export function getAttackFlagCategoryOfKeys(
+  keys: readonly EffectTargetKey[],
+): AttackFlagCategory | undefined {
+  return keys
+    .map((key) => ATTACK_FLAG_CATEGORY_BY_KEY[key])
+    .find((attackType) => attackType !== undefined);
+}
+
+/**
+ * Сл спасброска от оружия: 8 + модификатор атаки этим оружием.
+ *
+ * @param attackModifier - модификатор атаки оружием
+ * @returns сложность
+ */
+export function resolveWeaponSaveDc(attackModifier: number): number {
+  return SPELL_SAVE_DC_BASE + attackModifier;
+}
+
+/**
+ * Ключ бонусов урона по дальности оружия или действия.
+ *
+ * @param rangeType - дальность оружия или действия
+ * @returns `damage.ranged` для дальнобойного, иначе `damage.melee`
+ */
+export function getDamageBonusKey(
+  rangeType: AttackRangeType | undefined,
+): EffectTargetKey {
+  return rangeType === 'ranged' ? 'damage.ranged' : 'damage.melee';
+}
 
 /** Параметры для определения результата атаки */
 interface AttackResolveParams {
@@ -26,10 +197,17 @@ interface AttackResolveParams {
   total: number;
   /** Модификатор атаки (мод. характеристики + мастерство + бонус) */
   attackModifier: number;
-  /** Класс доспеха цели */
-  targetAc: number;
+  /** Натуральная оставленная кость d20, отдельно от бонусных костей. */
+  naturalRoll: number;
+  /**
+   * Класс доспеха цели; `null` — цель не выбрана: попал ли бросок, решает
+   * мастер по числу в чате
+   */
+  targetAc: number | null;
   /** Активные флаги цели (для иммунитета к критам и т.п.) */
   targetFlags?: ReadonlySet<string>;
+  /** С какой натуральной кости крит (по умолчанию 20) */
+  critThreshold?: number;
 }
 
 /** Результат определения атаки */
@@ -40,9 +218,23 @@ export interface AttackResult {
   isCriticalHit: boolean;
   /** Критический промах (натуральная 1) */
   isCriticalMiss: boolean;
-  /** Попадание (крит или total >= AC, но не крит. промах) */
+  /**
+   * Попадание (крит или total >= AC, но не крит. промах). Без цели — любой
+   * бросок, кроме критического промаха: урон катится, а засчитывает его мастер
+   */
   isHit: boolean;
+  /**
+   * Цели нет, и исход броска неизвестен. Крит и критический промах известны
+   * и без цели — их решает сама кость
+   */
+  isHitUnknown: boolean;
 }
+
+/** Натуральная 20: крит по правилам и всегда попадание */
+const NATURAL_CRIT_ROLL = 20;
+
+/** Флаг «любое попадание по этому существу — критическое» */
+export const FORCE_CRITICAL_FLAG = 'attacksAgainst.forceCritical';
 
 /**
  * Определяет результат броска атаки D&D 5e.
@@ -51,27 +243,71 @@ export interface AttackResult {
  * @returns результат определения попадания
  */
 export function resolveAttackRoll(params: AttackResolveParams): AttackResult {
-  const naturalRoll = params.total - params.attackModifier;
+  const naturalRoll = params.naturalRoll;
   const isCriticalMiss = naturalRoll === 1;
 
   // Адамантиновая броня: критический удар становится обычным попаданием
   const hasCritImmunity =
     params.targetFlags?.has('defense.critImmunity') ?? false;
 
-  const isCriticalHit = naturalRoll === 20 && !hasCritImmunity;
+  // «Улучшенный крит» опускает порог, но единица по-прежнему промах
+  const critThreshold = Math.min(
+    NATURAL_CRIT_ROLL,
+    params.critThreshold ?? NATURAL_CRIT_ROLL,
+  );
+
+  // «Попадание по этому существу — крит»: парализованный, без сознания. Критом
+  // становится только атака, которая уже попала, — промах им не делается.
+  // Иммунитет к критам сильнее — адамантиновая броня спасает и от него
+  const forcesCritical = params.targetFlags?.has(FORCE_CRITICAL_FLAG) ?? false;
+
+  // Без цели сравнивать не с чем: бросок считается попавшим, пока кость не
+  // сказала обратного, — урон катится сразу, а засчитывает его мастер
+  const hitsByTotal =
+    params.targetAc === null || params.total >= params.targetAc;
+
+  const isCriticalHit =
+    (naturalRoll >= critThreshold || (forcesCritical && hitsByTotal))
+    && !isCriticalMiss
+    && !hasCritImmunity;
 
   const isHit =
-    naturalRoll === 20 || (!isCriticalMiss && params.total >= params.targetAc);
+    naturalRoll === NATURAL_CRIT_ROLL
+    || (!isCriticalMiss && (isCriticalHit || hitsByTotal));
 
-  return { naturalRoll, isCriticalHit, isCriticalMiss, isHit };
+  const isHitUnknown =
+    params.targetAc === null && !isCriticalHit && !isCriticalMiss;
+
+  return { naturalRoll, isCriticalHit, isCriticalMiss, isHit, isHitUnknown };
+}
+
+/**
+ * Попал ли бросок наверняка: без цели обычный бросок попаданием не считается —
+ * обработчики попадания (эффекты «при попадании») ждут решения мастера.
+ *
+ * @param result - результат броска атаки
+ * @returns `true`, если попадание известно
+ */
+export function isKnownAttackHit(result: AttackResult): boolean {
+  return result.isHit && !result.isHitUnknown;
+}
+
+/**
+ * Попадание для сообщения серверу о броске: без цели оно неизвестно.
+ *
+ * @param result - результат броска атаки
+ * @returns попал ли бросок; `undefined` — исход решает мастер
+ */
+export function resolveAttackLanded(result: AttackResult): boolean | undefined {
+  return result.isHitUnknown ? undefined : result.isHit;
 }
 
 /** Параметры для формирования лейбла атаки */
 interface AttackLabelParams {
   /** Название оружия или контекст броска */
   weaponName: string;
-  /** Имя цели */
-  targetName: string;
+  /** Имя цели; нет — цель не выбрана */
+  targetName?: string;
   /** Результат определения попадания */
   result: AttackResult;
   /** Атака с помехой (дальняя дистанция) */
@@ -81,26 +317,32 @@ interface AttackLabelParams {
 /**
  * Формирует лейбл для броска атаки с результатом попадания.
  *
- * Пример: `Атака — Длинный меч → Гоблин | ✅ Попадание!`
+ * Пример: `Атака — Длинный меч → Гоблин | Попадание!`. Эмодзи в подписи нет:
+ * это запасной текст карточки, а исход в ней называет плашка блока.
  *
  * @param params - параметры для лейбла
  * @returns текст лейбла
  */
 export function buildAttackLabel(params: AttackLabelParams): string {
-  let label = `Атака\u00A0—\u00A0${params.weaponName}\u00A0→\u00A0${params.targetName}`;
+  let label = `Атака\u00A0—\u00A0${params.weaponName}`;
+
+  if (params.targetName) {
+    label += `\u00A0→\u00A0${params.targetName}`;
+  }
 
   if (params.isDisadvantage) {
-    label += '\u00A0|\u00A0⚠️\u00A0Помеха\u00A0(дальняя\u00A0дистанция)';
+    label += '\u00A0|\u00A0Помеха\u00A0(дальняя\u00A0дистанция)';
   }
 
   if (params.result.isCriticalHit) {
-    label += '\u00A0|\u00A0✨\u00A0КРИТ!';
+    label += '\u00A0|\u00A0Крит!';
   } else if (params.result.isCriticalMiss) {
-    label += '\u00A0|\u00A0❌\u00A0Крит.\u00A0промах!';
-  } else if (params.result.isHit) {
-    label += '\u00A0|\u00A0✅\u00A0Попадание!';
-  } else {
-    label += '\u00A0|\u00A0❌\u00A0Промах!';
+    label += '\u00A0|\u00A0Крит.\u00A0промах!';
+  } else if (!params.result.isHitUnknown) {
+    // Исход без цели решает мастер — тогда подпись его не называет
+    label += params.result.isHit
+      ? '\u00A0|\u00A0Попадание!'
+      : '\u00A0|\u00A0Промах!';
   }
 
   return label;
@@ -143,6 +385,66 @@ export function buildDamageLabel(
   return label;
 }
 
+/** Итог одного снаряда по цели — строка под целью в сводке заклинания */
+export interface ProjectileOutcome {
+  /** Номер снаряда в касте: сквозной по всем целям, как в бросках атаки */
+  number: number;
+  /** Выпавший урон снаряда до защит цели; `null` — снаряд промахнулся */
+  damage: number | null;
+  /**
+   * Формула, которой брошен урон этого снаряда: у крита кости уже удвоены,
+   * поэтому она у каждого снаряда своя, а не одна на каст
+   */
+  formula?: string;
+  /** Критическое попадание (кости этого снаряда удвоены) */
+  critical?: boolean;
+}
+
+/** Подписи строк снарядов в сводке заклинания */
+const PROJECTILE_OUTCOME_LABELS = {
+  projectile: 'Снаряд',
+  miss: 'промах',
+  critical: 'крит',
+} as const;
+
+/**
+ * Отступ строки снаряда: чат сохраняет пробелы, и строки снарядов читаются
+ * вложенными в строку своей цели.
+ */
+const PROJECTILE_LINE_PREFIX = '   • ';
+
+/**
+ * Строка одного снаряда под целью: «• Снаряд 2: 1к4 + 1 = 5»,
+ * «• Снаряд 3: 2к10 = 12 (крит)», «• Снаряд 4: промах».
+ *
+ * Одна строка «(1к4+1)×3: -10 HP» не говорила, сколько нанёс каждый снаряд.
+ * Значение — выпавшее ДО защит цели: при сопротивлении итог в HP у цели
+ * меньше суммы снарядов, и это объясняет пометка защиты в строке цели.
+ *
+ * @param outcome - итог снаряда
+ * @returns строка для сводки в чате
+ */
+export function formatProjectileOutcomeLine(
+  outcome: ProjectileOutcome,
+): string {
+  const head = `${PROJECTILE_LINE_PREFIX}${PROJECTILE_OUTCOME_LABELS.projectile} ${outcome.number}`;
+
+  if (outcome.damage === null) {
+    return `${head}: ${PROJECTILE_OUTCOME_LABELS.miss}`;
+  }
+
+  const criticalSuffix = outcome.critical
+    ? ` (${PROJECTILE_OUTCOME_LABELS.critical})`
+    : '';
+
+  // Формула рядом с итогом: сверить бросок, не листая кубики в чате
+  const formulaPart = outcome.formula
+    ? `${formatDiceFormula(outcome.formula)} = `
+    : '';
+
+  return `${head}: ${formulaPart}${outcome.damage}${criticalSuffix}`;
+}
+
 const DOUBLE_DICE_REGEX = /(\d+)(к|d)(\d+)/gi;
 
 /**
@@ -160,18 +462,92 @@ export function doubleDiceInFormula(formula: string): string {
   );
 }
 
+/**
+ * Возвращает формулу к виду до крита: делит пополам число костей, которое
+ * удвоил {@link doubleDiceInFormula}.
+ *
+ * @param formula - формула с удвоенными костями (напр. "4к6+3")
+ * @returns формула без костей крита (напр. "2к6+3") либо `undefined`, если
+ *   число каких-то костей нечётное: такую формулу крит не удваивал
+ */
+export function halveDiceInFormula(formula: string): string | undefined {
+  let isHalvable = true;
+
+  const halved = formula.replace(
+    DOUBLE_DICE_REGEX,
+    (_match, count, separator, sides) => {
+      isHalvable &&= Number(count) % 2 === 0;
+
+      return `${Number(count) / 2}${separator}${sides}`;
+    },
+  );
+
+  return isHalvable ? halved : undefined;
+}
+
+/** Кости формулы, которые удваивает крит: сколько их и с каким знаком */
+export interface CritDiceTerm {
+  /** Число костей */
+  count: number;
+  /** Знак слагаемого: «2к6 − 1к4» вычитает вторую кость и на крите */
+  sign: 1 | -1;
+  /** Запись слагаемого как в формуле: «2к6» */
+  body: string;
+}
+
+/**
+ * Кости формулы в порядке записи — те же, что удваивает
+ * {@link doubleDiceInFormula}.
+ *
+ * @param formula - формула урона
+ * @returns кости со знаком их слагаемого
+ */
+export function listCritDiceTerms(formula: string): CritDiceTerm[] {
+  return [...formula.matchAll(DOUBLE_DICE_REGEX)].map((match) => ({
+    count: Number(match[1]),
+    sign: formula.slice(0, match.index).trimEnd().endsWith('-') ? -1 : 1,
+    body: match[0],
+  }));
+}
+
+/**
+ * Кости крита — формула из одних костей: по правилам 5e критическое
+ * попадание бросает кости урона ещё раз, а модификаторы не повторяет.
+ *
+ * @param formula - формула урона без крита (напр. "2к6+3")
+ * @returns формула костей крита (напр. "2к6") либо `undefined`, если костей
+ *   в формуле нет
+ */
+export function buildCritDiceFormula(formula: string): string | undefined {
+  const terms = listCritDiceTerms(formula);
+
+  if (terms.length === 0) {
+    return undefined;
+  }
+
+  return terms
+    .map((term, index) => {
+      if (index === 0) {
+        return term.sign < 0 ? `-${term.body}` : term.body;
+      }
+
+      return term.sign < 0 ? ` - ${term.body}` : ` + ${term.body}`;
+    })
+    .join('');
+}
+
 /** Параметры для полного двухэтапного броска атаки */
 export interface PerformAttackParams {
   /** Формула атаки (напр. "1к20+5") */
   attackFormula: string;
   /** Модификатор атаки */
   attackModifier: number;
-  /** Класс доспеха цели */
-  targetAc: number;
+  /** Класс доспеха цели; `null` — цель не выбрана, исход решает мастер */
+  targetAc: number | null;
   /** Название оружия */
   weaponName: string;
-  /** Имя цели */
-  targetName: string;
+  /** Имя цели; нет — цель не выбрана */
+  targetName?: string;
   /** Атака с помехой */
   isDisadvantage?: boolean;
   /** Формула урона (если есть) */
@@ -182,6 +558,10 @@ export interface PerformAttackParams {
   targetFlags?: ReadonlySet<string>;
   /** Тип урона (если есть) */
   damageType?: string;
+  /** С какой натуральной кости крит (по умолчанию 20) */
+  critThreshold?: number;
+  /** Вид атаки — от него значок в карточке чата; не задан — рукопашная */
+  attackKind?: AttackChatKind;
 }
 
 /** Результат двухэтапной атаки */
@@ -199,7 +579,8 @@ export interface PerformAttackResult {
  *
  * @param params - параметры атаки
  * @param rollFn - функция для парсинга и броска кубиков (parseAndRoll)
- * @param applyDamageFn - функция для применения урона к цели (опционально)
+ * @param applyDamageFn - функция для применения урона к цели (опционально);
+ *   третьим аргументом — крит: он нужен событиям урона цели
  * @returns результат атаки с данными обоих бросков
  */
 export function performTwoStageAttack(
@@ -208,21 +589,32 @@ export function performTwoStageAttack(
   applyDamageFn?: (
     damage: number,
     isHealing: boolean,
+    critical: boolean,
   ) => DamageApplyResult | null,
 ): PerformAttackResult {
   const attackRoll = rollFn(params.attackFormula);
 
   const attackResult = resolveAttackRoll({
     total: attackRoll.total,
+    naturalRoll: getNaturalD20Roll(attackRoll),
     attackModifier: params.attackModifier,
     targetAc: params.targetAc,
     targetFlags: params.targetFlags,
+    critThreshold: params.critThreshold,
   });
 
   attackRoll.label = buildAttackLabel({
     weaponName: params.weaponName,
     targetName: params.targetName,
     result: attackResult,
+    isDisadvantage: params.isDisadvantage,
+  });
+
+  attackRoll.block = buildAttackChatBlock({
+    name: params.weaponName,
+    targetName: params.targetName,
+    result: attackResult,
+    attackKind: params.attackKind,
     isDisadvantage: params.isDisadvantage,
   });
 
@@ -239,7 +631,11 @@ export function performTwoStageAttack(
     let applyResult: DamageApplyResult | null = null;
 
     if (params.targetActorId && applyDamageFn) {
-      applyResult = applyDamageFn(damageRoll.total, false);
+      applyResult = applyDamageFn(
+        damageRoll.total,
+        false,
+        attackResult.isCriticalHit,
+      );
     }
 
     damageRoll.label = buildDamageLabel(
@@ -248,14 +644,27 @@ export function performTwoStageAttack(
       params.damageType,
     );
 
+    damageRoll.block = buildDamageChatBlock(
+      applyResult,
+      params.damageType,
+      damageRoll.total,
+    );
+
     output.damageRoll = damageRoll;
   }
 
   return output;
 }
 
+/** Режимы броска атаки */
+export const ATTACK_ROLL_MODES = [
+  'normal',
+  'advantage',
+  'disadvantage',
+] as const;
+
 /** Режим броска атаки */
-export type AttackRollMode = 'normal' | 'advantage' | 'disadvantage';
+export type AttackRollMode = (typeof ATTACK_ROLL_MODES)[number];
 
 /** Категория атаки для подбора профильных флагов преимущества/помехи */
 export type AttackFlagCategory = 'melee' | 'ranged' | 'spell';
@@ -276,9 +685,12 @@ export interface AttackRollModeParams {
  * Определяет итоговый режим броска атаки D&D 5e по флагам атакующего и цели.
  *
  * Учитывает общие флаги (`attack.advantage`/`attack.disadvantage`), профильные
- * по категории атаки (`attack.<melee|ranged|spell>.*`), флаги «атак по цели»
- * (`attacksAgainst.*`) и внешнюю помеху `forceDisadvantage` (дистанция). По
- * правилу 5e преимущество и помеха взаимно гасятся до «обычного» броска.
+ * по категории атаки (`attack.<melee|ranged|spell>.*`), флаги «атак по цели» —
+ * общие (`attacksAgainst.*`) и профильные по категории
+ * (`attacksAgainst.<melee|ranged|spell>.*`, ими описан Лежащий ничком: рукопашные
+ * по нему с преимуществом, дальнобойные с помехой) — и внешнюю помеху
+ * `forceDisadvantage` (дистанция). По правилу 5e преимущество и помеха взаимно
+ * гасятся до «обычного» броска.
  *
  * Единая точка для всех путей атаки (оружие/заклинания актёра, действия и
  * заклинания существа), чтобы флаги атакующего читались одинаково везде.
@@ -291,26 +703,355 @@ export function resolveAttackRollMode(
 ): AttackRollMode {
   const { attackerFlags, attackType, targetFlags, forceDisadvantage } = params;
 
+  const hasFlagOfKind = (kind: AttackRollModeKind): boolean => {
+    const keys = listAttackRollModeFlags(kind, attackType);
+
+    return (
+      keys.attacker.some((flag) => attackerFlags.has(flag))
+      || keys.target.some((flag) => targetFlags?.has(flag) ?? false)
+    );
+  };
+
+  return combineRollMode(
+    hasFlagOfKind('advantage'),
+    forceDisadvantage === true || hasFlagOfKind('disadvantage'),
+  );
+}
+
+/** Сторона режима броска: преимущество или помеха */
+export type AttackRollModeKind = 'advantage' | 'disadvantage';
+
+/** Флаги, дающие атаке преимущество или помеху, по сторонам боя */
+export interface AttackRollModeFlags {
+  /** Флаги атакующего: общий и профильный по виду атаки */
+  attacker: string[];
+  /** Флаги цели «атаки по носителю»: общий и профильный */
+  target: string[];
+}
+
+/**
+ * Какие флаги дают атаке этого вида преимущество или помеху. Один список на
+ * расчёт режима и на объяснение, откуда режим взялся, — чтобы показанная
+ * причина и сам бросок не разошлись.
+ *
+ * @param kind - преимущество или помеха
+ * @param attackType - вид атаки
+ * @returns флаги атакующего и цели
+ */
+export function listAttackRollModeFlags(
+  kind: AttackRollModeKind,
+  attackType: AttackFlagCategory,
+): AttackRollModeFlags {
+  return {
+    attacker: [`attack.${kind}`, `attack.${attackType}.${kind}`],
+    target: [`attacksAgainst.${kind}`, `attacksAgainst.${attackType}.${kind}`],
+  };
+}
+
+/**
+ * Режим броска по наличию преимущества и помехи: по правилу 5e они гасятся.
+ *
+ * @param hasAdvantage - есть преимущество
+ * @param hasDisadvantage - есть помеха
+ * @returns режим броска
+ */
+export function combineRollMode(
+  hasAdvantage: boolean,
+  hasDisadvantage: boolean,
+): AttackRollMode {
+  if (hasAdvantage === hasDisadvantage) {
+    return 'normal';
+  }
+
+  return hasAdvantage ? 'advantage' : 'disadvantage';
+}
+
+/**
+ * Определяет режим броска инициативы по активным флагам сущности.
+ *
+ * Инициатива — проверка Ловкости, поэтому преимущество/помеху ей дают три
+ * группы флагов: свои (`initiative.*`), профильные по Ловкости
+ * (`abilityCheck.*.dexterity`) и общие на все проверки (`abilityCheck.*`).
+ * По правилу 5e преимущество и помеха взаимно гасятся.
+ *
+ * Единая точка для листа персонажа, листа существа и окна броска из трекера
+ * инициативы — чтобы одни и те же флаги везде читались одинаково.
+ *
+ * @param flags - активные флаги сущности (`ResolvedActorStats.activeFlags`)
+ * @returns режим броска: обычный / преимущество / помеха
+ */
+export function resolveInitiativeRollMode(
+  flags: ReadonlySet<string>,
+): AttackRollMode {
   const hasAdvantage =
-    attackerFlags.has('attack.advantage')
-    || attackerFlags.has(`attack.${attackType}.advantage`)
-    || (targetFlags?.has('attacksAgainst.advantage') ?? false);
+    flags.has('initiative.advantage')
+    || flags.has('abilityCheck.advantage.dexterity')
+    || flags.has('abilityCheck.advantage');
 
   const hasDisadvantage =
-    forceDisadvantage === true
-    || attackerFlags.has('attack.disadvantage')
-    || attackerFlags.has(`attack.${attackType}.disadvantage`)
-    || (targetFlags?.has('attacksAgainst.disadvantage') ?? false);
+    flags.has('initiative.disadvantage')
+    || flags.has('abilityCheck.disadvantage.dexterity')
+    || flags.has('abilityCheck.disadvantage');
 
-  if (hasAdvantage && !hasDisadvantage) {
-    return 'advantage';
-  }
+  return combineRollMode(hasAdvantage, hasDisadvantage);
+}
 
-  if (hasDisadvantage && !hasAdvantage) {
-    return 'disadvantage';
-  }
+/** Параметры расчёта режима проверки характеристики или навыка */
+export interface AbilityCheckRollModeParams {
+  /** Активные флаги существа (`ResolvedActorStats.activeFlags`) */
+  flags: ReadonlySet<string>;
+  /**
+   * Характеристика проверки. У навыка — та, от которой он считается на листе:
+   * Атлетику перевели на Телосложение — и флаги читаются по Телосложению.
+   */
+  ability: AbilityType;
+  /**
+   * Навык проверки. Не задан — катится голая проверка характеристики, и
+   * понавыковые флаги (помеха Скрытности от брони) её не касаются.
+   */
+  skill?: SkillType;
+}
 
-  return 'normal';
+/** Флаг преимущества или помехи, задевающий проверку */
+export interface AbilityCheckRollFlag {
+  /** Ключ флага */
+  flag: EffectFlagKey;
+  /** Преимущество или помеха */
+  kind: 'advantage' | 'disadvantage';
+  /** Докуда он дотягивается: сам навык, характеристика или все проверки */
+  reach: 'skill' | 'ability' | 'all';
+}
+
+/**
+ * Все флаги, от которых проверка идёт с преимуществом или помехой: свои у
+ * навыка, по характеристике и общие на все проверки.
+ *
+ * Один список и для броска, и для значка у навыка на листе: иначе новый флаг,
+ * добавленный в одно место, развёл бы показанное и брошенное.
+ *
+ * @param ability - характеристика проверки
+ * @param skill - навык проверки; нет — голая проверка характеристики
+ * @returns флаги по порядку: навык, характеристика, все проверки
+ */
+export function listAbilityCheckRollFlags(
+  ability: AbilityType,
+  skill?: SkillType,
+): AbilityCheckRollFlag[] {
+  const skillFlags: AbilityCheckRollFlag[] = skill
+    ? [
+        {
+          flag: getSkillAdvantageFlagKey(skill),
+          kind: 'advantage',
+          reach: 'skill',
+        },
+        {
+          flag: getSkillDisadvantageFlagKey(skill),
+          kind: 'disadvantage',
+          reach: 'skill',
+        },
+      ]
+    : [];
+
+  return [
+    ...skillFlags,
+    {
+      flag: `abilityCheck.advantage.${ability}`,
+      kind: 'advantage',
+      reach: 'ability',
+    },
+    {
+      flag: `abilityCheck.disadvantage.${ability}`,
+      kind: 'disadvantage',
+      reach: 'ability',
+    },
+    { flag: 'abilityCheck.advantage', kind: 'advantage', reach: 'all' },
+    { flag: 'abilityCheck.disadvantage', kind: 'disadvantage', reach: 'all' },
+  ];
+}
+
+/**
+ * Определяет режим проверки характеристики или навыка D&D 5e по активным
+ * флагам существа.
+ *
+ * Учитывает общие флаги (`abilityCheck.advantage`/`abilityCheck.disadvantage`),
+ * профильные по характеристике (`abilityCheck.*.<ability>`) и понавыковые
+ * (`skill.<навык>.*` — преимущество Скрытности от эльфийских сапог, помеха от
+ * брони). По правилу 5e преимущество и помеха взаимно гасятся.
+ *
+ * Единая точка для листа персонажа и листа существа, чтобы одни и те же флаги
+ * везде читались одинаково.
+ *
+ * @param params - флаги, характеристика и навык проверки
+ * @returns режим броска: обычный / преимущество / помеха
+ */
+export function resolveAbilityCheckRollMode(
+  params: AbilityCheckRollModeParams,
+): AttackRollMode {
+  const { flags, ability, skill } = params;
+
+  const activeKinds = new Set(
+    listAbilityCheckRollFlags(ability, skill)
+      .filter((entry) => flags.has(entry.flag))
+      .map((entry) => entry.kind),
+  );
+
+  return combineRollMode(
+    activeKinds.has('advantage'),
+    activeKinds.has('disadvantage'),
+  );
+}
+
+/**
+ * Модификатор броска проверки характеристики: модификатор характеристики плюс
+ * прибавка ко всем проверкам. Плитка листа прибавку не показывает — она
+ * только в броске; у навыков она уже в числе навыка.
+ *
+ * @param abilityModifier - модификатор характеристики
+ * @param stats - итоговые статы; нет — прибавки нет
+ * @returns модификатор броска
+ */
+export function resolveAbilityCheckModifier(
+  abilityModifier: number,
+  stats: Pick<ResolvedActorStats, 'abilityCheckBonus'> | undefined,
+): number {
+  return abilityModifier + (stats?.abilityCheckBonus ?? 0);
+}
+
+/** Параметры расчёта режима спасброска по флагам существа */
+export interface SavingThrowRollModeParams {
+  /** Активные флаги существа (`ResolvedActorStats.activeFlags`) */
+  flags: ReadonlySet<string>;
+  /** Характеристика спасброска */
+  ability: AbilityType;
+  /**
+   * Спасбросок вызван заклинанием или иным магическим эффектом.
+   *
+   * Отдельным признаком, а не флагом существа: «против магии» — свойство
+   * броска, а не носителя. Мантия сопротивления заклинаниям даёт преимущество
+   * только тут и молчит на спасброске от яда.
+   */
+  againstMagic?: boolean;
+  /**
+   * Спасбросок вызван именно заклинанием, а не любой магией: «Кольцо
+   * отражения заклинаний» даёт преимущество только тут.
+   */
+  againstSpell?: boolean;
+  /**
+   * Состояние, которого спасбросок позволяет избежать или которое прекращает.
+   *
+   * Тоже свойство броска, а не носителя: дварфийская стойкость даёт
+   * преимущество на спасбросок против отравления и молчит на спасброске от
+   * страха.
+   */
+  againstCondition?: ConditionRef;
+  /**
+   * Спасбросок концентрации: «Боевой заклинатель» даёт преимущество только на
+   * нём, а не на всех спасбросках Телосложения.
+   */
+  againstConcentration?: boolean;
+  /**
+   * Преимущество или помеха самого спасброска, а не бросающего: «повторяет
+   * спасбросок с преимуществом, если урон нанёс заклинатель».
+   */
+  mode?: EffectTriggerSaveMode;
+}
+
+/**
+ * Определяет режим спасброска D&D 5e по активным флагам существа.
+ *
+ * Учитывает общие флаги (`save.advantage`/`save.disadvantage`), профильные по
+ * характеристике (`save.*.<ability>`), `save.*.vsMagic` — когда спасбросок
+ * вызван магией, — и `save.*.vs<Состояние>`, когда спасбросок против состояния.
+ * По правилу 5e преимущество и помеха взаимно гасятся.
+ *
+ * Единая точка для листа персонажа и для спасбросков, которые навязывает
+ * заклинание, чтобы одни и те же флаги читались одинаково.
+ *
+ * @param params - флаги, характеристика и обстоятельства спасброска
+ * @returns режим броска: обычный / преимущество / помеха
+ */
+export function resolveSavingThrowRollMode(
+  params: SavingThrowRollModeParams,
+): AttackRollMode {
+  const {
+    flags,
+    ability,
+    againstMagic,
+    againstSpell,
+    againstCondition,
+    againstConcentration,
+    mode,
+  } = params;
+
+  const hasAdvantage =
+    mode === 'advantage'
+    || flags.has('save.advantage')
+    || flags.has(`save.advantage.${ability}`)
+    || (againstMagic === true && flags.has('save.advantage.vsMagic'))
+    || (againstSpell === true && flags.has('save.advantage.vsSpell'))
+    || (againstConcentration === true
+      && flags.has('save.advantage.vsConcentration'))
+    || (againstCondition !== undefined
+      && flags.has(buildSaveVsConditionFlag('advantage', againstCondition)));
+
+  const hasDisadvantage =
+    mode === 'disadvantage'
+    || flags.has('save.disadvantage')
+    || flags.has(`save.disadvantage.${ability}`)
+    || (againstMagic === true && flags.has('save.disadvantage.vsMagic'))
+    || (againstSpell === true && flags.has('save.disadvantage.vsSpell'))
+    || (againstConcentration === true
+      && flags.has('save.disadvantage.vsConcentration'))
+    || (againstCondition !== undefined
+      && flags.has(buildSaveVsConditionFlag('disadvantage', againstCondition)));
+
+  return combineRollMode(hasAdvantage, hasDisadvantage);
+}
+
+/** Обстоятельства спасброска, от которых зависят его прибавки */
+export type SavingThrowBonusCircumstances = Pick<
+  SavingThrowRollModeParams,
+  'againstConcentration'
+>;
+
+/**
+ * Ключи кубиковых прибавок спасброска: своей характеристики и, у спасброска
+ * концентрации, ещё и концентрации.
+ *
+ * @param ability - характеристика спасброска
+ * @param circumstances - обстоятельства спасброска
+ * @returns ключи прибавок
+ */
+export function listSavingThrowBonusKeys(
+  ability: AbilityType,
+  circumstances: SavingThrowBonusCircumstances = {},
+): EffectTargetKey[] {
+  const abilityKey: EffectTargetKey = `save.${ability}`;
+
+  return circumstances.againstConcentration
+    ? [abilityKey, CONCENTRATION_SAVE_KEY]
+    : [abilityKey];
+}
+
+/**
+ * Модификатор спасброска с прибавками обстоятельств: спасбросок концентрации
+ * получает ещё и свою прибавку.
+ *
+ * @param stats - посчитанные статы бросающего
+ * @param ability - характеристика спасброска
+ * @param circumstances - обстоятельства спасброска
+ * @returns модификатор
+ */
+export function resolveSavingThrowModifier(
+  stats: Pick<ResolvedActorStats, 'saves' | 'concentrationSaveBonus'>,
+  ability: AbilityType,
+  circumstances: SavingThrowBonusCircumstances = {},
+): number {
+  const concentrationBonus = circumstances.againstConcentration
+    ? stats.concentrationSaveBonus
+    : 0;
+
+  return stats.saves[ability] + concentrationBonus;
 }
 
 /**
@@ -322,11 +1063,13 @@ export function resolveAttackRollMode(
  *
  * @param attackModifier - суммарный модификатор атаки
  * @param rollMode - режим броска (обычный / преимущество / помеха)
+ * @param bonusDiceFormulas - кубиковые бонусы, бросаемые отдельно от d20
  * @returns формула атаки
  */
 export function buildAttackFormula(
   attackModifier: number,
   rollMode: AttackRollMode = 'normal',
+  bonusDiceFormulas: readonly string[] = [],
 ): string {
   const sign = attackModifier >= 0 ? '+' : '-';
 
@@ -338,7 +1081,15 @@ export function buildAttackFormula(
     diceExpr = '2к20kl1';
   }
 
-  return `${diceExpr}${sign}${Math.abs(attackModifier)}`;
+  const bonusSuffix = bonusDiceFormulas
+    .map((formula) =>
+      formula.startsWith('-') || formula.startsWith('+')
+        ? formula
+        : `+${formula}`,
+    )
+    .join('');
+
+  return `${diceExpr}${sign}${Math.abs(attackModifier)}${bonusSuffix}`;
 }
 
 /**
@@ -349,7 +1100,7 @@ export function buildAttackFormula(
  * @returns объект с результатом проверки или null
  */
 export function checkRange(
-  weapon: GameItem,
+  weapon: DnDGameItem,
   distance: number,
 ): { allowed: boolean; disadvantage: boolean } {
   if (weapon.rangeType === 'ranged' && weapon.range) {
@@ -383,6 +1134,9 @@ export function checkRange(
  * Логика идентична checkRange для оружия:
  * - ranged: проверяет normal/long дистанцию, помеха при превышении нормальной
  * - melee: проверяет reach (по умолчанию 5)
+ * - meleeOrRanged без выбранного вида: в досягаемости — как рукопашная, дальше
+ *   — как дальнобойная (обычно вид выбран до проверки, и сюда приходит
+ *   `melee` либо `ranged`)
  *
  * @param action - действие существа
  * @param distance - расстояние до цели
@@ -392,6 +1146,17 @@ export function checkCreatureActionRange(
   action: CreatureAction,
   distance: number,
 ): { allowed: boolean; disadvantage: boolean } {
+  if (action.rangeType === 'meleeOrRanged') {
+    const meleeCheck = checkCreatureActionRange(
+      { ...action, rangeType: 'melee' },
+      distance,
+    );
+
+    return meleeCheck.allowed
+      ? meleeCheck
+      : checkCreatureActionRange({ ...action, rangeType: 'ranged' }, distance);
+  }
+
   if (action.rangeType === 'ranged' && action.range) {
     const normalRange = action.range.normal;
     const longRange = action.range.long ?? normalRange;
@@ -423,9 +1188,9 @@ export function checkCreatureActionRange(
  * В отличие от оружия, у заклинаний D&D 5e нет «длинной» дистанции
  * с помехой — только жёсткий предел:
  * - `melee` / `touch`: досягаемость 5 футов;
- * - `ranged` с дистанцией больше 0: дистанция заклинания, сконвертированная
+ * - `ranged` / `none` с дистанцией больше 0: дистанция заклинания, сконвертированная
  *   из `rangeUnit` заклинания в единицы сцены;
- * - `self` / `sight` / `none` или дистанция 0: без ограничений.
+ * - `self` / `sight` или дистанция 0: без ограничений.
  *
  * @param spell - заклинание
  * @param sceneUnit - единица измерения сцены
@@ -439,11 +1204,37 @@ export function getSpellMaxRange(
     return Math.round(convertDistance(DEFAULT_REACH_FEET, 'ft', sceneUnit));
   }
 
-  if (spell.deliveryType === 'ranged' && spell.range > 0) {
+  if (
+    (spell.deliveryType === 'ranged' || spell.deliveryType === 'none')
+    && spell.range > 0
+  ) {
     return Math.round(convertDistance(spell.range, spell.rangeUnit, sceneUnit));
   }
 
   return null;
+}
+
+/**
+ * Ставится ли линия или конус заклинания отдельно от заклинателя.
+ *
+ * «Молния» бьёт от самого заклинателя — её дистанция «на себя». У «Стены
+ * огня» дистанция своя (120 футов): стена встаёт в любом месте в её пределах,
+ * и начинать её от фишки заклинателя нельзя. Круг и прямоугольник сюда не
+ * относятся: их и так ставят в точку.
+ *
+ * @param spell - заклинание
+ * @returns `true`, если начало линии/конуса выбирают на карте
+ */
+export function isSpellAreaPlacedAtRange(
+  spell: Pick<Spell, 'areaOfEffect' | 'deliveryType' | 'range'>,
+): boolean {
+  const shape = spell.areaOfEffect?.shape;
+
+  return (
+    (shape === 'ray' || shape === 'cone')
+    && (spell.deliveryType === 'ranged' || spell.deliveryType === 'none')
+    && spell.range > 0
+  );
 }
 
 /**

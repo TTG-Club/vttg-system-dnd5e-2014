@@ -3,7 +3,10 @@
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import { MODAL_BUTTON_LABELS } from '../actor/constants';
+  import { CREATURE_DEFENSES_LABELS } from './constants';
 
   /** Блокирующий модал — фиксированный z-index поверх остальных */
   const MODAL_Z_INDEX = Z_INDEX.MODAL_ELEVATED;
@@ -12,9 +15,12 @@
    * Свойства физического пробивания.
    */
   const BYPASS_MODIFIERS = [
-    { key: 'bypass-adamantine', label: 'Адамантиновое' },
-    { key: 'bypass-magical', label: 'Магическое' },
-    { key: 'bypass-silvered', label: 'Посеребрённое' },
+    {
+      key: 'bypass-adamantine',
+      label: CREATURE_DEFENSES_LABELS.bypassAdamantine,
+    },
+    { key: 'bypass-magical', label: CREATURE_DEFENSES_LABELS.bypassMagical },
+    { key: 'bypass-silvered', label: CREATURE_DEFENSES_LABELS.bypassSilvered },
   ];
 
   type DefenseCategory = 'vulnerabilities' | 'resistances' | 'immunities';
@@ -84,13 +90,25 @@
   const modalConfig = computed(() => {
     switch (props.category) {
       case 'vulnerabilities':
-        return { title: 'Уязвимости', color: 'text-error' };
+        return {
+          title: CREATURE_DEFENSES_LABELS.titleVulnerabilities,
+          color: 'text-error',
+        };
       case 'resistances':
-        return { title: 'Сопротивления', color: 'text-info' };
+        return {
+          title: CREATURE_DEFENSES_LABELS.titleResistances,
+          color: 'text-info',
+        };
       case 'immunities':
-        return { title: 'Иммунитеты', color: 'text-warning' };
+        return {
+          title: CREATURE_DEFENSES_LABELS.titleImmunities,
+          color: 'text-warning',
+        };
       default:
-        return { title: 'Защиты', color: 'text-default' };
+        return {
+          title: CREATURE_DEFENSES_LABELS.titleFallback,
+          color: 'text-default',
+        };
     }
   });
 
@@ -144,7 +162,7 @@
     <template #body>
       <div class="flex flex-col gap-4">
         <div class="grid grid-cols-2 gap-4">
-          <!-- Левая колонка: Типы урона -->
+          <!-- Левая колонка: {{ CREATURE_DEFENSES_LABELS.damageTypes }} -->
           <div
             class="flex flex-col rounded-lg border border-default/50 bg-elevated/30 p-2"
           >
@@ -152,11 +170,11 @@
               class="mb-2 border-b border-default/50 pb-2 text-center text-xs font-bold tracking-wider uppercase"
               :class="modalConfig.color"
             >
-              Типы урона
+              {{ CREATURE_DEFENSES_LABELS.damageTypes }}
             </div>
 
             <div
-              class="custom-scrollbar max-h-[380px] space-y-0.5 overflow-y-auto pr-1"
+              class="custom-scrollbar max-h-95 space-y-0.5 overflow-y-auto pr-1"
             >
               <div
                 v-for="option in damageOptions"
@@ -183,12 +201,11 @@
               <div
                 class="mb-2 border-b border-default/50 pb-2 text-center text-xs font-bold tracking-wider text-highlighted uppercase"
               >
-                Физическое пробивание
+                {{ CREATURE_DEFENSES_LABELS.bypassTitle }}
               </div>
 
               <div class="mb-2 text-xs text-dimmed">
-                Предметы с этим свойством игнорируют устойчивость к физическому
-                урону.
+                {{ CREATURE_DEFENSES_LABELS.bypassHint }}
               </div>
 
               <div class="space-y-0.5">
@@ -215,18 +232,18 @@
               <div
                 class="mb-2 border-b border-default/50 pb-2 text-center text-xs font-bold tracking-wider text-highlighted uppercase"
               >
-                Особое
+                {{ CREATURE_DEFENSES_LABELS.customTitle }}
               </div>
 
               <textarea
                 v-model="customValues"
-                class="w-full resize-none rounded border-none bg-black/20 p-2 text-sm text-default outline-none placeholder:text-dimmed focus:ring-1 focus:ring-primary"
+                class="w-full resize-none rounded border-none bg-default/20 p-2 text-sm text-default outline-none placeholder:text-dimmed focus:ring-1 focus:ring-primary"
                 rows="3"
-                placeholder="от немагического оружия..."
+                :placeholder="CREATURE_DEFENSES_LABELS.customPlaceholder"
               />
 
               <div class="mt-1 text-xs text-dimmed">
-                Значения разделяются точкой с запятой.
+                {{ CREATURE_DEFENSES_LABELS.customHint }}
               </div>
             </div>
           </div>
@@ -240,7 +257,7 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -248,7 +265,7 @@
             size="sm"
             @click.left.exact.prevent="applySelection"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

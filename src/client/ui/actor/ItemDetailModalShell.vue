@@ -1,12 +1,14 @@
 <script setup lang="ts">
-  import type { ChatCardType } from '@vtt/shared';
+  import type { ChatCardType, SourceDefinition } from '@vtt/shared';
 
   import { computed } from 'vue';
 
   import SendToChatButton from '@/shared_ui/components/SendToChatButton.vue';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
 
-  import { useSourceLabel } from '../../composables/useSourceLabel';
+  import { ITEM_DETAIL_SHELL_LABELS } from './constants';
+  import EffectsBySubscriptionBadge from './EffectsBySubscriptionBadge.vue';
+  import SourceBadge from './SourceBadge.vue';
 
   const props = defineProps<{
     /** Открыто ли модальное окно */
@@ -17,12 +19,16 @@
     subtitle?: string;
     /** Ключ источника контента для бейджа (PHB, DMG…) */
     sourceKey?: string;
+    /** Определение источника, вписанное вместе с записью (авторская книга) */
+    source?: SourceDefinition;
     /**
      * Является ли контент SRD (для бейджа «SRD»). Имя `isSrd`, а не `isSRD`,
      * намеренно: kebab-привязка `:is-srd` камелизуется в `isSrd` — с тремя
      * заглавными подряд (`isSRD`) проп не сопоставился бы и бейдж не появлялся.
      */
     isSrd?: boolean;
+    /** Поле `automation` записи: `false` — эффекты доступны только по подписке */
+    automation?: boolean;
     /** Тип карточки для кнопки «Поделиться в чат» */
     cardType: ChatCardType;
     /** JSON-payload для кнопки «Поделиться в чат» */
@@ -56,8 +62,6 @@
       ? { x: props.positionOffset, y: props.positionOffset }
       : undefined,
   );
-
-  const { sourceLabel } = useSourceLabel(() => props.sourceKey);
 </script>
 
 <template>
@@ -68,19 +72,15 @@
     :initial-width="480"
     :min-width="300"
     :min-height="200"
-    :resizable="false"
     :z-index="zIndex"
     :saved-position="initialPosition"
     @update:open="emit('update:open', $event)"
     @bring-to-front="emit('bring-to-front')"
   >
     <template #header-actions>
-      <UBadge
-        v-if="sourceLabel"
-        :label="sourceLabel"
-        color="neutral"
-        variant="subtle"
-        size="sm"
+      <SourceBadge
+        :source-key="sourceKey"
+        :source="source"
       />
 
       <UBadge
@@ -91,12 +91,14 @@
         size="sm"
       />
 
+      <EffectsBySubscriptionBadge :automation="automation" />
+
       <!-- Доп. действия конкретной модалки (напр. «Атаковать» у действий существ) -->
       <slot name="header-extra" />
 
       <UTooltip
         v-if="showCastButton"
-        text="Применить заклинание"
+        :text="ITEM_DETAIL_SHELL_LABELS.cast"
       >
         <UButton
           icon="tabler:wand"
@@ -109,7 +111,7 @@
 
       <UTooltip
         v-if="showCopyButton"
-        :text="copyTooltip || 'Скопировать'"
+        :text="copyTooltip || ITEM_DETAIL_SHELL_LABELS.copyFallback"
       >
         <UButton
           icon="tabler:copy"

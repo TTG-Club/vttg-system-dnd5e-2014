@@ -1,50 +1,102 @@
 <script setup lang="ts">
-  import type { TypedWebSocketClient } from '@vtt/shared';
+  import type { Feature, TypedWebSocketClient } from '@vtt/shared';
   import type {
-    Actor,
     BackgroundDefinition,
+    ClassSpellListRequest,
+    DnDActor,
     GrantedSpellSource,
+    RefCandidate,
   } from '@vtt/shared/system/dnd.js';
-  import type { ComponentPublicInstance } from 'vue';
 
-  import { collectFeatGrantedSpellSources } from '@vtt/shared/system/dnd.js';
-  import { computed, ref, toRef } from 'vue';
+  import type { CatalogPack } from '../../../composables/useCompendiumCatalog';
+  import type { AppliedFeatFeature } from '../feat/featApply';
 
+  import { computed, ref, shallowRef, toRef, watch } from 'vue';
+
+  import { loadCompendiumKindByPack } from '@/core/compendiumDataClient';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
+  import {
+    addStartingCoins,
+    calculateProficiencyBonus,
+    collectFeatGrantedClassSpellRequests,
+    collectFeatGrantedSpellSources,
+    collectGrantedSpellSources,
+    getTotalLevel,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { flattenPreferringBy } from '../../../composables/useCompendiumCatalog';
   import { useGrantedSpellsResolver } from '../../../composables/useGrantedSpellsResolver';
+  import {
+    describeCandidate,
+    resolveRefForActor,
+  } from '../../../composables/usePackChoicePrompt';
   import { useSourceLabels } from '../../../composables/useSourceLabel';
+  import { resolveStartingEquipment } from '../../../composables/useStartingEquipment';
+  import {
+    BACKGROUND_WIZARD_LABELS,
+    GRANT_SECTION_LABELS,
+    MODAL_BUTTON_LABELS,
+  } from '../constants';
+  import FeatChoicesFields from '../feat/FeatChoicesFields.vue';
   import {
     backgroundSpellSource,
     useBackgroundWizard,
   } from './useBackgroundWizard';
+  import WizardStepAbilities from './WizardStepAbilities.vue';
   import WizardStepEquipment from './WizardStepEquipment.vue';
   import WizardStepOverview from './WizardStepOverview.vue';
   import WizardStepTools from './WizardStepTools.vue';
 
   const props = defineProps<{
     open: boolean;
-    actor: Actor;
+    actor: DnDActor;
     backgroundDefinition: BackgroundDefinition | null;
+    /** Пак записи предыстории: ложится на запись актора */
+    packId?: string;
     socket: TypedWebSocketClient | null;
   }>();
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
     'apply': [
-      systemUpdates: Partial<Actor['system']>,
-      rootUpdates: Partial<Actor>,
+      systemUpdates: Partial<DnDActor['system']>,
+      rootUpdates: Partial<DnDActor>,
     ];
   }>();
 
-  const modalRef = ref<ComponentPublicInstance | null>(null);
-
   const { getSourceLabel } = useSourceLabels();
 
-  // Композабл мастера
+  /** Черты компендиума по пакам: черта предыстории ищется сперва в её паке */
+  const featPacks = ref<CatalogPack<Feature>[]>([]);
+  const isLoadingFeats = ref(false);
+
+  /**
+   * Черты одним списком для выбора черты-происхождения: при повторе id берётся
+   * копия из пака предыстории. Какую копию выдать, решает {@link chosenFeat}.
+   */
+  const featsData = computed(() =>
+    flattenPreferringBy(featPacks.value, props.packId, (feat) => feat.id),
+  );
+
+  // Композабл мастера. `definition` — нормализованное определение (компендиум
+  // отдаёт блоки даров частично); шаги получают именно его, а не сырой проп.
   const {
+    definition,
     currentStepInfo,
+    selectedScheme,
+    abilityAllocation,
     toolSelections,
+    grantedTools,
+    grantComplete,
+    selectedFeatId,
+    selectedFeatChoices,
+    grantedFeatData,
+    askedFeatChoices,
+    namedClassKeys,
+    featChoiceSpells,
+    selectedEquipmentIndex,
+    selectedEquipmentItems,
+    selectedEquipmentCoins,
     wizardSteps: wizardStepKeys,
     canProceed,
     nextStep,
@@ -54,13 +106,17 @@
     toRef(props, 'backgroundDefinition'),
     toRef(props, 'actor'),
     toRef(props, 'open'),
+    toRef(props, 'socket'),
+    toRef(props, 'packId'),
   );
 
   const wizardSteps = computed(() => {
     const titles: Record<string, string> = {
-      overview: 'Обзор',
-      tools: 'Инструменты',
-      equipment: 'Снаряжение',
+      overview: BACKGROUND_WIZARD_LABELS.tabOverview,
+      featChoices: BACKGROUND_WIZARD_LABELS.tabFeatChoices,
+      tools: GRANT_SECTION_LABELS.tools,
+      abilities: BACKGROUND_WIZARD_LABELS.tabAbilities,
+      equipment: GRANT_SECTION_LABELS.equipment,
     };
 
     return wizardStepKeys.value.map((key) => ({
@@ -74,32 +130,194 @@
 
     if (step) {
       currentStepInfo.value = {
-        stepGroup: step.value as typeof currentStepInfo.value.stepGroup,
+        stepGroup: step.value,
         index: targetIndex + 1,
         total: wizardSteps.value.length,
       };
     }
   }
 
+  function isFeature(value: unknown): value is Feature {
+    // Без требования 'source': у записей компендиума есть только sourceKey,
+    // проверка source отсеивала ВСЕ черты — грант предыстории уходил заглушкой
+    // с пустым описанием.
+    return (
+      typeof value === 'object'
+      && value !== null
+      && 'id' in value
+      && 'name' in value
+      && 'description' in value
+    );
+  }
+
   /**
-   * Заклинания, автоматически предоставляемые предысторией — из её
-   * собственного `featData`. Origin-черту предыстория не выдаёт — это механика
-   * PHB 2024, — поэтому второго источника здесь нет.
+   * Загружает черты компендиума с сервера (агрегировано по всем пакам: бандл +
+   * скачиваемые + модули) в `featsData`.
+   */
+  async function loadFeats(): Promise<void> {
+    if (!props.socket) {
+      return;
+    }
+
+    isLoadingFeats.value = true;
+
+    const packs = await loadCompendiumKindByPack(props.socket, 'feat');
+
+    featPacks.value = packs.map((pack) => {
+      // CompendiumEntry[] расширяем до unknown[], т.к. Feature не подтип
+      // CompendiumEntry и guard иначе не сузит при filter.
+      const entries: unknown[] = pack.entries;
+
+      return {
+        packId: pack.packId,
+        packName: pack.packName,
+        entries: entries.filter(isFeature),
+      };
+    });
+
+    isLoadingFeats.value = false;
+  }
+
+  // Запрашиваем черты с сервера при открытии модалки, если их ещё нет
+  watch(
+    () => props.open,
+    (isOpen) => {
+      if (
+        !isOpen
+        || featsData.value.length > 0
+        || !definition.value
+        || !props.socket
+      ) {
+        return;
+      }
+
+      void loadFeats();
+    },
+    { immediate: true },
+  );
+
+  /**
+   * Копия выбранной черты из конкретного пака: своя у пака предыстории, иначе
+   * единственная в мире, иначе — какую выбрал игрок.
+   */
+  const chosenFeat = shallowRef<RefCandidate<Feature> | undefined>();
+
+  /** Номер поиска черты: ответ на устаревший выбор черты не применяется */
+  let featSearchToken = 0;
+
+  /**
+   * Ищет копию выбранной черты по правилу «свой пак → единственный другой →
+   * выбор игрока». Окно выбора всплывает сразу: от черты зависят шаги мастера.
+   *
+   * @param featId - id выбранной черты
+   */
+  async function resolveSelectedFeat(featId: string): Promise<void> {
+    featSearchToken += 1;
+
+    const token = featSearchToken;
+
+    chosenFeat.value = undefined;
+
+    if (!featId || featPacks.value.length === 0 || !definition.value) {
+      return;
+    }
+
+    const found = await resolveRefForActor(props.actor.id, {
+      packs: featPacks.value,
+      key: featId,
+      keyOf: (feat) => feat.id,
+      ownPackId: props.packId,
+      grantedBy: definition.value.name,
+      toOption: describeCandidate,
+    });
+
+    if (token === featSearchToken) {
+      chosenFeat.value = found;
+    }
+  }
+
+  watch([selectedFeatId, featPacks], ([featId]) => {
+    void resolveSelectedFeat(featId);
+  });
+
+  /**
+   * Выбранная черта целиком — из неё берутся дары и выборы. Список объявлен
+   * типом черты: базовый `Feature` о `featData` не знает.
+   */
+  const selectedFeat = computed((): AppliedFeatFeature | undefined => {
+    const feat: AppliedFeatFeature | undefined = chosenFeat.value?.entry;
+
+    return feat;
+  });
+
+  /** Название выбранной черты — заголовок шага её выборов */
+  const grantedFeatName = computed(() => selectedFeat.value?.name ?? '');
+
+  const proficiencyBonus = computed(() =>
+    calculateProficiencyBonus(getTotalLevel(props.actor.system.classes)),
+  );
+
+  /**
+   * Дары выбранной черты уезжают в composable: шаги мастера читают их оттуда, а
+   * компендиум знает только это окно. Смена черты сбрасывает сделанный выбор —
+   * он относился к прежней.
+   */
+  watch(
+    selectedFeat,
+    (feat) => {
+      grantedFeatData.value = feat?.featData ?? null;
+
+      selectedFeatChoices.value = {};
+    },
+    { immediate: true },
+  );
+
+  /**
+   * Заклинания, автоматически предоставляемые предысторией: от выбранной
+   * черты-происхождения (`grantedSpells` черты) И от СОБСТВЕННОГО `featData`
+   * предыстории. Источники последних помечаются отдельным именем
+   * (`backgroundSpellSource`), чтобы откат снимал их раздельно от черты.
    */
   const grantedSpellSources = computed((): GrantedSpellSource[] => {
     const sources: GrantedSpellSource[] = [];
 
-    const def = props.backgroundDefinition;
+    if (selectedFeat.value) {
+      // Заклинания черты живут в её дарах, а выбранные игроком — в ответах шага
+      // выборов: и то, и другое выдаётся от имени самой черты, чтобы снятие
+      // предыстории забрало их вместе с ней
+      sources.push(
+        // Лист передаётся ради уровней доступа: заклинание черты, доступное
+        // только с третьего уровня, на первом выдаваться не должно
+        ...[
+          ...collectFeatGrantedSpellSources(
+            {
+              name: selectedFeat.value.name,
+              featData: selectedFeat.value.featData,
+              choices: selectedFeatChoices.value,
+            },
+            props.actor,
+          ),
+          ...collectGrantedSpellSources([selectedFeat.value]),
+          // Своим паком заклинаний черты считается пак, из которого взята черта
+        ].map((source) => ({
+          ...source,
+          packId: source.packId ?? chosenFeat.value?.packId,
+        })),
+      );
+    }
+
+    const def = definition.value;
 
     if (def?.featData) {
-      const ownSources = collectFeatGrantedSpellSources({
-        name: def.name,
-        featData: def.featData,
-      });
+      const ownSources = collectFeatGrantedSpellSources(
+        { name: def.name, featData: def.featData },
+        props.actor,
+      );
 
       for (const source of ownSources) {
         sources.push({
           ...source,
+          packId: source.packId ?? props.packId,
           featureName: backgroundSpellSource(def.name),
         });
       }
@@ -108,15 +326,87 @@
     return sources;
   });
 
-  /** Granted-заклинания предыстории с данными из компендиума */
-  const { resolvedGrantedSpells } = useGrantedSpellsResolver(
+  /**
+   * Запросы «выдать весь список класса» — от черты происхождения и от собственных
+   * даров предыстории. Заклинаний они не называют: их подберёт резолвер по
+   * компендиуму.
+   */
+  const grantedClassSpellRequests = computed((): ClassSpellListRequest[] => {
+    const requests: ClassSpellListRequest[] = [];
+
+    if (selectedFeat.value) {
+      requests.push(
+        ...collectFeatGrantedClassSpellRequests(
+          {
+            name: selectedFeat.value.name,
+            featData: selectedFeat.value.featData,
+            choices: selectedFeatChoices.value,
+          },
+          props.actor,
+        ),
+      );
+    }
+
+    const def = definition.value;
+
+    if (def?.featData) {
+      for (const request of collectFeatGrantedClassSpellRequests(
+        { name: def.name, featData: def.featData },
+        props.actor,
+      )) {
+        requests.push({
+          ...request,
+          featureName: backgroundSpellSource(def.name),
+        });
+      }
+    }
+
+    return requests;
+  });
+
+  /** Granted-заклинания выбранной черты с данными из компендиума */
+  const { finalizeForActor } = useGrantedSpellsResolver(
     toRef(props, 'socket'),
     grantedSpellSources,
+    grantedClassSpellRequests,
   );
 
-  function handleApply() {
-    const { systemUpdates, rootUpdates } = buildUpdates(
-      resolvedGrantedSpells.value,
+  async function handleApply() {
+    // Заклинания из нескольких компендиумов игрок выбирает здесь же, до записи
+    const grantedSpells = await finalizeForActor(props.actor.id);
+
+    // Выбранная копия черты — первой: сборщик ищет черту по id в этом списке
+    const feats: Feature[] = selectedFeat.value
+      ? [selectedFeat.value, ...featsData.value]
+      : featsData.value;
+
+    const { systemUpdates, rootUpdates } = buildUpdates(feats, grantedSpells);
+
+    // Стартовое снаряжение — отдельным шагом после сборки даров: позиции надо
+    // сопоставить с компендиумом, а это асинхронно и к остальным дарам
+    // отношения не имеет
+    const granted = await resolveStartingEquipment(
+      props.socket,
+      selectedEquipmentItems.value,
+      props.packId,
+      props.backgroundDefinition
+        ? { kind: 'background', key: props.backgroundDefinition.key }
+        : undefined,
+      {
+        actorId: props.actor.id,
+        grantedByName: props.backgroundDefinition?.name ?? '',
+      },
+    );
+
+    if (granted.length > 0) {
+      rootUpdates.equipment = [...(props.actor.equipment ?? []), ...granted];
+    }
+
+    // Деньги варианта — в кошелёк: их показывают в карточке варианта, и без
+    // этого выбор «N зм вместо снаряжения» не давал ничего
+    systemUpdates.currency = addStartingCoins(
+      props.actor.system.currency,
+      selectedEquipmentCoins.value,
     );
 
     emit('apply', systemUpdates, rootUpdates);
@@ -130,7 +420,6 @@
 
 <template>
   <UDraggableModal
-    ref="modalRef"
     v-bind="$attrs"
     :open="open"
     :draggable="false"
@@ -140,18 +429,18 @@
     :initial-width="800"
     :min-height="400"
     :title="
-      backgroundDefinition
-        ? `Предыстория: ${backgroundDefinition.name}`
-        : 'Настройка предыстории'
+      definition
+        ? `${BACKGROUND_WIZARD_LABELS.titlePrefix}${definition.name}`
+        : BACKGROUND_WIZARD_LABELS.fallbackTitle
     "
     @update:open="emit('update:open', $event)"
   >
     <template #body>
       <div
-        v-if="!backgroundDefinition"
+        v-if="!definition"
         class="p-6 text-center text-muted"
       >
-        Предыстория не выбрана. Перетащите предысторию из справочника.
+        {{ BACKGROUND_WIZARD_LABELS.empty }}
       </div>
 
       <div
@@ -163,13 +452,14 @@
           <div class="flex items-center gap-3">
             <div>
               <h3 class="text-lg font-medium text-highlighted">
-                {{ backgroundDefinition.name }}
+                {{ definition.name }}
               </h3>
 
               <p class="text-sm text-dimmed">
-                Источник:
-                <span class="font-medium text-primary-400">{{
-                  getSourceLabel(backgroundDefinition.sourceKey) || 'PHB'
+                {{ BACKGROUND_WIZARD_LABELS.sourcePrefix }}
+                <span class="font-medium text-primary">{{
+                  getSourceLabel(definition.sourceKey, definition.source)
+                  || 'PHB'
                 }}</span>
               </p>
             </div>
@@ -188,7 +478,7 @@
               class="h-px flex-1"
               :class="
                 stepIdx < currentStepInfo.index
-                  ? 'bg-primary-500/60'
+                  ? 'bg-primary/60'
                   : 'bg-accented/50'
               "
             />
@@ -198,7 +488,7 @@
               class="flex items-center gap-1.5 rounded-full px-2 py-1 text-xs transition-colors"
               :class="[
                 stepIdx === currentStepInfo.index - 1
-                  ? 'bg-primary-500/20 text-primary-400 ring-1 ring-primary-500/40'
+                  ? 'bg-primary/20 text-primary ring-1 ring-primary/40'
                   : stepIdx < currentStepInfo.index - 1
                     ? 'bg-success/10 text-healing'
                     : 'text-dimmed',
@@ -215,25 +505,71 @@
         </div>
 
         <!-- Контент текущего шага -->
-        <div class="min-h-[200px]">
-          <!-- Шаг 1: Обзор -->
-          <WizardStepOverview
-            v-if="currentStepInfo.stepGroup === 'overview'"
-            :background-definition="backgroundDefinition"
-          />
+        <div class="min-h-50">
+          <div
+            v-if="isLoadingFeats"
+            class="flex h-full items-center justify-center p-20"
+          >
+            <UIcon
+              name="tabler:loader-2"
+              class="animate-spin text-3xl text-dimmed"
+            />
+          </div>
 
-          <!-- Шаг 1.5: Инструменты (условно) -->
-          <WizardStepTools
-            v-else-if="currentStepInfo.stepGroup === 'tools'"
-            v-model:tool-selections="toolSelections"
-            :background-definition="backgroundDefinition"
-          />
+          <template v-else>
+            <!-- Шаг 1: Обзор -->
+            <WizardStepOverview
+              v-if="currentStepInfo.stepGroup === 'overview'"
+              v-model:selected-feat-id="selectedFeatId"
+              :background-definition="definition"
+              :feats-data="featsData"
+            />
 
-          <!-- Шаг 2: Снаряжение -->
-          <WizardStepEquipment
-            v-else-if="currentStepInfo.stepGroup === 'equipment'"
-            :equipment-options="backgroundDefinition.equipmentOptions"
-          />
+            <!-- Шаг 1.2: Выборы внутри выданной черты («Умелый» просит навыки) -->
+            <div
+              v-else-if="currentStepInfo.stepGroup === 'featChoices'"
+              class="space-y-3"
+            >
+              <span class="block text-sm font-medium text-toned">
+                {{ grantedFeatName }}
+              </span>
+
+              <FeatChoicesFields
+                v-model="selectedFeatChoices"
+                :choices="askedFeatChoices"
+                :actor="actor"
+                :proficiency-bonus="proficiencyBonus"
+                :spells="featChoiceSpells"
+                :named-class-keys="namedClassKeys"
+              />
+            </div>
+
+            <!-- Шаг 1.5: Инструменты (условно) -->
+            <WizardStepTools
+              v-else-if="currentStepInfo.stepGroup === 'tools'"
+              v-model:choice-selections="toolSelections"
+              v-model:granted-tools="grantedTools"
+              :background-definition="definition"
+              :socket="socket"
+              @update:grant-complete="grantComplete = $event"
+            />
+
+            <!-- Шаг 2: Характеристики -->
+            <WizardStepAbilities
+              v-else-if="currentStepInfo.stepGroup === 'abilities'"
+              v-model:selected-scheme="selectedScheme"
+              v-model:ability-allocation="abilityAllocation"
+              :background-definition="definition"
+              :current-abilities="actor.system.abilities"
+            />
+
+            <!-- Шаг 3: Снаряжение -->
+            <WizardStepEquipment
+              v-else-if="currentStepInfo.stepGroup === 'equipment'"
+              v-model:selected-index="selectedEquipmentIndex"
+              :equipment-options="definition.equipmentOptions"
+            />
+          </template>
         </div>
       </div>
     </template>
@@ -247,7 +583,7 @@
           icon="tabler:arrow-left"
           @click.left.exact.prevent="previousStep"
         >
-          Назад
+          {{ MODAL_BUTTON_LABELS.back }}
         </UButton>
 
         <div
@@ -261,16 +597,16 @@
             color="neutral"
             @click.left.exact.prevent="handleModalClose"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
             v-if="currentStepInfo.index < currentStepInfo.total"
             color="primary"
-            :disabled="!canProceed"
+            :disabled="!canProceed || isLoadingFeats"
             @click.left.exact.prevent="nextStep"
           >
-            Далее
+            {{ MODAL_BUTTON_LABELS.next }}
             <template #trailing>
               <UIcon name="tabler:arrow-right" />
             </template>
@@ -279,9 +615,10 @@
           <UButton
             v-else
             color="primary"
+            :disabled="isLoadingFeats"
             @click.left.exact.prevent="handleApply"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

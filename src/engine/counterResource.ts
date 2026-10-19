@@ -1,0 +1,969 @@
+/**
+ * Ресурс листа: максимум формулой и восстановление на отдыхе.
+ *
+ * Максимум у большинства ресурсов не число, а растущее значение: очки удачи
+ * «Удачливого» равны бонусу мастерства, очки чародейства — уровню, запас
+ * «Слабокровного» — бонусу мастерства минус один. Записанное число разошлось бы
+ * с листом при первом же повышении уровня, поэтому у счётчика хранится формула,
+ * а `max` — снимок последнего расчёта (по нему читаются листы, собранные до неё).
+ *
+ * Восстановление раздельное: короткий и продолжительный отдых возвращают своё,
+ * и «ничего / все заряды / N зарядов» описывает и ярость (всё продолжительным),
+ * и кости превосходства (всё коротким), и заряды, которые отдых возвращает по
+ * одному.
+ */
+
+import type { AbilityType } from '@vtt/shared';
+
+import type {
+  CounterDefinitionExtras,
+  CounterRecovery,
+  CounterRecoveryMode,
+  CounterRecoveryRule,
+} from './classTypes.js';
+import type { DnDActor } from './dndEntities.js';
+import type { FormulaContext } from './formulaParser.js';
+import type { ActorCounterState } from './types.js';
+
+import { z } from 'zod';
+
+import { isAbilityType } from './consts.js';
+import { counterIdentity } from './counterIds.js';
+import { resolveActorStats } from './effectPipeline.js';
+import {
+  ABILITY_ABBREVIATION_BY_KEY,
+  ABILITY_ABBREVIATIONS,
+  COUNTER_FORMULA_TOKENS,
+  evaluateFormula,
+} from './formulaParser.js';
+import { buildResolvedFormulaContext } from './resolvedFormulaContext.js';
+
+// ── Грамматика формулы максимума ─────────────────────────────
+
+/**
+ * Тот же токен уровня в классе в нижнем регистре.
+ *
+ * Разбор формулы приводит строку к нижнему регистру целиком (иначе `@PROF`
+ * автора не разобрался бы), а сам токен пишется camelCase — как его читает
+ * движок формул, регистрозависимый. Сравнивать поэтому приходится с этой
+ * заготовкой, а не с самим токеном; выводить её у каждого разборщика заново
+ * значило бы завести второе написание одного и того же.
+ */
+export const CLASS_LEVEL_TOKEN_LOWERCASE =
+  COUNTER_FORMULA_TOKENS.classLevel.toLowerCase();
+
+/**
+ * От чего считается максимум ресурса.
+ *
+ * `spellAbility` — заклинательная характеристика («Вознесение лича»): своя,
+ * спрошенная у игрока, либо классовая.
+ */
+export type CounterMaxSource =
+  'fixed' | 'proficiency' | 'ability' | 'spellAbility' | 'level' | 'classLevel';
+
+/**
+ * Максимум ресурса, разобранный на понятный форме выбор.
+ *
+ * Хранится всё равно формулой — правило нужно только редактору, чтобы автору не
+ * приходилось знать про `@prof` и `@mod.cha`. Итог — «источник + offset»,
+ * поэтому «бонус мастерства минус один» и «уровень плюс два» выражаются
+ * одинаково.
+ */
+export interface CounterMaxRule {
+  source: CounterMaxSource;
+  /** Характеристика источника `ability`; у прочих в счёт не идёт */
+  ability: AbilityType;
+  /** Прибавка к значению источника; может быть отрицательной */
+  offset: number;
+  /**
+   * Множитель значения источника; нет — единица.
+   *
+   * Нужен ресурсам, у которых запас кратен растущему значению: «Возложение
+   * рук» паладина — это пять хитов за уровень.
+   */
+  multiplier?: number;
+}
+
+/** Характеристика правила по умолчанию: поле обязано быть заполненным. */
+export const COUNTER_MAX_DEFAULT_ABILITY: AbilityType = 'charisma';
+
+/** Минимальное количество зарядов ресурса. */
+export const COUNTER_COUNT_MIN = 0;
+
+/** Максимальное количество зарядов ресурса. */
+export const COUNTER_COUNT_MAX = 99;
+
+/** Наименьший множитель значения источника: единица его не меняет. */
+export const COUNTER_MAX_MULTIPLIER_MIN = 1;
+
+/** Наибольший множитель значения источника: «Возложение рук» — пять за уровень. */
+export const COUNTER_MAX_MULTIPLIER_MAX = 20;
+
+/** Минимальная прибавка к значению источника максимума. */
+export const COUNTER_MAX_OFFSET_MIN = -9;
+
+/** Максимальная прибавка к значению источника максимума. */
+export const COUNTER_MAX_OFFSET_MAX = 9;
+
+/** Минимальное число зарядов, возвращаемых отдыхом. */
+export const COUNTER_RECOVERY_AMOUNT_MIN = 1;
+
+/**
+ * Сколько зарядов возвращает короткий отдых ресурсу с откатом «один заряд
+ * коротким, все продолжительным»: ровно один — так написано у «Второго
+ * дыхания» и вдохновения барда правил 2024 года.
+ */
+export const COUNTER_SHORT_REST_ONE_AMOUNT = 1;
+
+/**
+ * Наибольшая нижняя граница максимума: выше неё запас уже не «минимум».
+ *
+ * Рядом с прочими границами полей ресурса, а не в подписях интерфейса: их
+ * читает и редактор класса, и редактор черты, и окно ресурсов листа.
+ */
+export const COUNTER_MINIMUM_MAX = 20;
+
+/**
+ * Зажимает значение в границы.
+ *
+ * @param value - значение
+ * @param min - нижняя граница
+ * @param max - верхняя граница
+ */
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+/** Целое число без знака — им записаны и своё число максимума, и множитель. */
+const NUMBER_PATTERN = /^\d+$/;
+
+/**
+ * Источник максимума и его множитель, отделённые от формулы.
+ *
+ * Множитель ищется отдельно по той же причине, что и смещение: у общего разбора
+ * всей строки они перетягивают друг у друга пробелы и знак. Записать его можно
+ * с любой стороны — «5 × уровень» и «уровень × 5» читаются одинаково.
+ *
+ * @param base - часть формулы без смещения
+ * @returns источник без множителя и сам множитель (нет — единица)
+ */
+function splitCounterMaxMultiplier(base: string): {
+  source: string;
+  multiplier: number;
+} {
+  const parts = base.split('*');
+
+  const left = parts[0]?.trim() ?? '';
+  const right = parts[1]?.trim() ?? '';
+
+  if (parts.length !== 2 || !left || !right) {
+    return { source: base, multiplier: 1 };
+  }
+
+  if (NUMBER_PATTERN.test(right)) {
+    return { source: left, multiplier: Number(right) };
+  }
+
+  if (NUMBER_PATTERN.test(left)) {
+    return { source: right, multiplier: Number(left) };
+  }
+
+  return { source: base, multiplier: 1 };
+}
+
+/**
+ * Разбирает формулу максимума в правило для формы.
+ *
+ * Грамматика: число, `@prof`, `@level`, `@classLevel`, `@mod.spell` или
+ * `@mod.<аббревиатура>`, любое из них с множителем (`@level * 5`) и смещением
+ * (`@prof - 1`). Смещение всегда в хвосте и ищется отдельно от источника: у
+ * общего разбора всей строки источник и смещение перетягивают друг у друга
+ * пробелы и знак.
+ *
+ * @param formula - формула максимума
+ * @returns правило; null — формула пуста либо написана руками и не разбирается
+ */
+export function parseCounterMaxFormula(formula: string): CounterMaxRule | null {
+  const trimmed = formula.trim().toLowerCase();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  const offsetMatch = /([+-])\s*(\d+)\s*$/.exec(trimmed);
+
+  const offset = offsetMatch
+    ? Number(offsetMatch[2]) * (offsetMatch[1] === '-' ? -1 : 1)
+    : 0;
+
+  const withMultiplier = trimmed
+    .slice(0, offsetMatch?.index ?? trimmed.length)
+    .trim();
+
+  const { source: base, multiplier } =
+    splitCounterMaxMultiplier(withMultiplier);
+
+  if (!base) {
+    // Формула из одного числа: «10» разобралось как смещение без источника
+    return offset
+      ? { source: 'fixed', ability: COUNTER_MAX_DEFAULT_ABILITY, offset }
+      : null;
+  }
+
+  if (/^\d+$/.test(base)) {
+    return {
+      source: 'fixed',
+      ability: COUNTER_MAX_DEFAULT_ABILITY,
+      offset: Number(base) * multiplier + offset,
+    };
+  }
+
+  if (base === COUNTER_FORMULA_TOKENS.proficiencyBonus) {
+    return {
+      source: 'proficiency',
+      ability: COUNTER_MAX_DEFAULT_ABILITY,
+      offset,
+      multiplier,
+    };
+  }
+
+  if (base === COUNTER_FORMULA_TOKENS.level) {
+    return {
+      source: 'level',
+      ability: COUNTER_MAX_DEFAULT_ABILITY,
+      offset,
+      multiplier,
+    };
+  }
+
+  if (base === CLASS_LEVEL_TOKEN_LOWERCASE) {
+    return {
+      source: 'classLevel',
+      ability: COUNTER_MAX_DEFAULT_ABILITY,
+      offset,
+      multiplier,
+    };
+  }
+
+  if (base === COUNTER_FORMULA_TOKENS.spellAbilityModifier) {
+    return {
+      source: 'spellAbility',
+      ability: COUNTER_MAX_DEFAULT_ABILITY,
+      offset,
+      multiplier,
+    };
+  }
+
+  if (base.startsWith(COUNTER_FORMULA_TOKENS.abilityModifierPrefix)) {
+    const ability =
+      ABILITY_ABBREVIATIONS[
+        base.slice(COUNTER_FORMULA_TOKENS.abilityModifierPrefix.length)
+      ];
+
+    // Приставка знакома, а характеристика за ней — нет: формулу правили руками,
+    // и подставлять вместо неё чужую характеристику хуже, чем отдать её как есть
+    return isAbilityType(ability)
+      ? { source: 'ability', ability, offset, multiplier }
+      : null;
+  }
+
+  return null;
+}
+
+/**
+ * Собирает формулу максимума из правила формы.
+ *
+ * @param rule - правило максимума
+ * @returns формула для записи в счётчик
+ */
+export function counterMaxFormula(rule: CounterMaxRule): string {
+  const offset = clamp(
+    Math.trunc(rule.offset),
+    COUNTER_MAX_OFFSET_MIN,
+    COUNTER_MAX_OFFSET_MAX,
+  );
+
+  // «Своё число» источника не имеет — весь его максимум лежит в прибавке
+  if (rule.source === 'fixed') {
+    return String(Math.max(COUNTER_COUNT_MIN, offset));
+  }
+
+  const multiplier = Math.trunc(rule.multiplier ?? 1);
+
+  const token = counterMaxSourceToken(rule);
+
+  const base = multiplier > 1 ? `${token} * ${multiplier}` : token;
+
+  return offset === 0
+    ? base
+    : `${base} ${offset < 0 ? '-' : '+'} ${Math.abs(offset)}`;
+}
+
+/**
+ * Токен источника максимума без смещения.
+ *
+ * @param rule - правило максимума
+ * @returns `@prof`, `@level`, `@classLevel`, `@mod.spell` либо `@mod.<abbr>`
+ */
+function counterMaxSourceToken(rule: CounterMaxRule): string {
+  if (rule.source === 'proficiency') {
+    return COUNTER_FORMULA_TOKENS.proficiencyBonus;
+  }
+
+  if (rule.source === 'level') {
+    return COUNTER_FORMULA_TOKENS.level;
+  }
+
+  if (rule.source === 'classLevel') {
+    return COUNTER_FORMULA_TOKENS.classLevel;
+  }
+
+  if (rule.source === 'spellAbility') {
+    return COUNTER_FORMULA_TOKENS.spellAbilityModifier;
+  }
+
+  const abbreviation =
+    ABILITY_ABBREVIATION_BY_KEY[rule.ability]
+    ?? ABILITY_ABBREVIATION_BY_KEY[COUNTER_MAX_DEFAULT_ABILITY];
+
+  return `${COUNTER_FORMULA_TOKENS.abilityModifierPrefix}${abbreviation}`;
+}
+
+/**
+ * Формула модификатора характеристики (`charisma` → `@mod.cha`).
+ *
+ * @param ability - характеристика
+ */
+export function counterAbilityModifierFormula(ability: AbilityType): string {
+  return counterMaxSourceToken({ source: 'ability', ability, offset: 0 });
+}
+
+// ── Расчёт максимума ─────────────────────────────────────────
+
+/**
+ * Контекст формул листа с заполненным `@mod.spell`.
+ *
+ * Характеристики и бонус мастерства берутся с учётом эффектов листа, а не
+ * голыми значениями: повышение от предыстории и черт живёт эффектом
+ * `ability.*`, и без него вдохновение барда с Харизмой 14 + 2 считалось бы от
+ * 14 — на заряд меньше, чем показывает плитка Харизмы того же листа.
+ *
+ * Заклинательная характеристика берётся у первого заклинающего класса: у своего
+ * ресурса листа спросить её больше негде, а у ресурса черты она уже посчитана
+ * при выдаче (`buildFeatCounters`).
+ *
+ * @param actor - лист персонажа
+ */
+export function buildCounterFormulaContext(actor: DnDActor): FormulaContext {
+  const ability = (actor.system.classes ?? []).find(
+    (entry) => entry.spellcastingAbility,
+  )?.spellcastingAbility;
+
+  const stats = resolveActorStats(actor);
+
+  return {
+    ...buildResolvedFormulaContext(actor, { stats }),
+    spellMod: ability ? stats.abilityMods[ability] : undefined,
+  };
+}
+
+/**
+ * Значение формулы максимума. Кривая формула не должна ронять лист — тогда
+ * персонаж остался бы без ресурса из-за опечатки в одном поле.
+ *
+ * Но и нулём она читаться не должна: ноль значит «зарядов нет», и опечатка
+ * молча забирала бы у листа весь ресурс. Поэтому возвращается запасное число —
+ * у своего счётчика листа это записанный максимум, у определения из записи
+ * запасного нет и остаётся ноль. Формула при этом называется в логе: иначе о
+ * ней не узнать ниоткуда.
+ *
+ * @param formula - формула максимума
+ * @param context - `@`-переменные листа
+ * @param fallback - чем читать формулу, которая не разобралась
+ */
+export function evaluateCounterMaxFormula(
+  formula: string,
+  context: FormulaContext,
+  fallback = 0,
+): number {
+  try {
+    return clamp(
+      Math.round(evaluateFormula(formula, context)),
+      COUNTER_COUNT_MIN,
+      COUNTER_COUNT_MAX,
+    );
+  } catch {
+    console.warn(
+      `[Счётчики] Формула максимума "${formula}" не читается — взято ${fallback}`,
+    );
+
+    return clamp(fallback, COUNTER_COUNT_MIN, COUNTER_COUNT_MAX);
+  }
+}
+
+/**
+ * Максимум счётчика по готовому контексту формул.
+ *
+ * Отдельно от {@link resolveCounterMax} ради списка: контекст собирается один
+ * раз на весь лист, а не заново на каждый счётчик.
+ *
+ * @param context - `@`-переменные листа
+ * @param counter - состояние счётчика
+ * @returns максимум зарядов
+ */
+export function resolveCounterMaxIn(
+  context: FormulaContext,
+  counter: ActorCounterState,
+): number {
+  const formula = counter.maxFormula?.trim();
+
+  if (!formula) {
+    return withCounterMinimum(
+      Math.max(COUNTER_COUNT_MIN, counter.max),
+      counter.min,
+    );
+  }
+
+  // Запасное число — записанный максимум счётчика: у листа с опечаткой в
+  // формуле ресурс остаётся тем, каким был, а не пропадает
+  return withCounterMinimum(
+    evaluateCounterMaxFormula(
+      formula,
+      scopeToCounterClass(context, counter),
+      counter.max,
+    ),
+    counter.min,
+  );
+}
+
+/**
+ * Подставляет в контекст уровень В КЛАССЕ СЧЁТЧИКА — для токена `@classLevel`.
+ *
+ * Ресурсы класса растут по его собственным уровням: очки чародейства равны
+ * уровню ЧАРОДЕЯ, а не сумме уровней мультиклассера. Класс счётчик знает сам
+ * (`classKey`), а общий контекст листа — нет: он один на все ресурсы.
+ *
+ * Ресурс черты класса за спиной не имеет — его `@classLevel` останется
+ * незаданным и прочитается как `@level`, ровно как раньше.
+ *
+ * @param context - общий контекст формул листа
+ * @param counter - состояние счётчика
+ * @returns контекст с уровнем своего класса (или тот же, если класса нет)
+ */
+function scopeToCounterClass(
+  context: FormulaContext,
+  counter: ActorCounterState,
+): FormulaContext {
+  const classLevel =
+    counter.classKey === undefined
+      ? undefined
+      : context.classLevels?.get(counter.classKey);
+
+  return classLevel === undefined ? context : { ...context, classLevel };
+}
+
+/**
+ * Максимум по ступеням: берётся старшая ступень, до которой персонаж дорос.
+ *
+ * Ступени задают ряд, который формулой не пишется («на 3-м два заряда, на 7-м
+ * три»), поэтому там, где они есть, формула не считается вовсе. Не дорос до
+ * первой ступени — зарядов нет.
+ *
+ * @param progression - максимум по уровням: ключ — уровень строкой
+ * @param level - уровень, от которого считаем (класса либо персонажа)
+ * @returns максимум зарядов; 0 — персонаж не дорос до первой ступени
+ */
+export function progressionCounterMax(
+  progression: Record<string, number>,
+  level: number,
+): number {
+  const exact = progression[String(level)];
+
+  if (exact !== undefined) {
+    return exact;
+  }
+
+  const reached = Object.keys(progression)
+    .map(Number)
+    .filter((step) => step <= level)
+    .sort((stepA, stepB) => stepB - stepA);
+
+  return reached.length > 0 ? (progression[String(reached[0])] ?? 0) : 0;
+}
+
+/**
+ * Максимум с оглядкой на нижнюю границу счётчика.
+ *
+ * Граница подпирает расчёт снизу, а не складывается с ним: вдохновение барда
+ * равно модификатору Харизмы, но не меньше одного — с Харизмой +0 вдохновение
+ * одно, а с Харизмой +2 их два, а не три.
+ *
+ * @param max - посчитанный максимум
+ * @param min - нижняя граница максимума; нет или 0 — границы нет
+ * @returns максимум не ниже границы
+ */
+export function withCounterMinimum(
+  max: number,
+  min: number | undefined,
+): number {
+  if (!min || min <= COUNTER_COUNT_MIN) {
+    return max;
+  }
+
+  return Math.max(max, clamp(min, COUNTER_COUNT_MIN, COUNTER_COUNT_MAX));
+}
+
+/**
+ * Максимум счётчика: с формулой он считается от листа, без формулы — лежит
+ * числом.
+ *
+ * Считается при чтении, а не хранится: бонус мастерства и модификатор
+ * характеристики растут вместе с персонажем, и записанное число разошлось бы с
+ * листом при первом же повышении уровня.
+ *
+ * @param actor - лист персонажа
+ * @param counter - состояние счётчика
+ * @returns максимум зарядов
+ */
+export function resolveCounterMax(
+  actor: DnDActor,
+  counter: ActorCounterState,
+): number {
+  return resolveCounterMaxIn(buildCounterFormulaContext(actor), counter);
+}
+
+/**
+ * Один ли это счётчик. Сравнение по {@link counterIdentity} вместо пары полей:
+ * у ресурсов черт `classKey` пуст, и прежнее сравнение сходилось у всех сразу.
+ *
+ * @param first - первый счётчик
+ * @param second - второй счётчик
+ */
+export function isSameCounter(
+  first: ActorCounterState,
+  second: ActorCounterState,
+): boolean {
+  return counterIdentity(first) === counterIdentity(second);
+}
+
+/**
+ * Ключ «класса» у своего ресурса игрока: его заводит окно ресурсов листа, и
+ * ни класса, ни записи с дарами за ним нет.
+ */
+export const CUSTOM_COUNTER_CLASS_KEY = 'custom';
+
+/**
+ * Есть ли у ресурса что показать игроку.
+ *
+ * Ресурс, выданный записью (классом, чертой, видом), без зарядов ещё не
+ * появился: «Скороход» лесного эльфа приходит с 3 уровня, и плитка «0/0» на
+ * первом читалась бы как потраченный ресурс. Из актора такой счётчик не
+ * убирается — пересчёт на повышении уровня сам поднимет его максимум.
+ *
+ * Свой ресурс игрока с нулём показывается: ноль он выставил сам, и спрятанный
+ * счётчик не найти, чтобы вернуть ему заряды.
+ *
+ * @param counter - состояние счётчика
+ * @param max - посчитанный максимум
+ * @returns true — ресурс показывается на листе и в сводке отдыха
+ */
+export function isCounterAvailable(
+  counter: ActorCounterState,
+  max: number,
+): boolean {
+  if (max > COUNTER_COUNT_MIN) {
+    return true;
+  }
+
+  // Своим считается и ресурс без класса и без записи-владельца: выданный
+  // ресурс владельца называет всегда, а безымянный пришёл только от игрока
+  return (
+    !counter.featureId
+    && (!counter.classKey || counter.classKey === CUSTOM_COUNTER_CLASS_KEY)
+  );
+}
+
+/**
+ * Совпадают ли два списка счётчиков по содержимому.
+ *
+ * Нужен пересчётам, которые лист запускает сам на смене уровня: лист
+ * сохраняется только при настоящей разнице, а не на каждом прогоне. Незаданное
+ * поле равно отсутствующему — счётчик из хранилища и собранный заново
+ * расходятся ровно этим.
+ *
+ * @param first - первый список
+ * @param second - второй список
+ */
+export function isSameCounterList(
+  first: ReadonlyArray<ActorCounterState>,
+  second: ReadonlyArray<ActorCounterState>,
+): boolean {
+  return (
+    first.length === second.length
+    && first.every(
+      (counter, index) =>
+        counterSignature(counter) === counterSignature(second[index]),
+    )
+  );
+}
+
+/**
+ * Строка содержимого счётчика без учёта порядка полей и незаданных значений.
+ *
+ * @param counter - состояние счётчика; нет — пустая подпись
+ */
+function counterSignature(counter: ActorCounterState | undefined): string {
+  return JSON.stringify(
+    Object.entries(counter ?? {})
+      .filter(([, value]) => value !== undefined)
+      .sort(([keyA], [keyB]) => keyA.localeCompare(keyB)),
+  );
+}
+
+/**
+ * Пересчитывает максимумы счётчиков с формулой; текущее растёт вместе с
+ * максимумом и обрезается при падении ({@link resizeCounterCurrent}).
+ *
+ * Нужен при повышении уровня: у ресурса с максимумом по бонусу мастерства он
+ * обязан вырасти вместе с ним, а у ресурса, максимум которого упал, в списке
+ * осталось бы «3/2».
+ *
+ * @param actor - лист персонажа (уже с новыми уровнем и характеристиками)
+ * @param counters - текущий список счётчиков
+ * @returns список счётчиков с пересчитанными максимумами
+ */
+export function refreshCounterMaxima(
+  actor: DnDActor,
+  counters: ReadonlyArray<ActorCounterState>,
+): ActorCounterState[] {
+  const context = buildCounterFormulaContext(actor);
+
+  return counters.map((counter) => {
+    if (!counter.maxFormula?.trim()) {
+      return counter;
+    }
+
+    const max = resolveCounterMaxIn(context, counter);
+
+    return {
+      ...counter,
+      max,
+      current: resizeCounterCurrent(counter, max, {
+        startsEmpty: counterFillsByAction(counter),
+      }),
+    };
+  });
+}
+
+// ── Восстановление на отдыхе ─────────────────────────────────
+
+/** Вид отдыха как ключ правила восстановления в счётчике. */
+export type CounterRestKey = 'shortRest' | 'longRest';
+
+/** Виды отдыха в порядке показа. */
+export const COUNTER_REST_KEYS: readonly CounterRestKey[] = [
+  'shortRest',
+  'longRest',
+];
+
+/** Правило «отдых не возвращает ничего». */
+const NO_RECOVERY: CounterRecoveryRule = {
+  mode: 'none',
+  amount: COUNTER_RECOVERY_AMOUNT_MIN,
+};
+
+/** Правило «отдых возвращает все заряды». */
+const FULL_RECOVERY: CounterRecoveryRule = {
+  mode: 'all',
+  amount: COUNTER_RECOVERY_AMOUNT_MIN,
+};
+
+/**
+ * Правило «отдых возвращает один заряд»: так короткий отдых восстанавливает
+ * «Второе дыхание» и вдохновение барда правил 2024 года.
+ */
+const ONE_CHARGE_RECOVERY: CounterRecoveryRule = {
+  mode: 'amount',
+  amount: COUNTER_SHORT_REST_ONE_AMOUNT,
+};
+
+/** Режимы правила отдыха: по ним проверяется правило из записи */
+const COUNTER_RECOVERY_MODES = [
+  'none',
+  'all',
+  'amount',
+] as const satisfies readonly CounterRecoveryMode[];
+
+/**
+ * Правило отдыха в записи ресурса. Незнакомый режим — правило не читается;
+ * число зарядов, которого нет или которое не число, считается единицей, а
+ * меньшее единицы поднимается до неё.
+ */
+const CounterRecoveryRuleSchema = z.object({
+  mode: z.enum(COUNTER_RECOVERY_MODES),
+  amount: z
+    .number()
+    .finite()
+    .catch(COUNTER_RECOVERY_AMOUNT_MIN)
+    .transform((amount) =>
+      Math.max(COUNTER_RECOVERY_AMOUNT_MIN, Math.round(amount)),
+    ),
+});
+
+/**
+ * Правило отдыха из записи ресурса. Записи приходят из компендиума и из
+ * мастерской как есть, поэтому правило проверяется схемой.
+ *
+ * @param value - правило из записи
+ * @returns правило либо `undefined`, если оно не задано или не читается
+ */
+function readCounterRecoveryRule(
+  value: unknown,
+): CounterRecoveryRule | undefined {
+  const parsed = CounterRecoveryRuleSchema.safeParse(value);
+
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * Отдых ресурса из его определения — полями счётчика на листе. Раздельные
+ * правила едут на лист вместе с откатом одним словом: отдых читает их первыми
+ * ({@link getCounterRecoveryRules}), и ресурс, которому оба отдыха ничего не
+ * возвращают, остаётся пустым и после продолжительного.
+ *
+ * @param definition - определение ресурса: класса, черты, вида
+ * @returns поля отдыха для состояния счётчика
+ */
+export function counterDefinitionRest(
+  definition: CounterDefinitionExtras & { recovery: CounterRecovery },
+): Pick<ActorCounterState, 'recovery' | 'shortRest' | 'longRest'> {
+  const shortRest = readCounterRecoveryRule(definition.shortRest);
+  const longRest = readCounterRecoveryRule(definition.longRest);
+
+  return {
+    recovery: definition.recovery,
+    ...(shortRest ? { shortRest } : {}),
+    ...(longRest ? { longRest } : {}),
+  };
+}
+
+/**
+ * Откат ресурса одним выбором формы: слово отката либо «отдых ничего не
+ * возвращает». Четвёртого слова у {@link CounterRecovery} нет — такой ресурс
+ * записывается раздельными правилами с режимом `none`.
+ */
+export type CounterRecoveryChoice = CounterRecovery | 'none';
+
+/** Выбор формы «отдых ничего не возвращает» */
+export const COUNTER_RECOVERY_CHOICE_NONE = 'none';
+
+/** Откат ресурса в форме: выбор и правила записи, которые форма не правит */
+export interface CounterRecoveryForm {
+  /** Выбор в поле «Восстановление» */
+  choice: CounterRecoveryChoice;
+  /**
+   * Раздельные правила записи, которые одним выбором не сказать («два заряда
+   * коротким, все продолжительным»): форма несёт их как есть, чтобы открытие и
+   * сохранение записи не упростило отдых ресурса молча.
+   */
+  customRest?: Pick<CounterDefinitionExtras, 'shortRest' | 'longRest'>;
+}
+
+/**
+ * Откат ресурса записи — выбором формы.
+ *
+ * @param definition - определение ресурса
+ * @returns выбор и, если правила записи им не выражаются, сами правила
+ */
+export function readCounterRecoveryForm(
+  definition: CounterDefinitionExtras & { recovery?: CounterRecovery },
+): CounterRecoveryForm {
+  // Определение без слова отката читается продолжительным отдыхом
+  const recovery: CounterRecovery = definition.recovery ?? 'long';
+
+  const { shortRest, longRest } = counterDefinitionRest({
+    ...definition,
+    recovery,
+  });
+
+  if (!shortRest && !longRest) {
+    return { choice: recovery };
+  }
+
+  // Задано хоть одно правило — недостающее читается как «ничего»
+  const isNone =
+    (shortRest?.mode ?? 'none') === 'none'
+    && (longRest?.mode ?? 'none') === 'none';
+
+  return isNone
+    ? { choice: COUNTER_RECOVERY_CHOICE_NONE }
+    : {
+        choice: recovery,
+        customRest: {
+          ...(shortRest ? { shortRest } : {}),
+          ...(longRest ? { longRest } : {}),
+        },
+      };
+}
+
+/**
+ * Откат ресурса из выбора формы — полями определения.
+ *
+ * @param form - выбор формы и несённые ею правила записи
+ * @returns слово отката и, если нужны, раздельные правила
+ */
+export function buildCounterRecoveryForm(
+  form: CounterRecoveryForm,
+): CounterDefinitionExtras & { recovery: CounterRecovery } {
+  if (form.choice === COUNTER_RECOVERY_CHOICE_NONE) {
+    // Слово — ближайшее для потребителей, которые правил ещё не читают
+    return { recovery: 'long', shortRest: NO_RECOVERY, longRest: NO_RECOVERY };
+  }
+
+  return { recovery: form.choice, ...form.customRest };
+}
+
+/**
+ * Значение только что заведённого счётчика: полный, а у ресурса «появляется
+ * пустым» — ноль. «Очки мутации» набирают тратой ячейки: полный счётчик у
+ * нового персонажа был бы подарком, которого правило не даёт.
+ *
+ * @param definition - определение ресурса
+ * @param max - посчитанный максимум
+ * @returns текущее значение нового счётчика
+ */
+export function initialCounterCurrent(
+  definition: CounterDefinitionExtras,
+  max: number,
+): number {
+  return definition.startsEmpty === true ? COUNTER_COUNT_MIN : max;
+}
+
+/**
+ * Текущее значение счётчика при смене максимума — как у хитов на повышении
+ * уровня: максимум вырос на Δ — текущее растёт на Δ (потраченное остаётся
+ * потраченным: 3/5 → 18/20), упал — обрезается.
+ *
+ * Прежние правила остаются у двух: у ресурса «появляется пустым» (его набирают
+ * действием, и рост максимума его не наполняет) и у счётчика, чей прежний
+ * максимум был 0, — «0 из 0» ничего не тратило, и ресурс приходит как новый
+ * ({@link initialCounterCurrent}).
+ *
+ * @param previous - счётчик до пересчёта: текущее и прежний максимум
+ * @param nextMax - новый максимум
+ * @param definition - ресурс «появляется пустым»
+ * @returns новое текущее значение
+ */
+export function resizeCounterCurrent(
+  previous: Pick<ActorCounterState, 'current' | 'max'>,
+  nextMax: number,
+  definition: CounterDefinitionExtras = {},
+): number {
+  if (previous.max <= COUNTER_COUNT_MIN) {
+    return initialCounterCurrent(definition, nextMax);
+  }
+
+  const growth =
+    definition.startsEmpty === true ? 0 : Math.max(0, nextMax - previous.max);
+
+  return clamp(previous.current + growth, COUNTER_COUNT_MIN, nextMax);
+}
+
+/**
+ * Набирается ли ресурс только действием: ни короткий, ни продолжительный
+ * отдых ему ничего не возвращает. Такой ресурс на листе ведёт себя как
+ * «появляется пустым» — у счётчика листа своего признака для этого нет.
+ *
+ * @param counter - счётчик листа
+ * @returns `true`, если отдых его не наполняет
+ */
+export function counterFillsByAction(
+  counter: Pick<ActorCounterState, 'recovery' | 'shortRest' | 'longRest'>,
+): boolean {
+  const rules = getCounterRecoveryRules(counter);
+
+  return rules.shortRest.mode === 'none' && rules.longRest.mode === 'none';
+}
+
+/**
+ * Правила восстановления счётчика по видам отдыха.
+ *
+ * Без своих правил читается легаси-поле `recovery`, где отдых назван один:
+ * короткий отдых в правилах короче продолжительного, поэтому ресурс с откатом
+ * `short` восстанавливается и продолжительным тоже. Так же его разбирает лист
+ * на сайте.
+ *
+ * @param counter - состояние счётчика
+ * @returns правила короткого и продолжительного отдыха
+ */
+export function getCounterRecoveryRules(
+  counter: Pick<ActorCounterState, 'recovery' | 'shortRest' | 'longRest'>,
+): Record<CounterRestKey, CounterRecoveryRule> {
+  if (counter.shortRest || counter.longRest) {
+    return {
+      shortRest: counter.shortRest ?? NO_RECOVERY,
+      longRest: counter.longRest ?? NO_RECOVERY,
+    };
+  }
+
+  return {
+    shortRest: shortRestRuleOf(counter.recovery),
+    longRest: FULL_RECOVERY,
+  };
+}
+
+/**
+ * Что возвращает короткий отдых ресурсу, у которого отдых назван одним словом.
+ *
+ * @param recovery - вид отката счётчика
+ * @returns правило короткого отдыха
+ */
+function shortRestRuleOf(
+  recovery: CounterRecovery | undefined,
+): CounterRecoveryRule {
+  if (recovery === 'short') {
+    return FULL_RECOVERY;
+  }
+
+  return recovery === 'short-one' ? ONE_CHARGE_RECOVERY : NO_RECOVERY;
+}
+
+/**
+ * Сколько зарядов вернёт правило: «все заряды» — до максимума, «своё число» —
+ * заданное количество (выше максимума оно не поднимет).
+ *
+ * @param rule - правило восстановления
+ * @param max - максимум зарядов счётчика
+ * @returns число возвращаемых зарядов
+ */
+export function getCounterRecoveryAmount(
+  rule: CounterRecoveryRule,
+  max: number,
+): number {
+  if (rule.mode === 'none') {
+    return 0;
+  }
+
+  return rule.mode === 'all' ? max : clamp(Math.trunc(rule.amount), 0, max);
+}
+
+/**
+ * Приводит правило восстановления к допустимым значениям: число зарядов — целое
+ * не меньше минимума и не больше максимума ресурса.
+ *
+ * @param rule - правило восстановления
+ * @param max - максимум зарядов счётчика
+ */
+export function normalizeCounterRecoveryRule(
+  rule: CounterRecoveryRule,
+  max: number,
+): CounterRecoveryRule {
+  return {
+    mode: rule.mode,
+    amount: clamp(
+      Math.trunc(rule.amount),
+      COUNTER_RECOVERY_AMOUNT_MIN,
+      Math.max(COUNTER_RECOVERY_AMOUNT_MIN, max),
+    ),
+  };
+}

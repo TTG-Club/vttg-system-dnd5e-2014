@@ -1,29 +1,105 @@
-import type {
-  ActiveEffect,
-  Actor,
-  Creature,
-  ResolvedActorStats,
-} from '@vtt/shared/system/dnd.js';
 import type { Ref } from 'vue';
 
-import { systemRegistry } from '@vtt/shared';
-import { isDnDEffect, resolveActorStats } from '@vtt/shared/system/dnd.js';
-import { computed, ref } from 'vue';
+import type {
+  ActiveEffect,
+  DnDActor,
+  DnDCreature,
+  DnDSceneEntity,
+  FormulaContext,
+  ResolvedActorStats,
+} from '@vtt/shared/system/dnd.js';
+
+import { computed } from 'vue';
 
 import { useAuraStore } from '@/stores/auraStore';
+import { systemRegistry } from '@vtt/shared';
+import {
+  buildResolvedFormulaContext,
+  collectActiveEffects,
+  combineEffectsWithAmbient,
+  isActiveEffect,
+  isDnDEffect,
+  resolveActorStats,
+} from '@vtt/shared/system/dnd.js';
 
-export const globalDebugError = ref<string | null>(null);
+/**
+ * Ауры карты, которые накрывают сущность, в форме D&D: контракт отдаёт их
+ * нейтральной базой.
+ *
+ * @param entityId - сущность
+ * @returns эффекты аур
+ */
+export function listAmbientEffects(entityId: string): ActiveEffect[] {
+  return useAuraStore().getAmbientEffectsForActor(entityId).filter(isDnDEffect);
+}
+
+/**
+ * Действующие эффекты сущности вместе с аурами карты.
+ *
+ * @param entity - сущность
+ * @returns эффекты без дублей одноимённых
+ */
+export function collectEffectsWithAuras(
+  entity: DnDSceneEntity,
+): readonly ActiveEffect[] {
+  return combineEffectsWithAmbient(
+    collectActiveEffects(entity),
+    listAmbientEffects(entity.id),
+  );
+}
+
+/**
+ * Итоговые числа сущности мира на клиенте — вместе с аурами карты, как их
+ * показывает сам лист. Один расчёт на лист, быстрые панели и горячую панель:
+ * Сл спасброска, бонус атаки и модификаторы, посчитанные без аур, расходились
+ * с листом у того, кому аура поднимает характеристику.
+ *
+ * Без аур клиент считает только то, что названо в тесте `entityStatsCallsites`
+ * с причиной: хранимые числа листа и расчёты цели, которые движок и ядро
+ * ведут без аур.
+ *
+ * @param entity - персонаж или существо
+ * @returns итоговые числа с аурами
+ */
+export function resolveEntityStats(
+  entity: DnDActor | DnDCreature,
+): ResolvedActorStats {
+  return resolveActorStats(entity, listAmbientEffects(entity.id));
+}
+
+/**
+ * Контекст формул сущности на клиенте — от итоговых чисел листа вместе с
+ * аурами карты, как их показывает сам лист. Аура, поднявшая характеристику,
+ * меняет и Сл, и урон формулой: без неё бросок разошёлся бы с листом.
+ *
+ * Готовые числа (`stats`) передаёт тот, кто их уже посчитал, — с теми же
+ * аурами ({@link listAmbientEffects}).
+ *
+ * @param entity - персонаж или существо
+ * @param stats - уже посчитанные числа листа с аурами
+ * @returns контекст формул
+ */
+export function buildEntityFormulaContext(
+  entity: DnDActor | DnDCreature,
+  stats?: ResolvedActorStats,
+): FormulaContext {
+  return buildResolvedFormulaContext(
+    entity,
+    stats ? { stats } : { ambientEffects: listAmbientEffects(entity.id) },
+  );
+}
 
 /**
  * Хук для реактивного получения итоговых статов актера
  * с учетом всех Active Effects и базовых формул системы.
+ *
+ * @param actorRef - ссылка на актёра или существо листа
+ * @returns итоговые статы и полный список действующих эффектов
  */
 export function useResolvedStats(
-  actorRef: Ref<Actor | Creature | null | undefined>,
+  actorRef: Ref<DnDActor | DnDCreature | null | undefined>,
 ) {
-  const auraStore = useAuraStore();
-
-  const combinedEffects = computed(() => {
+  const combinedEffects = computed<ActiveEffect[]>(() => {
     const actor = actorRef.value;
 
     if (!actor) {
@@ -32,37 +108,16 @@ export function useResolvedStats(
 
     const system = systemRegistry.getSystem();
 
-    const nativeEffectsRaw = system.collectActiveEffects
-      ? system.collectActiveEffects(actor)
-      : [];
+    // Контракт отдаёт эффекты непрозрачным `unknown[]` — сужаем гвардом движка
+    const nativeEffects = (
+      system.collectActiveEffects ? system.collectActiveEffects(actor) : []
+    ).filter(isActiveEffect);
 
-    const nativeEffects = nativeEffectsRaw.filter(
-      (eff): eff is ActiveEffect =>
-        typeof eff === 'object'
-        && eff !== null
-        && 'id' in eff
-        && typeof eff.id === 'string'
-        && 'name' in eff
-        && typeof eff.name === 'string',
-    );
+    const ambientEffects = listAmbientEffects(actor.id);
 
-    // Ambient-ауры контракт отдаёт нейтральной базой — сужаем к D&D-форме.
-    const ambient = auraStore
-      .getAmbientEffectsForActor(actor.id)
-      .filter(isDnDEffect);
-
-    const safeAmbient = ambient.filter((ambientEff: ActiveEffect) => {
-      const ambientBaseId = ambientEff.id.split('_aura_')[0];
-
-      return !nativeEffects.some(
-        (nativeEff) =>
-          nativeEff.id === ambientBaseId
-          || (nativeEff.name || '').trim().toLowerCase()
-            === (ambientEff.name || '').trim().toLowerCase(),
-      );
-    });
-
-    return [...nativeEffects, ...safeAmbient];
+    // Отсев дублей — правило движка «одноимённые эффекты не складываются»:
+    // повторять его здесь нельзя, иначе две реализации разойдутся
+    return combineEffectsWithAmbient(nativeEffects, ambientEffects);
   });
 
   /**

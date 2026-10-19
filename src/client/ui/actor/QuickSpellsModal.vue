@@ -1,19 +1,43 @@
 <script setup lang="ts">
   import type { TypedWebSocketClient } from '@vtt/shared';
-  import type { Actor, Spell } from '@vtt/shared/system/dnd.js';
+  import type {
+    CreatureSpellcastingBlock,
+    DnDActor,
+    DnDCreature,
+    DnDSceneEntity,
+    Spell,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { generateId } from '@vtt/shared';
-  import { computed, ref, watch } from 'vue';
+  import { computed, ref } from 'vue';
 
-  import { requireSocket } from '@/core/entityUtils';
+  import { findEntityInWorld, requireSocket } from '@/core/entityUtils';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { useWorldStore } from '@/stores/worldStore';
+  import { generateId, isActorEntity } from '@vtt/shared';
+  import {
+    ensureCreatureSpellsInBlocks,
+    isDndSceneEntity,
+    isDndSceneEntityRecord,
+    isSpell,
+    syncCreatureSpellcastingUses,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { SPELL_MIME } from './constants';
+  import { useWorldEntityCopy } from '../../composables/useWorldEntityCopy';
+  import CreatureSpellsBlock from '../creature/CreatureSpellsBlock.vue';
+  import {
+    QUICK_PANEL_LABELS,
+    QUICK_PANEL_MODAL_SIZE,
+    SPELL_MIME,
+  } from './constants';
   import ActorSpellsTab from './tabs/ActorSpellsTab.vue';
 
   interface Props {
     open: boolean;
+    /**
+     * Идентификатор выделенной сущности. Имя пропа историческое — панель над
+     * хотбаром одна на актёра и существо, и сюда приезжает идентификатор любой
+     * из них.
+     */
     actorId: string;
     worldId: string;
     socket: TypedWebSocketClient | null;
@@ -27,27 +51,30 @@
 
   const worldStore = useWorldStore();
 
-  /** Реактивный актёр из worldStore (source of truth) */
-  const storeActor = computed(() => {
-    const world = worldStore.getWorldById(props.worldId);
-
-    return (
-      world?.actors.find((actor: Actor) => actor.id === props.actorId) ?? null
+  /**
+   * Реактивная сущность из worldStore (источник истины) — актёр или существо.
+   *
+   * Мир хоста хранит их в нейтральной форме, поэтому D&D-форму подтверждает
+   * гвард границы, а не приведение типа.
+   */
+  const storeEntity = computed<DnDSceneEntity | null>(() => {
+    const entity = findEntityInWorld(
+      worldStore.getWorldById(props.worldId),
+      props.actorId,
     );
+
+    return entity && isDndSceneEntity(entity) ? entity : null;
   });
 
-  /** Локальная копия актёра для компонента (синхронизируется из store) */
-  const localActor = ref<Actor | null>(null);
+  /** Локальная копия сущности для компонента (синхронизируется из store) */
+  const localActor = ref<DnDSceneEntity | null>(null);
 
-  watch(
-    storeActor,
-    (newActor) => {
-      if (newActor) {
-        localActor.value = JSON.parse(JSON.stringify(newActor));
-      }
-    },
-    { immediate: true, deep: true },
-  );
+  // Копия следует за миром; серверу уходит только то, чем её изменило окно
+  const { saveCopy } = useWorldEntityCopy({
+    copy: localActor,
+    readWorld: () => storeEntity.value,
+    isEntity: isDndSceneEntityRecord,
+  });
 
   const isOpen = computed({
     get: () => props.open,
@@ -55,17 +82,60 @@
   });
 
   /**
+   * Лист персонажа, если выделен он: у него заклинания живут ячейками и
+   * подготовкой, и вкладка своя.
+   */
+  const localActorSheet = computed<DnDActor | null>(() =>
+    localActor.value && isActorEntity(localActor.value)
+      ? localActor.value
+      : null,
+  );
+
+  /** Статблок существа, если выделено оно */
+  const localCreature = computed<DnDCreature | null>(() =>
+    localActor.value && !isActorEntity(localActor.value)
+      ? localActor.value
+      : null,
+  );
+
+  /**
    * Обработчик обновления актёра из дочернего компонента.
    * Применяет обновления к локальной копии.
    *
    * @param updates - частичные обновления актёра
    */
-  function handleActorUpdate(updates: Partial<Actor>): void {
-    if (!localActor.value) {
+  function handleActorUpdate(updates: Partial<DnDActor>): void {
+    const actor = localActorSheet.value;
+
+    if (!actor) {
       return;
     }
 
-    Object.assign(localActor.value, updates);
+    Object.assign(actor, updates);
+  }
+
+  /**
+   * Записывает заклинания существа вместе с их раскладкой по блокам и сразу
+   * сохраняет: у статблока нет режима правки с кнопкой «Сохранить».
+   *
+   * @param value - заклинания и блоки существа
+   */
+  function handleCreatureSpellbookUpdate(value: {
+    spells: Spell[];
+    blocks: CreatureSpellcastingBlock[];
+  }): void {
+    if (!localCreature.value) {
+      return;
+    }
+
+    localCreature.value.spells = value.spells;
+
+    localCreature.value.system = {
+      ...localCreature.value.system,
+      spellcastingBlocks: value.blocks,
+    };
+
+    handleImmediateSave();
   }
 
   /**
@@ -79,8 +149,7 @@
 
     try {
       requireSocket(props.socket);
-
-      props.socket.emit('actor:updated', localActor.value);
+      saveCopy(props.socket);
     } catch (error) {
       console.error('[QuickSpellsModal] Immediate save failed:', error);
     }
@@ -122,7 +191,11 @@
     event.preventDefault();
 
     try {
-      const droppedSpell = JSON.parse(spellData) as Spell;
+      const droppedSpell: unknown = JSON.parse(spellData);
+
+      if (!isSpell(droppedSpell)) {
+        return;
+      }
 
       const alreadyExists = (localActor.value.spells ?? []).some(
         (spell) => spell.name === droppedSpell.name,
@@ -138,7 +211,26 @@
         prepared: false,
       };
 
-      localActor.value.spells = [...(localActor.value.spells ?? []), newSpell];
+      const spells = [...(localActor.value.spells ?? []), newSpell];
+
+      // У существа заклинание вне блока не живёт: перетащенное сразу ложится в
+      // группу, подобранную по его зарядам. У актёра блоков нет — там список
+      // плоский, как и был
+      if (localCreature.value) {
+        handleCreatureSpellbookUpdate(
+          syncCreatureSpellcastingUses(
+            spells,
+            ensureCreatureSpellsInBlocks(
+              spells,
+              localCreature.value.system.spellcastingBlocks ?? [],
+            ),
+          ),
+        );
+
+        return;
+      }
+
+      localActor.value.spells = spells;
       handleImmediateSave();
     } catch {
       /* ошибка парсинга — игнорируем */
@@ -154,9 +246,11 @@
     /** Поднимает окно выше всех остальных */
     bringToFront: () => draggableModalRef.value?.bringToFront(),
     /** Текущий z-index окна (Vue auto-unwrap из expose) */
-    localZIndex: computed(
-      () => draggableModalRef.value?.localZIndex as number | undefined,
-    ),
+    localZIndex: computed(() => {
+      const zIndex = draggableModalRef.value?.localZIndex;
+
+      return typeof zIndex === 'number' ? zIndex : undefined;
+    }),
   });
 </script>
 
@@ -166,11 +260,11 @@
     v-model:open="isOpen"
     :draggable="true"
     :resizable="true"
-    :min-width="400"
-    :min-height="300"
-    :initial-width="520"
-    initial-height="70vh"
-    :title="`Заклинания — ${localActor?.name ?? ''}`"
+    :min-width="QUICK_PANEL_MODAL_SIZE.minWidth"
+    :min-height="QUICK_PANEL_MODAL_SIZE.minHeight"
+    :initial-width="QUICK_PANEL_MODAL_SIZE.initialWidth"
+    :initial-height="QUICK_PANEL_MODAL_SIZE.initialHeight"
+    :title="`${QUICK_PANEL_LABELS.spellsTitlePrefix}${localActor?.name ?? ''}`"
   >
     <template #body>
       <div
@@ -179,11 +273,26 @@
         @drop="handleDrop"
       >
         <ActorSpellsTab
-          v-if="localActor"
-          :actor="localActor"
+          v-if="localActorSheet"
+          :actor="localActorSheet"
           :is-edit-mode="false"
           @update:actor="handleActorUpdate"
           @immediate-save="handleImmediateSave"
+        />
+
+        <!-- Статблок существа: свой блок заклинательства (плоские DC и бонус
+          атаки, заряды вместо ячеек) -->
+        <CreatureSpellsBlock
+          v-else-if="localCreature"
+          :creature="localCreature"
+          :spells="localCreature.spells"
+          :spellcasting-blocks="localCreature.system.spellcastingBlocks"
+          :is-edit-mode="false"
+          :creature-id="localCreature.id"
+          :creature-name="localCreature.name"
+          :socket="socket"
+          can-edit
+          @update:spellbook="handleCreatureSpellbookUpdate"
         />
       </div>
     </template>

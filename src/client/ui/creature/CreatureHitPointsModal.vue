@@ -1,17 +1,55 @@
 <script setup lang="ts">
-  import type { CreatureHitPoints, HitDie } from '@vtt/shared/system/dnd.js';
+  import type {
+    CreatureHitPoints,
+    CreatureSize,
+    DnDCustomBonus,
+    DnDCustomBonusContext,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { computed, reactive, watch } from 'vue';
+  import { computed, reactive, ref, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
+  import {
+    calculateCreatureAverageHitPoints,
+    calculateCreatureHitPointsBaseBonus,
+    calculateCreatureHitPointsBonus,
+    CREATURE_HIT_POINTS_BASE_BONUS_MAX,
+    CREATURE_HIT_POINTS_BASE_BONUS_MIN,
+    CREATURE_SIZE_LABELS,
+    DEFAULT_CREATURE_HIT_DICE_COUNT,
+    formatCreatureHitPointsFormula,
+    getCreatureHitDieBySize,
+    getCustomBonusesValue,
+    parseCreatureHitDiceCount,
+    parseCreatureHitPointsBaseBonus,
+    parseCustomBonuses,
+    toStoredCustomBonus,
+  } from '@vtt/shared/system/dnd.js';
 
-  /** Доступные размеры костей хитов */
-  const HIT_DIE_OPTIONS: HitDie[] = [6, 8, 10, 12];
+  import {
+    ACTOR_LEFT_PANEL_LABELS,
+    BONUS_INPUT_FORMAT_OPTIONS,
+    HIT_POINTS_LABELS,
+    MODAL_BUTTON_LABELS,
+  } from '../actor/constants';
+  import CustomBonusRows from '../actor/CustomBonusRows.vue';
+  import { formatSignedNumber } from '../actor/utils/formatSignedNumber';
+  import {
+    CREATURE_COMBAT_LABELS,
+    CREATURE_HIT_POINTS_LABELS,
+  } from './constants';
 
   interface Props {
     open: boolean;
     hitPoints: CreatureHitPoints;
+    /** Размер существа — по правилам 2024 он задаёт кость хитов */
+    size: CreatureSize;
+    /**
+     * Числа листа для формулы: модификатор Телосложения даёт бонус за каждую
+     * кость, а все модификаторы и бонус мастерства — вклад своих бонусов
+     */
+    context: DnDCustomBonusContext;
   }
 
   const props = defineProps<Props>();
@@ -26,14 +64,33 @@
     set: (value) => emit('update:open', value),
   });
 
-  const editHp = reactive({
+  /**
+   * Черновик правки хитов существа. Кости и итогового бонуса здесь нет: их
+   * считает движок из размера, Телосложения и своих бонусов, руками задаются
+   * число костей, основа бонуса и свои бонусы.
+   */
+  interface EditableHitPoints {
+    current: number;
+    max: number;
+    temp: number;
+    hitDiceCount: number;
+  }
+
+  const editHp = reactive<EditableHitPoints>({
     current: 0,
     max: 1,
     temp: 0,
-    hitDie: 8 as HitDie,
-    hitDiceCount: 1,
-    bonus: 0,
+    hitDiceCount: DEFAULT_CREATURE_HIT_DICE_COUNT,
   });
+
+  /** Свои бонусы формулы: копии, чтобы до «Применить» лист не менялся */
+  const draftBonuses = ref<DnDCustomBonus[]>([]);
+
+  /**
+   * Своё число основы бонуса вместо «Телосложение за каждую кость»; `null` —
+   * основа считается по правилам и идёт за числом костей.
+   */
+  const draftBaseBonus = ref<number | null>(null);
 
   // При открытии — подставляем текущие значения
   watch(
@@ -45,32 +102,114 @@
 
         editHp.max = props.hitPoints.max ?? props.hitPoints.average ?? 1;
         editHp.temp = props.hitPoints.temp ?? 0;
-        editHp.hitDie = props.hitPoints.hitDie ?? 8;
-        editHp.hitDiceCount = props.hitPoints.hitDiceCount ?? 1;
-        editHp.bonus = props.hitPoints.bonus ?? 0;
+
+        // У существа из компендиума число костей есть только в формуле
+        editHp.hitDiceCount =
+          props.hitPoints.hitDiceCount
+          ?? parseCreatureHitDiceCount(props.hitPoints.formula)
+          ?? DEFAULT_CREATURE_HIT_DICE_COUNT;
+
+        // Список приходит из записи мира — разбирается поштучно
+        draftBonuses.value = parseCustomBonuses(props.hitPoints.bonuses).map(
+          (row) => ({ ...row }),
+        );
+
+        draftBaseBonus.value = parseCreatureHitPointsBaseBonus(
+          props.hitPoints.baseBonus,
+        );
       }
     },
   );
 
-  /** Генерирует формулу из текущих значений */
-  function generateFormula(): string {
-    const dicePart = `${editHp.hitDiceCount}к${editHp.hitDie}`;
+  /** Модификатор Телосложения — бонус за каждую кость */
+  const constitutionModifier = computed(
+    () => props.context.abilityMods.constitution,
+  );
 
-    if (editHp.bonus === 0) {
-      return dicePart;
-    }
+  /**
+   * Свои бонусы в том виде, в каком уйдут в лист: число целое и в пределах
+   * поля. По ним же считается предпросмотр — иначе он разошёлся бы с записью.
+   */
+  const storedBonuses = computed(() =>
+    draftBonuses.value.map((row) => toStoredCustomBonus(row)),
+  );
 
-    const sign = editHp.bonus > 0 ? '+' : '-';
+  /** Вклад своих бонусов — один раз на формулу */
+  const customBonus = computed(() =>
+    getCustomBonusesValue(props.context, storedBonuses.value),
+  );
 
-    return `${dicePart} ${sign} ${Math.abs(editHp.bonus)}`;
+  /** Кость хитов — по размеру существа */
+  const hitDie = computed(() => getCreatureHitDieBySize(props.size));
+
+  /** Основа бонуса: своё число либо Телосложение за каждую кость */
+  const baseBonus = computed(() =>
+    calculateCreatureHitPointsBaseBonus(
+      editHp.hitDiceCount,
+      constitutionModifier.value,
+      draftBaseBonus.value,
+    ),
+  );
+
+  /** Основа задана своим числом — показываем кнопку возврата к правилам */
+  const isBaseBonusCustom = computed(() => draftBaseBonus.value !== null);
+
+  /** Бонус к хитам — основа и свои бонусы */
+  const bonus = computed(() =>
+    calculateCreatureHitPointsBonus(baseBonus.value, customBonus.value),
+  );
+
+  /**
+   * Правка основы бонуса: любое число становится своим, очищенное поле
+   * возвращает расчёт по Телосложению.
+   *
+   * @param value - число из поля (пустое поле — `null`/NaN)
+   */
+  function setBaseBonus(value: number | null | undefined): void {
+    draftBaseBonus.value = parseCreatureHitPointsBaseBonus(value);
   }
 
-  /** Вычисляет среднее значение из формулы */
-  function calculateAverage(): number {
-    const dieAvg = (editHp.hitDie + 1) / 2;
-
-    return Math.floor(editHp.hitDiceCount * dieAvg) + editHp.bonus;
+  /** Возвращает основу бонуса к расчёту по Телосложению */
+  function resetBaseBonus(): void {
+    draftBaseBonus.value = null;
   }
+
+  const formula = computed(() =>
+    formatCreatureHitPointsFormula(
+      editHp.hitDiceCount,
+      hitDie.value,
+      bonus.value,
+    ),
+  );
+
+  const average = computed(() =>
+    calculateCreatureAverageHitPoints(
+      editHp.hitDiceCount,
+      hitDie.value,
+      bonus.value,
+    ),
+  );
+
+  /** Кость в записи листа: «к10» */
+  const hitDieLabel = computed(
+    () => `${ACTOR_LEFT_PANEL_LABELS.hitDieLetter}${hitDie.value}`,
+  );
+
+  /**
+   * Откуда взялись кость и бонус: размер с его костью, основа бонуса (своё
+   * число или модификатор Телосложения) и свои бонусы сверху.
+   */
+  const rulesHint = computed(() => {
+    const sizePart = `${CREATURE_SIZE_LABELS[props.size]} — ${hitDieLabel.value}`;
+
+    const constitutionPart = formatSignedNumber(constitutionModifier.value);
+
+    const basePart = isBaseBonusCustom.value
+      ? CREATURE_HIT_POINTS_LABELS.bonusCustom
+      : `${CREATURE_HIT_POINTS_LABELS.bonusByConstitution} (${constitutionPart}) ${CREATURE_HIT_POINTS_LABELS.perDie}`;
+
+    return `${CREATURE_HIT_POINTS_LABELS.dieBySize} (${sizePart}), ${basePart}, ${CREATURE_HIT_POINTS_LABELS.plusCustomBonuses}.`;
+  });
 
   /** Применяет изменения очков здоровья */
   function applyHitPoints() {
@@ -78,11 +217,13 @@
       current: editHp.current,
       max: editHp.max,
       temp: editHp.temp,
-      hitDie: editHp.hitDie,
+      hitDie: hitDie.value,
       hitDiceCount: editHp.hitDiceCount,
-      bonus: editHp.bonus,
-      formula: generateFormula(),
-      average: calculateAverage(),
+      bonus: bonus.value,
+      baseBonus: draftBaseBonus.value,
+      bonuses: storedBonuses.value,
+      formula: formula.value,
+      average: average.value,
     });
 
     isOpen.value = false;
@@ -95,9 +236,9 @@
     :draggable="false"
     :resizable="false"
     :blocking="true"
-    :min-width="380"
+    :min-width="440"
     :min-height="200"
-    title="Очки здоровья и кости хитов"
+    :title="HIT_POINTS_LABELS.title"
     :z-index="Z_INDEX.MODAL_ELEVATED"
   >
     <template #body>
@@ -107,8 +248,9 @@
           <div class="flex flex-1 flex-col gap-1">
             <span
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
-              >Сейчас</span
             >
+              {{ HIT_POINTS_LABELS.current }}
+            </span>
 
             <UInput
               :model-value="editHp.current"
@@ -124,8 +266,9 @@
           <div class="flex flex-1 flex-col gap-1">
             <span
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
-              >Всего</span
             >
+              {{ HIT_POINTS_LABELS.total }}
+            </span>
 
             <UInput
               :model-value="editHp.max"
@@ -139,8 +282,9 @@
           <div class="flex flex-1 flex-col gap-1">
             <span
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
-              >Врем.</span
             >
+              {{ HIT_POINTS_LABELS.temporary }}
+            </span>
 
             <UInput
               :model-value="editHp.temp"
@@ -159,7 +303,7 @@
           <span
             class="text-[10px] font-bold tracking-wider text-muted uppercase"
           >
-            Формула хитов
+            {{ HIT_POINTS_LABELS.formula }}
           </span>
 
           <div class="flex items-center gap-2 rounded bg-elevated/40 p-2">
@@ -168,7 +312,7 @@
               <span
                 class="text-[9px] font-medium tracking-wider text-dimmed uppercase"
               >
-                Количество
+                {{ HIT_POINTS_LABELS.amount }}
               </span>
 
               <UInput
@@ -183,56 +327,95 @@
               />
             </div>
 
-            <span class="mt-4 font-light text-dimmed">к</span>
+            <span class="mt-4 font-light text-dimmed">×</span>
 
-            <!-- Размер кости -->
+            <!-- Кость: по размеру, не правится -->
             <div class="flex flex-1 flex-col gap-0.5">
               <span
                 class="text-[9px] font-medium tracking-wider text-dimmed uppercase"
               >
-                Кость
+                {{ HIT_POINTS_LABELS.die }}
               </span>
 
-              <USelect
-                :model-value="editHp.hitDie"
-                :items="
-                  HIT_DIE_OPTIONS.map((hitDie) => ({
-                    label: String(hitDie),
-                    value: hitDie,
-                  }))
-                "
-                size="sm"
-                @update:model-value="editHp.hitDie = Number($event) as HitDie"
-              />
+              <span
+                class="rounded border border-muted px-2 py-1 text-sm font-medium text-toned tabular-nums"
+              >
+                {{ hitDieLabel }}
+              </span>
             </div>
 
             <span class="mt-4 font-light text-dimmed">+</span>
 
-            <!-- Бонус -->
+            <!-- Основа бонуса: по Телосложению, пока не вписано своё число;
+              свои бонусы ниже прибавляются к ней -->
             <div class="flex flex-col gap-0.5">
               <span
                 class="text-[9px] font-medium tracking-wider text-dimmed uppercase"
               >
-                Бонус
+                {{ HIT_POINTS_LABELS.bonus }}
               </span>
 
-              <UInput
-                :model-value="editHp.bonus"
-                type="number"
-                size="sm"
-                class="w-16"
-                @update:model-value="editHp.bonus = Number($event)"
-              />
+              <div class="flex items-center gap-1">
+                <UInputNumber
+                  :model-value="baseBonus"
+                  :min="CREATURE_HIT_POINTS_BASE_BONUS_MIN"
+                  :max="CREATURE_HIT_POINTS_BASE_BONUS_MAX"
+                  :format-options="BONUS_INPUT_FORMAT_OPTIONS"
+                  :increment="false"
+                  :decrement="false"
+                  size="sm"
+                  class="w-20"
+                  @update:model-value="setBaseBonus"
+                />
+
+                <UTooltip
+                  v-if="isBaseBonusCustom"
+                  :text="CREATURE_HIT_POINTS_LABELS.resetBaseBonus"
+                >
+                  <UButton
+                    icon="tabler:restore"
+                    color="neutral"
+                    variant="ghost"
+                    size="sm"
+                    square
+                    :aria-label="CREATURE_HIT_POINTS_LABELS.resetBaseBonus"
+                    @click.left.exact.prevent="resetBaseBonus"
+                  />
+                </UTooltip>
+              </div>
             </div>
           </div>
 
           <div
             class="mt-1 flex items-center justify-between text-xs text-dimmed"
           >
-            <span>Формула: {{ generateFormula() }}</span>
+            <span
+              >{{ CREATURE_COMBAT_LABELS.formulaPrefix }} {{ formula }}</span
+            >
 
-            <span>Среднее: {{ calculateAverage() }}</span>
+            <span
+              >{{ CREATURE_COMBAT_LABELS.averagePrefix }} {{ average }}</span
+            >
           </div>
+
+          <p class="text-xs text-dimmed">
+            {{ rulesHint }}
+          </p>
+        </div>
+
+        <!-- Свои бонусы формулы: те же строки, что у КД и инициативы, —
+          числом, модификатором характеристики или бонусом мастерства -->
+        <div class="flex flex-col gap-2">
+          <span
+            class="text-[10px] font-bold tracking-wider text-muted uppercase"
+          >
+            {{ CREATURE_HIT_POINTS_LABELS.customBonusesTitle }}
+          </span>
+
+          <CustomBonusRows
+            v-model="draftBonuses"
+            :context="context"
+          />
         </div>
 
         <!-- Кнопки -->
@@ -243,7 +426,7 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -251,7 +434,7 @@
             size="sm"
             @click.left.exact.prevent="applyHitPoints"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

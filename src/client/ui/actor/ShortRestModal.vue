@@ -1,17 +1,34 @@
 <script setup lang="ts">
   import type {
     ActorClassEntry,
+    HitDiceSpendRules,
     ManualHitDieGroup,
     ShortRestHitDiceResult,
   } from '@vtt/shared/system/dnd.js';
 
-  import { getHitDiceGroups, spendHitDice } from '@vtt/shared/system/dnd.js';
   import { computed, reactive, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
   import { useChatStore } from '@/stores/chatStore';
   import { useDiceRollerStore } from '@/stores/diceRollerStore';
+  import {
+    formatHitDiceRollTerm,
+    getHitDiceGroups,
+    listHitDiceCharges,
+    lowHitDiceBonus,
+    NO_HIT_DICE_SPEND_RULES,
+    spendHitDice,
+  } from '@vtt/shared/system/dnd.js';
+
+  import {
+    DICE_ROLL_LABELS,
+    HIT_DIE_LETTER,
+    HIT_POINTS_LABELS,
+    MODAL_BUTTON_LABELS,
+    REST_LABELS,
+    SHORT_REST_LABELS,
+  } from './constants';
 
   interface Props {
     open: boolean;
@@ -20,14 +37,26 @@
     /** Ручные кости хитов (для актёров без классов / NPC) */
     manualHitDice?: ManualHitDieGroup[];
     currentHitPoints: number;
+    /**
+     * Потолок лечения костями — С прибавкой эффектов (`hitPoints.max`), то же
+     * число, что в плитке хитов листа. Запас листа сюда не годится: с ним отдых
+     * не долечивал бы до показанного максимума.
+     */
     maxHitPoints: number;
     /** Модификатор Телосложения (прибавляется к каждой потраченной кости) */
     conMod: number;
+    /**
+     * Как черты владельца меняют трату костей хитов: максимум вместо броска,
+     * «1 и 2 как 3», бесплатная первая кость. Те же правила читает цена
+     * ресурсом (`engine/effectPay.ts`)
+     */
+    hitDiceRules?: HitDiceSpendRules;
   }
 
   const props = withDefaults(defineProps<Props>(), {
     classes: () => [],
     manualHitDice: () => [],
+    hitDiceRules: () => NO_HIT_DICE_SPEND_RULES,
   });
 
   const emit = defineEmits<{
@@ -51,6 +80,11 @@
     getHitDiceGroups(props.classes, props.manualHitDice),
   );
 
+  /** Запись кости хитов группы: «к8» */
+  function formatHitDie(die: number): string {
+    return `${HIT_DIE_LETTER}${die}`;
+  }
+
   /** Есть ли вообще кости хитов */
   const hasHitDice = computed(() =>
     hitDiceGroups.value.some((group) => group.total > 0),
@@ -59,6 +93,14 @@
   /** Форматированный модификатор Телосложения (напр. «+2», «−1») */
   const conModLabel = computed(() =>
     props.conMod >= 0 ? `+${props.conMod}` : `−${Math.abs(props.conMod)}`,
+  );
+
+  /** Выбранные к трате кости по граням */
+  const pendingPicks = computed(() =>
+    hitDiceGroups.value.map((group) => ({
+      die: group.die,
+      count: pending[group.die] ?? 0,
+    })),
   );
 
   /** Суммарно выбрано костей к трате */
@@ -71,14 +113,19 @@
 
   /** Текст кнопки завершения отдыха (зависит от выбора костей) */
   const finishButtonLabel = computed(() =>
-    totalPending.value > 0 ? 'Бросить и завершить отдых' : 'Завершить отдых',
+    totalPending.value > 0
+      ? SHORT_REST_LABELS.rollAndFinish
+      : SHORT_REST_LABELS.finish,
   );
 
-  /** Формула броска выбранных костей (напр. «2к10 + 1к8 + 4») */
+  /**
+   * Формула броска выбранных костей (напр. «2к10 + 1к8 + 4»). Под правилом
+   * «максимум вместо броска» кости не бросаются — в формулу идёт их максимум.
+   */
   const rollFormula = computed(() => {
-    const diceParts = hitDiceGroups.value
-      .filter((group) => (pending[group.die] ?? 0) > 0)
-      .map((group) => `${pending[group.die]}к${group.die}`);
+    const diceParts = pendingPicks.value
+      .filter((pick) => pick.count > 0)
+      .map((pick) => formatHitDiceRollTerm(pick, props.hitDiceRules.maximize));
 
     if (diceParts.length === 0) {
       return '';
@@ -138,34 +185,43 @@
     if (totalPending.value > 0 && rollFormula.value) {
       const rollData = diceRollerStore.parseAndRoll(rollFormula.value);
 
-      const healed = Math.max(0, rollData.total);
+      // «1 и 2 считаются как 3»: роллер приложения этого правила не знает —
+      // сумма поправляется по выпавшим значениям
+      const lowBonus = props.hitDiceRules.lowAsThree
+        ? lowHitDiceBonus(rollData.dice.flatMap((group) => group.values))
+        : 0;
+
+      const healed = Math.max(0, rollData.total + lowBonus);
 
       newCurrent = Math.min(
         props.maxHitPoints,
         props.currentHitPoints + healed,
       );
 
-      rollData.label = `Короткий отдых — кости хитов (+${
+      rollData.label = `${SHORT_REST_LABELS.rollTitlePrefix}${
         newCurrent - props.currentHitPoints
-      } HP)`;
+      }${SHORT_REST_LABELS.rollTitleSuffix}`;
 
       chatStore.sendMessage(rollFormula.value, 'roll', rollData);
 
-      // Иммутабельно списываем выбранные кости каждого размера по очереди
-      for (const group of hitDiceGroups.value) {
-        const count = pending[group.die] ?? 0;
+      // «Первая кость после отдыха не тратится»: одна из костей этого отдыха
+      // даёт лечение, но не списывается
+      const charges = listHitDiceCharges(
+        pendingPicks.value,
+        props.hitDiceRules.freeDie,
+      );
 
-        if (count > 0) {
-          const spent = spendHitDice(
-            group.die,
-            count,
-            updatedClasses,
-            updatedManualHitDice,
-          );
+      // Иммутабельно списываем кости каждого размера по очереди
+      for (const charge of charges) {
+        const spent = spendHitDice(
+          charge.die,
+          charge.count,
+          updatedClasses,
+          updatedManualHitDice,
+        );
 
-          updatedClasses = spent.classes;
-          updatedManualHitDice = spent.manualHitDice;
-        }
+        updatedClasses = spent.classes;
+        updatedManualHitDice = spent.manualHitDice;
       }
     }
 
@@ -187,7 +243,7 @@
     :blocking="true"
     :min-width="380"
     :min-height="240"
-    title="Короткий отдых"
+    :title="REST_LABELS.short"
     :z-index="Z_INDEX.MODAL_ELEVATED"
   >
     <template #body>
@@ -196,7 +252,9 @@
         <div
           class="flex items-center justify-between rounded-lg bg-elevated/50 p-3"
         >
-          <span class="text-xs tracking-wider text-muted uppercase">Хиты</span>
+          <span class="text-xs tracking-wider text-muted uppercase">
+            {{ SHORT_REST_LABELS.hitPoints }}
+          </span>
 
           <span class="font-bold text-highlighted">
             {{ currentHitPoints }}
@@ -210,11 +268,11 @@
             <span
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
             >
-              Потратить кости хитов
+              {{ SHORT_REST_LABELS.spendHitDice }}
             </span>
 
             <span class="text-xs text-dimmed">
-              мод. ТЕЛ:
+              {{ SHORT_REST_LABELS.constitutionModPrefix }}
               <span class="font-bold text-highlighted">
                 {{ conModLabel }}
               </span>
@@ -225,7 +283,7 @@
             v-if="!hasHitDice"
             class="text-sm text-dimmed"
           >
-            Нет доступных костей хитов.
+            {{ HIT_POINTS_LABELS.hitDiceEmpty }}
           </div>
 
           <div
@@ -239,10 +297,13 @@
                 class="h-4 w-4 text-healing"
               />
 
-              <span class="font-bold text-highlighted">к{{ group.die }}</span>
+              <span class="font-bold text-highlighted">{{
+                formatHitDie(group.die)
+              }}</span>
 
               <span class="text-xs text-dimmed">
-                доступно {{ group.available }} / {{ group.total }}
+                {{ SHORT_REST_LABELS.availablePrefix }} {{ group.available }} /
+                {{ group.total }}
               </span>
             </div>
 
@@ -277,11 +338,11 @@
           v-if="totalPending > 0"
           class="rounded-lg bg-elevated/50 p-3 text-center"
         >
-          <span class="text-xs tracking-wider text-muted uppercase"
-            >Формула</span
-          >
+          <span class="text-xs tracking-wider text-muted uppercase">
+            {{ DICE_ROLL_LABELS.formula }}
+          </span>
 
-          <div class="mt-1 font-mono text-lg font-bold text-white">
+          <div class="mt-1 font-mono text-lg font-bold text-highlighted">
             {{ rollFormula }}
           </div>
         </div>
@@ -296,7 +357,7 @@
             size="md"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton

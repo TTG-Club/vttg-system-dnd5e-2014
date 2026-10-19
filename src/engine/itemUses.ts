@@ -1,0 +1,130 @@
+/**
+ * Трата зарядов магического предмета.
+ *
+ * Заряды описывает {@link ItemUses} (`GameItem.uses`): максимум, текущий
+ * остаток, способ отката и — необязательно — расход одного применения и
+ * формулу возврата. Здесь только расход; восстановление на отдыхе живёт в
+ * `restEngine.ts`, потому что это правило отдыха, а не правило предмета.
+ *
+ * @module system/dnd/itemUses
+ */
+
+import type { DnDGameItem } from './dndEntities.js';
+
+/**
+ * Молчит ли магия предмета без настройки: настройка обязательна, а её нет. По
+ * правилам 2024 такой предмет не даёт ничего — ни эффектов, ни бонуса +N.
+ * Необязательная настройка (`optional`) ничего не гейтит.
+ *
+ * @param item - предмет инвентаря
+ * @returns `true`, если магия предмета ждёт настройки
+ */
+export function isAwaitingAttunement(
+  item: Pick<DnDGameItem, 'magicAttunement' | 'isAttuned'>,
+): boolean {
+  return item.magicAttunement === 'required' && !item.isAttuned;
+}
+
+/**
+ * Закончился ли предмет: количество дошло до нуля. Такой предмет остаётся в
+ * инвентаре строкой «Закончились» и считается отсутствующим — не действует, не
+ * применяется и не бьёт, пока количество не вернут.
+ *
+ * @param item - предмет инвентаря
+ * @returns `true`, если предмета не осталось
+ */
+export function isItemDepleted(item: Pick<DnDGameItem, 'quantity'>): boolean {
+  return item.quantity <= 0;
+}
+
+/**
+ * Надет ли предмет на деле: отмечен надетым и не закончился.
+ *
+ * @param item - предмет инвентаря
+ * @returns `true`, если предмет на носителе
+ */
+export function isItemWorn(
+  item: Pick<DnDGameItem, 'equipped' | 'quantity'>,
+): boolean {
+  return Boolean(item.equipped) && !isItemDepleted(item);
+}
+
+/**
+ * Количество, вписанное от руки: целое и не меньше нуля — ноль оставляет
+ * предмет в инвентаре закончившимся.
+ *
+ * @param value - введённое число
+ * @returns количество; нечисло — `undefined`, прежнее значение не трогают
+ */
+export function normalizeItemQuantity(value: number): number | undefined {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : undefined;
+}
+
+/** Расход одного применения предмета; по умолчанию один заряд. */
+export function itemUsesCost(item: DnDGameItem): number {
+  const cost = item.uses?.cost;
+
+  return cost === undefined || cost < 1 ? 1 : cost;
+}
+
+/**
+ * Хватает ли остатка на одно применение. Предмет без зарядов применяется без
+ * ограничений — для него ответ всегда `true`.
+ *
+ * @param item - предмет инвентаря
+ */
+export function canSpendItemUses(item: DnDGameItem): boolean {
+  if (!item.uses) {
+    return true;
+  }
+
+  return item.uses.current >= itemUsesCost(item);
+}
+
+/**
+ * Возвращает копию предмета со списанным зарядом. Предмет без зарядов и предмет
+ * с недостаточным остатком возвращаются как есть — решение «можно ли применить»
+ * принимает вызывающий через {@link canSpendItemUses}, чтобы показать причину
+ * отказа, а не молча списать в минус.
+ *
+ * @param item - предмет инвентаря
+ * @returns предмет (новый объект при списании)
+ */
+export function spendItemUses(item: DnDGameItem): DnDGameItem {
+  if (!item.uses || !canSpendItemUses(item)) {
+    return item;
+  }
+
+  return {
+    ...item,
+    uses: {
+      ...item.uses,
+      current: Math.max(0, item.uses.current - itemUsesCost(item)),
+    },
+  };
+}
+
+/**
+ * Возвращает копию предмета с изменённым остатком зарядов — для ручной правки
+ * счётчика в карточке предмета. Значение зажимается в `0…max`.
+ *
+ * @param item - предмет инвентаря
+ * @param current - желаемый остаток
+ * @returns предмет (новый объект, если остаток изменился)
+ */
+export function setItemUsesCurrent(
+  item: DnDGameItem,
+  current: number,
+): DnDGameItem {
+  if (!item.uses) {
+    return item;
+  }
+
+  const clamped = Math.max(0, Math.min(item.uses.max, Math.round(current)));
+
+  if (clamped === item.uses.current) {
+    return item;
+  }
+
+  return { ...item, uses: { ...item.uses, current: clamped } };
+}

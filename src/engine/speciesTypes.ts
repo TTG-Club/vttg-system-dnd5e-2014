@@ -1,11 +1,3 @@
-import type {
-  AbilityType,
-  DefensibleDamageType,
-  SkillType,
-} from '@vtt/shared';
-
-import type { CreatureSize } from './types.js';
-
 /**
  * Ключ вида (открытый тип, как и `BackgroundKey`).
  *
@@ -15,22 +7,14 @@ import type { CreatureSize } from './types.js';
  */
 export type SpeciesKey = string;
 
-export type CreatureType =
-  | 'humanoid'
-  | 'fey'
-  | 'construct'
-  | 'celestial'
-  | 'fiend'
-  | 'undead'
-  | 'elemental'
-  | 'monstrosity'
-  | 'aberration'
-  | 'dragon'
-  | 'beast'
-  | 'giant'
-  | 'ooze'
-  | 'plant'
-  | 'swarm';
+/**
+ * Тип существа вида — тот же словарь, что и у статблока существа.
+ *
+ * Раньше это был свой союз с теми же значениями, и «Рой» жил только здесь:
+ * статблок его не знал, а гейт урона «по такому-то типу» не срабатывал ни на
+ * ком с этим типом. Один союз на оба места чинит расхождение навсегда.
+ */
+export type CreatureType = import('./creatureTypes.js').CreatureCategory;
 
 export type SpeciesGrant =
   | SkillProficiencyGrant
@@ -46,7 +30,7 @@ export type SpeciesGrant =
 export interface SkillProficiencyGrant {
   type: 'skillProficiency';
   count: number;
-  from: SkillType[];
+  from: import('@vtt/shared').SkillType[];
 }
 
 export interface WeaponProficiencyGrant {
@@ -69,7 +53,7 @@ export interface ToolProficiencyGrant {
 
 export interface SavingThrowProficiencyGrant {
   type: 'savingThrowProficiency';
-  abilities: AbilityType[];
+  abilities: import('@vtt/shared').AbilityType[];
 }
 
 export interface LanguageGrant {
@@ -83,7 +67,7 @@ export interface LanguageGrant {
  * иммунитет или уязвимость (гибко, в отличие от прежнего «только сопротивление»).
  */
 export interface DamageDefenseEntry {
-  damageType: DefensibleDamageType;
+  damageType: import('@vtt/shared').DefensibleDamageType;
   kind: import('./damageConstants.js').DamageDefenseKind;
 }
 
@@ -105,38 +89,18 @@ export interface DarkvisionGrant {
 }
 
 /**
- * Повышение характеристик, выдаваемое видом или подвидом (редакция 2014).
+ * Встроенный вариант-подвид ЛЕГАСИ-формата.
  *
- * В 2014 характеристики поднимает именно вид, а не предыстория: дварф даёт
- * +2 Телосложения, горный дварф сверху +2 Силы, полуэльф — +2 Харизмы и по +1
- * к двум характеристикам на выбор. Поэтому нужны обе формы:
- *
- * - `fixed` — жёсткие прибавки (`{ constitution: 2 }`);
- * - `choice` — `+amount` к `count` характеристикам из набора `from`
- *   (пусто = любая, кроме уже поднятых фиксированно). Выбор делает игрок в
- *   мастере вида.
- *
- * Форма намеренно повторяет {@link FeatAbilityScoreIncrease}: и черта, и вид
- * решают одну задачу, и редакторы у них общие.
+ * @deprecated Подвид теперь — самостоятельная запись вида со ссылкой
+ * {@link SpeciesDefinition.parentKey} на родителя (как на сайте TTG Club).
+ * Старые паки и хоумбрю-виды со встроенными вариантами продолжают читаться
+ * (дуал-рид в мастере и просмотре), но новый редактор и новая выгрузка
+ * встроенные варианты не пишут.
  */
-export interface SpeciesAbilityGrant {
-  fixed?: Partial<Record<AbilityType, number>>;
-  choice?: {
-    amount: number;
-    count: number;
-    from?: AbilityType[];
-  };
-}
-
 export interface SpeciesFeatureChoice {
   key: string;
   name: string;
   description: string;
-  /**
-   * Повышение характеристик подвида — складывается с повышением основного вида
-   * (холмовой дварф: +2 Телосложения от вида и +1 Мудрости от подвида).
-   */
-  abilityGrant?: SpeciesAbilityGrant;
   /**
    * Особенности, которые даёт этот вариант (подвид) — со своими уровнями,
    * скоростью, тёмным зрением и заклинаниями. Применяются и появляются только
@@ -173,6 +137,29 @@ export interface GrantedSpellRef {
    * переносимость.
    */
   packId?: string;
+  /**
+   * Уровень персонажа, с которого заклинание доступно; пусто — сразу.
+   *
+   * Нужен чертам: у метки дракона «Лечение ран» есть с самого начала, а «Малое
+   * восстановление» приходит на третьем уровне. Так же у вида: «Наследие
+   * преисподней» — одна особенность, а её заклинания приходят на 1, 3 и 5 уровнях.
+   * У класса гейт свой — там уровень стоит у самого умения, и поле остаётся пустым.
+   */
+  requiredLevel?: number;
+  /**
+   * Характеристика, от которой считаются ЭТИ заклинания; пусто — берётся выше:
+   * ответом игрока, характеристикой записи, характеристикой класса.
+   *
+   * У группы выдачи, а не только у записи целиком: один набор заклинаний записи
+   * может считаться от одной характеристики, другой — от другой.
+   */
+  spellcastingAbility?: import('@vtt/shared').AbilityType;
+  /**
+   * ЭТИ заклинания не нужно готовить; пусто — отметка берётся у записи. Заклинания
+   * домена всегда подготовлены, а выданное тем же умением сверх них подготовку
+   * занимает.
+   */
+  alwaysPrepared?: boolean;
 }
 
 /**
@@ -202,31 +189,90 @@ export interface SpeciesFeature {
   movement?: SpeciesMovementGrant;
   /** Тёмное зрение (футы), выдаваемое особенностью. */
   darkvision?: number;
+  /** @deprecated Встроенные варианты-подвиды легаси-формата; см. {@link SpeciesFeatureChoice}. */
   choices?: SpeciesFeatureChoice[];
   isInformationalOnly?: boolean;
+  /**
+   * Дары особенности блоком {@link import('./featTypes.js').FeatData} — той же
+   * формы, что у черты, предыстории и умения класса: владения, модификаторы
+   * листа, выборы игрока, счётчики, тёмное зрение. Так приезжает выгрузка сайта;
+   * поля `movement`/`darkvision` выше остаются для легаси-паков и простых
+   * хоумбрю-записей.
+   */
+  featData?: import('./featTypes.js').FeatData;
   /**
    * Заклинания, выдаваемые особенностью. Автор вписывает имя; при совпадении с
    * компендиумом связывает по `spellId` (тогда авто-выдача). Без связи —
    * информационно. См. {@link GrantedSpellRef}.
    */
   grantedSpells?: GrantedSpellRef[];
+  /**
+   * Активные эффекты умения: то, что меняет числа листа готовой формулой.
+   *
+   * Соседом даров, а не их частью: дар лист проставляет сам — владение, чувство,
+   * скорость, — а эффект приезжает готовым, живёт на акторе своей записью, и её
+   * видно на вкладке эффектов и можно временно отключить.
+   */
+  activeEffects?: import('./activeEffectTypes.js').ActiveEffect[];
+}
+
+/**
+ * Рост вида в футах для одного размера: границы «от» и «до». Задавать можно
+ * любую одну — у «Средний, от 5 фт.» верхней границы попросту нет.
+ */
+export interface SpeciesHeightRange {
+  /** Нижняя граница роста в футах; пусто — не указана */
+  from?: number;
+  /** Верхняя граница роста в футах; пусто — не указана */
+  to?: number;
 }
 
 export interface SpeciesDefinition {
   /** Дискриминантное поле типа записи компендиума */
   type: 'species';
   key: SpeciesKey;
+  /**
+   * Ключ родительского вида. Задан — запись является подвидом (происхождением)
+   * этого вида: она не предлагается как самостоятельный вид, а появляется
+   * вариантом после выбора родителя. Подвид — полноценная запись со своими
+   * характеристиками, особенностями и дарами (как на сайте TTG Club).
+   */
+  parentKey?: SpeciesKey;
+  /**
+   * Пак родительского вида — по той же причине, что у подкласса
+   * (`ClassDefinition.parentClassPackId`): один ключ вида есть сразу в
+   * нескольких компендиумах. Пусто — родитель из любого пака.
+   */
+  parentPackId?: string;
   name: string;
   nameEn: string;
   description: string;
   icon?: string;
-  /** Ключ источника-книги из sources.json (напр. 'phb', 'dmg') */
+  /** Ключ источника-книги — аббревиатура в нижнем регистре (напр. 'phb', 'dmg') */
   sourceKey?: string;
+  /** Название источника, если его нет ни во встроенном справочнике, ни в паке */
+  source?: import('@vtt/shared').SourceDefinition;
   /** Принадлежит ли виду к System Reference Document (SRD) */
   isSRD?: boolean;
+  /**
+   * `false` — запись вне SRD скачана без подписки TTG, и источник вырезал её
+   * эффекты (остальное на месте). У полных записей поля нет.
+   */
+  automation?: boolean;
 
   creatureType: CreatureType;
-  size: CreatureSize[];
+  size: import('@vtt/shared').CreatureSize[];
+
+  /**
+   * Рост в футах по каждому размеру из {@link SpeciesDefinition.size} — так же,
+   * как его задаёт мастерская сайта. Величина справочная: на механику она не
+   * влияет, но помогает игроку выбрать размер в мастере и стоит в карточке
+   * вида. Ключи — только те размеры, у которых рост указан.
+   */
+  heights?: Partial<
+    Record<import('@vtt/shared').CreatureSize, SpeciesHeightRange>
+  >;
+
   speed: {
     walk: number;
     fly?: number;
@@ -236,28 +282,65 @@ export interface SpeciesDefinition {
   };
 
   /**
-   * Повышение характеристик вида. В редакции 2014 его даёт вид, а не
-   * предыстория; подвид может добавить своё (см. `SpeciesFeatureChoice`).
+   * Обычное зрение в футах — дальность зрения токена в дневном режиме
+   * (`token.vision.range`). Пусто — у токена остаётся его значение по
+   * умолчанию. Запись-подвид переопределяет родителя, как и скоростью.
    */
-  abilityGrant?: SpeciesAbilityGrant;
+  vision?: number;
 
-  grants: SpeciesGrant[];
+  /**
+   * Дары записи легаси-формата (9 фиксированных типов). Читаются по-прежнему;
+   * новый редактор и новая выгрузка пишут дары блоком {@link SpeciesDefinition.featData}.
+   *
+   * Поле НЕОБЯЗАТЕЛЬНОЕ: записи нового формата его не содержат вовсе — ни одна
+   * запись вида в компендиуме TTG Club его уже не пишет. Читать `grants` как
+   * гарантированный массив нельзя: мастер настройки так и падал на первой же
+   * записи из компендиума.
+   */
+  grants?: SpeciesGrant[];
+
+  /**
+   * Дары записи блоком {@link import('./featTypes.js').FeatData} — механика вида
+   * или происхождения целиком, той же формы, что у черты. Нужен прежде всего
+   * подвидам без особенностей: приписать дар им больше некуда.
+   */
+  featData?: import('./featTypes.js').FeatData;
 
   features: SpeciesFeature[];
+
+  /**
+   * Активные эффекты самого вида или происхождения. Переносятся на актора при
+   * выборе вида — так же, как эффекты предыстории при её применении.
+   *
+   * Нужны прежде всего происхождениям: умений у них не бывает, и приписать
+   * эффект там было бы некуда.
+   */
+  activeEffects?: import('./activeEffectTypes.js').ActiveEffect[];
 }
 
 export interface ActorSpeciesEntry {
   speciesKey: string;
   speciesName: string;
+  /** Компендиум, из которого взят вид; см. {@link ActorClassEntry.packId} */
+  packId?: string;
   creatureType: CreatureType;
-  size: CreatureSize;
+  size: import('@vtt/shared').CreatureSize;
+  /**
+   * Ключ выбранной записи-подвида (новая модель: подвид — самостоятельная
+   * запись с {@link SpeciesDefinition.parentKey}). Пусто — подвид не выбран либо
+   * вид использует легаси-варианты ({@link ActorSpeciesEntry.featureChoices}).
+   */
+  subspeciesKey?: string;
+  /** Название выбранного подвида — снимок для показа без резолва записи. */
+  subspeciesName?: string;
+  /** Ответы по легаси-вариантам: ключ особенности → ключ выбранного варианта. */
   featureChoices: Record<string, string>;
   grantChoices: Record<number, string[]>;
   /**
-   * Итоговые прибавки характеристик, которые вид применил к актору
-   * (фиксированные вида и подвида плюс выбранные игроком). Хранятся ИМЕННО
-   * применённые значения — чтобы откат при смене вида снимал ровно их, а не
-   * пере-выводил из определения, которое могло измениться.
+   * Ответы на выборы блоков даров `featData`: ключ источника
+   * ({@link import('./speciesGrants.js').SpeciesFeatDataSource.sourceKey}) →
+   * ответы этого блока (ключ выбора → выбранные значения). По ним откат снимает
+   * выданное выбором, не переспрашивая игрока.
    */
-  abilityChoices?: Partial<Record<AbilityType, number>>;
+  featDataChoices?: Record<string, Record<string, string[]>>;
 }

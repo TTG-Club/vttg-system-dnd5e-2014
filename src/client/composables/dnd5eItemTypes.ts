@@ -10,17 +10,27 @@
  * @module systems/dnd5e/composables/dnd5eItemTypes
  */
 
-import type { TypedWebSocketClient } from '@vtt/shared';
-import type { DnDGameItem, GameItem, Spell } from '@vtt/shared/system/dnd.js';
-
 import type {
   ItemFormContext,
   ItemTypeMeta,
   ItemTypeProvider,
 } from '@/core/registries';
+import type { BaseGameItem, TypedWebSocketClient } from '@vtt/shared';
+import type {
+  DnDEquipmentCategory,
+  DnDGameItem,
+  Spell,
+} from '@vtt/shared/system/dnd.js';
 
 import { useModalManager } from '@/shared_ui/composables/useModalManager';
 import { useChatStore } from '@/stores/chatStore';
+import { isRecord } from '@vtt/shared';
+import {
+  CONDITION_ITEM_TYPE,
+  getEquipmentCategoryIcon,
+  isDnDGameItem,
+  POTION_EQUIPMENT_CATEGORY,
+} from '@vtt/shared/system/dnd.js';
 
 import { useFeatModal } from './useFeatModal';
 
@@ -53,7 +63,111 @@ const ITEM_TYPE_CONFIG: Record<string, ItemTypeConfig> = {
     label: 'Классы',
   },
   spell: { icon: 'tabler:wand', modalPrefix: 'Spell', label: 'Заклинания' },
+  [CONDITION_ITEM_TYPE]: {
+    icon: 'tabler:activity-heartbeat',
+    modalPrefix: 'Condition',
+    label: 'Состояния',
+  },
 };
+
+/**
+ * Псевдо-вид меню создания «Безделушка».
+ *
+ * Безделушка — не отдельный тип предмета, а КАТЕГОРИЯ снаряжения
+ * (`equipmentCategory`), поэтому значение ключа совпадает с ключом категории:
+ * пункт меню и есть выбор категории. Сохраняется такая запись обычным
+ * снаряжением (`type: 'equipment'`) и живёт в разделе «Снаряжение» — своего
+ * раздела у псевдо-вида не появляется: разделы панель строит по типам
+ * СУЩЕСТВУЮЩИХ записей, а записей с таким типом не бывает.
+ *
+ * Пункт нужен ровно затем, чтобы не создавать снаряжение и не менять ему тип
+ * экипировки руками на вкладке «Подробнее» — безделушек в мире много.
+ */
+const TRINKET_CATEGORY: DnDEquipmentCategory = 'trinket';
+
+/**
+ * Метаданные пункта «Безделушка» в меню создания.
+ *
+ * Значок берётся у категории (движок), чтобы пункт меню и уже созданные
+ * безделушки в списках выглядели одинаково. Подпись здесь своя: названия
+ * категорий приезжают данными системы уже после регистрации провайдера, а
+ * список видов ядро читает один раз, при регистрации.
+ */
+const TRINKET_TYPE_META: ItemTypeMeta = {
+  type: TRINKET_CATEGORY,
+  icon: getEquipmentCategoryIcon(TRINKET_CATEGORY),
+  label: 'Безделушка',
+};
+
+/**
+ * Метаданные пункта «Зелье» в меню создания. Псевдо-вид того же рода, что и
+ * {@link TRINKET_TYPE_META}: ключ пункта совпадает с ключом категории, запись
+ * сохраняется снаряжением и живёт в разделе «Снаряжение», только со значком
+ * зелья.
+ */
+const POTION_TYPE_META: ItemTypeMeta = {
+  type: POTION_EQUIPMENT_CATEGORY,
+  icon: getEquipmentCategoryIcon(POTION_EQUIPMENT_CATEGORY),
+  label: 'Зелье',
+};
+
+/**
+ * Псевдо-вид меню создания «Магический предмет».
+ *
+ * Своего типа записи у магического предмета нет: магия — это СВОЙСТВО
+ * (`isMagical`), а не тип, и носить его может любая экипировка. Поэтому пункт,
+ * как и {@link TRINKET_TYPE_META}, открывает обычную форму снаряжения —
+ * но со включённым свойством, а тип экипировки (кольцо, жезл, чудесный
+ * предмет, безделушка…) выбирают в самой форме. Сохраняется запись обычным
+ * снаряжением (`type: 'equipment'`) и живёт в разделе «Снаряжение».
+ *
+ * Пункт нужен затем, чтобы не включать свойство руками на вкладке
+ * «Подробнее» — магических предметов в мире много.
+ */
+const MAGIC_ITEM_TYPE = 'magic-item';
+
+/** Метаданные пункта «Магический предмет» в меню создания. */
+const MAGIC_ITEM_TYPE_META: ItemTypeMeta = {
+  type: MAGIC_ITEM_TYPE,
+  icon: 'tabler:sparkles',
+  label: 'Магический предмет',
+};
+
+/**
+ * Псевдо-виды меню, открывающие форму СНАРЯЖЕНИЯ с заранее заполненными полями.
+ * Ключ — тип пункта меню, значение — что форма проставит при создании.
+ */
+const EQUIPMENT_PRESETS: Record<
+  string,
+  { category?: DnDEquipmentCategory; magical?: boolean }
+> = {
+  [TRINKET_CATEGORY]: { category: TRINKET_CATEGORY },
+  [POTION_EQUIPMENT_CATEGORY]: { category: POTION_EQUIPMENT_CATEGORY },
+  [MAGIC_ITEM_TYPE]: { magical: true },
+};
+
+/**
+ * Подпись типа предмета («Оружие»). Словарь типов один на систему: панель
+ * предметов, карточки и фильтры окна выбора подписывают тип одинаково, и вторая
+ * копия подписей разошлась бы с ним у первого же переименования.
+ *
+ * @param type - тип предмета (`weapon`, `equipment`, `tool`, …)
+ * @returns подпись либо `undefined` у незнакомого типа
+ */
+export function itemTypeLabel(type: string): string | undefined {
+  return ITEM_TYPE_CONFIG[type]?.label;
+}
+
+/**
+ * Значок типа предмета. Тот же словарь, что и у {@link itemTypeLabel}: значок
+ * вида записей в «Мастерской» и значок раздела своего компендиума — один.
+ *
+ * @param type - тип предмета (`weapon`, `equipment`, `tool`, …)
+ * @returns значок либо `undefined` у незнакомого типа
+ */
+export function itemTypeIcon(type: string): string | undefined {
+  return ITEM_TYPE_CONFIG[type]?.icon;
+}
 
 /**
  * Формирует имя модалки по типу и действию (`weapon`+`FormModal`→`WeaponFormModal`).
@@ -68,10 +182,6 @@ function getModalName(type: string, action: string): string {
     ?? type.charAt(0).toUpperCase() + type.slice(1);
 
   return `${prefix}${action}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
 }
 
 /**
@@ -89,7 +199,7 @@ function isSpellEntity(value: unknown): value is Spell {
   );
 }
 
-function isGameItemLike(value: unknown): value is GameItem {
+function isGameItemLike(value: unknown): value is DnDGameItem {
   return (
     isRecord(value)
     && typeof value.id === 'string'
@@ -106,28 +216,40 @@ function isGameItemLike(value: unknown): value is GameItem {
  * @returns реализация `ItemTypeProvider`
  */
 export function createDnd5eItemTypeProvider(): ItemTypeProvider {
-  const types: ItemTypeMeta[] = Object.entries(ITEM_TYPE_CONFIG).map(
-    ([type, config]) => ({ type, icon: config.icon, label: config.label }),
+  // Псевдо-виды «Безделушка», «Зелье» и «Магический предмет» встают сразу за
+  // снаряжением: все их записи — снаряжение, и в меню создания пункты стоят
+  // рядом.
+  const types: ItemTypeMeta[] = Object.entries(ITEM_TYPE_CONFIG).flatMap(
+    ([type, config]) => {
+      const meta: ItemTypeMeta = {
+        type,
+        icon: config.icon,
+        label: config.label,
+      };
+
+      return type === 'equipment'
+        ? [meta, TRINKET_TYPE_META, POTION_TYPE_META, MAGIC_ITEM_TYPE_META]
+        : [meta];
+    },
   );
 
-  /** Открывает модалку по вычисленному имени (динамическое имя — каст в одном месте). */
+  /** Открывает модалку по вычисленному имени. */
   const openByName = (name: string, props: Record<string, unknown>): void => {
     const { openModal } = useModalManager();
 
-    (openModal as (n: string, p: Record<string, unknown>) => void)(name, props);
+    openModal(name, props);
   };
 
-  /*
-   * Предмет объявлен сразу в D&D-форме, а не как нейтральный `BaseGameItem`.
-   *
-   * Ядро вызывает провайдер с нейтральным предметом, но провайдер этот —
-   * системный, и в мире на D&D предмет всегда D&D-формы. Раньше это выражалось
-   * присваиванием `const item: DnDGameItem = baseItem`, которое проходило лишь
-   * потому, что все D&D-поля были опциональны и ни одно не сужало базу. Стоило
-   * `DnDGameItem` сузить `activeEffects` до D&D-эффектов — и присваивание стало
-   * ложью, которую компилятор поймал. Место стыка одно, здесь оно и объявлено.
-   */
-  const openDetail = (item: DnDGameItem): void => {
+  const openDetail = (baseItem: BaseGameItem): void => {
+    // Ядро отдаёт нейтральный предмет — D&D-форму подтверждает гвард. Простым
+    // расширением типа тут не обойтись: `DnDGameItem` не только добавляет поля,
+    // но и СУЖАЕТ `activeEffects` до D&D-формы.
+    if (!isDnDGameItem(baseItem)) {
+      return;
+    }
+
+    const item = baseItem;
+
     // Заклинание: SpellDetailModal ожидает prop `spell` (плоский Spell из spellData).
     if (item.type === 'spell') {
       openByName(getModalName('spell', 'DetailModal'), {
@@ -169,9 +291,12 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
 
   const openForm = (
     type: string,
-    item: DnDGameItem | null,
+    baseItem: BaseGameItem | null,
     ctx: ItemFormContext,
   ): void => {
+    // Ядро отдаёт нейтральный предмет — D&D-форму подтверждает гвард
+    // (см. openDetail); запись чужой формы открывается как новая.
+    const item = baseItem && isDnDGameItem(baseItem) ? baseItem : null;
     const socket: TypedWebSocketClient | null = ctx.socket;
     const onSave = ctx.onSave;
     const modalName = getModalName(type, 'FormModal');
@@ -214,6 +339,28 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
       return;
     }
 
+    // Состояние: форме нужен сокет — «Сбросить к канону» удаляет запись мира.
+    if (type === CONDITION_ITEM_TYPE) {
+      openByName(modalName, { item, onSave, socket });
+
+      return;
+    }
+
+    // Безделушка, зелье и магический предмет: та же форма снаряжения, но
+    // категория и/или свойство «магическое» проставлены заранее.
+    const preset = EQUIPMENT_PRESETS[type];
+
+    if (preset) {
+      openByName(getModalName('equipment', 'FormModal'), {
+        item,
+        onSave,
+        createCategory: preset.category,
+        createMagical: preset.magical,
+      });
+
+      return;
+    }
+
     // Оружие/снаряжение/инструмент/заклинание — обобщённо { item, onSave }.
     openByName(modalName, { item, onSave });
   };
@@ -222,7 +369,7 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
    * Сворачивает сохранённый объект в GameItem. Spell из SpellFormModal
    * оборачивается в GameItem-обёртку со spellData; GameItem — как есть.
    */
-  const normalizeSave = (saved: unknown): GameItem | null => {
+  const normalizeSave = (saved: unknown): DnDGameItem | null => {
     if (isSpellEntity(saved)) {
       return {
         id: saved.id,
@@ -250,10 +397,52 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
   };
 
   /**
-   * Отправляет карточку предмета в чат. Пока share только у заклинаний: метаданные
-   * верхнего уровня сливаются со spellData (карточка чата ждёт объект Spell).
+   * Отправляет карточку записи «Мастерской» в чат — ту же, что кнопка «Поделиться
+   * в чат» в окне просмотра записи. У заклинания метаданные верхнего уровня
+   * сливаются со spellData (карточка чата ждёт объект Spell); оружие и снаряжение
+   * уходят карточкой снаряжения, черта — карточкой особенности. Классу, виду и
+   * состоянию карточки чата нет — для них ничего не отправляется.
    */
-  const shareToChat = (item: DnDGameItem): void => {
+  const shareToChat = (baseItem: BaseGameItem): void => {
+    // Ядро отдаёт нейтральный предмет — D&D-форму подтверждает гвард
+    // (см. openDetail).
+    if (!isDnDGameItem(baseItem)) {
+      return;
+    }
+
+    const item = baseItem;
+    const chatStore = useChatStore();
+
+    if (item.type === 'weapon' || item.type === 'equipment') {
+      chatStore.sendItemCard({
+        cardType: 'equipment',
+        title: item.name,
+        payload: JSON.stringify(item),
+      });
+
+      return;
+    }
+
+    if (item.type === 'tool' || item.type === 'background') {
+      chatStore.sendItemCard({
+        cardType: item.type,
+        title: item.name,
+        payload: JSON.stringify(item),
+      });
+
+      return;
+    }
+
+    if (item.type === 'feat') {
+      chatStore.sendItemCard({
+        cardType: 'feature',
+        title: item.name,
+        payload: JSON.stringify({ ...item, type: 'feat', featureType: 'feat' }),
+      });
+
+      return;
+    }
+
     if (item.type !== 'spell' || !item.spellData) {
       return;
     }
@@ -268,7 +457,7 @@ export function createDnd5eItemTypeProvider(): ItemTypeProvider {
       sourceKey: item.sourceKey,
     };
 
-    useChatStore().sendItemCard({
+    chatStore.sendItemCard({
       cardType: 'spell',
       title: item.name,
       payload: JSON.stringify(spell),

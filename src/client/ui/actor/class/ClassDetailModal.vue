@@ -3,29 +3,85 @@
     ClassDefinition,
     ClassFeature,
     ClassLevelEntry,
+    FeatChoice,
+    SubclassDefinition,
   } from '@vtt/shared/system/dnd.js';
 
   import { computed, nextTick, ref } from 'vue';
 
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
-  import { useSourceLabels } from '@/systems/dnd5e/composables/useSourceLabel';
-
+  import { stripDiceRollMarkers } from '@/shared_ui/utils/diceRollMarkup';
+  import { useChatStore } from '@/stores/chatStore';
   import {
+    classOwnCounterDefinitions,
+    subclassCounterDefinitions,
+    toolProficiencyLabel,
+    withCounterTableColumns,
+    withSubclassRecords,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { useClassCatalog } from '../../../composables/useClassCatalog';
+  import { useSourceLabels } from '../../../composables/useSourceLabel';
+  import { copySubclassToWorkshop } from '../../../composables/workshopCopy';
+  import {
+    ABILITY_DELIMITER_LABELS,
     ABILITY_LABELS,
     ARMOR_PROF_SHORT_LABELS,
     CASTER_TYPE_LABELS,
+    CLASS_DETAIL_LABELS,
+    CLASS_LEVEL_TABLE_LABELS,
+    COPY_TO_ITEMS_LABEL,
+    FORM_TAB_LABELS,
+    GRANT_SECTION_LABELS,
+    HIT_DIE_LETTER,
+    LEVEL_BADGE_SUFFIX,
+    SELECT_FOR_ACTOR_LABEL,
     SKILL_LABELS,
     TOOL_PROF_LABELS,
     WEAPON_PROF_SHORT_LABELS,
   } from '../constants';
+  import EffectsBySubscriptionBadge from '../EffectsBySubscriptionBadge.vue';
+  import ItemEffectsView from '../ItemEffectsView.vue';
+  import SourceBadge from '../SourceBadge.vue';
+  import StartingEquipmentOptionBody from '../StartingEquipmentOptionBody.vue';
+  import ClassFeatureChoicesView from './ClassFeatureChoicesView.vue';
 
-  /** Проверяет, является ли особенность генеричной заглушкой подкласса («Умение подкласса», «Подкласс воина») */
+  /**
+   * Строка владения: подписи категорий и приписка свободным текстом через запятую.
+   * Так же их склеивает сайт — приписка там дополняет список, а не заменяет его.
+   *
+   * @param labels - подписи выбранных категорий
+   * @param custom - приписка записи; пусто — её нет
+   * @returns строка для плитки; «Нет», когда не задано ничего
+   */
+  function joinProficiency(labels: string[], custom?: string): string {
+    const parts = custom?.trim() ? [...labels, custom.trim()] : labels;
+
+    return parts.length > 0 ? parts.join(', ') : CLASS_DETAIL_LABELS.empty;
+  }
+
+  /** Проверяет, является ли умение генеричной заглушкой подкласса («Умение подкласса», «Подкласс воина») */
   function isSubclassPlaceholder(feature: ClassFeature): boolean {
     return (
-      feature.name === 'Умение подкласса'
-      || feature.name.startsWith('Подкласс ')
+      feature.name === CLASS_DETAIL_LABELS.subclassFeature
+      || feature.name.startsWith(CLASS_DETAIL_LABELS.subclassPrefix)
     );
+  }
+
+  /**
+   * Собирает запись уровня для значка: «3 ур.». Приписка идёт из константы и уже
+   * начинается с пробела, поэтому склейку делает функция, а не шаблон: две
+   * подстановки подряд форматтер вправе разорвать переносом, и Vue добавил бы
+   * между ними второй пробел.
+   */
+  function formatLevelBadge(level: number): string {
+    return `${level}${LEVEL_BADGE_SUFFIX}`;
+  }
+
+  /** Запись кости хитов класса: «к8» */
+  function formatHitDie(die: number): string {
+    return `${HIT_DIE_LETTER}${die}`;
   }
 
   /** Извлекает значение динамической колонки из строки таблицы уровней */
@@ -44,18 +100,46 @@
     open: boolean;
     /** Определение класса для отображения */
     classDefinition: ClassDefinition | null;
+    /** Пак записи; пусто — не известен, подклассы клеятся из первого пака с ней */
+    packId?: string;
     /** Z-index модалки */
     zIndex?: number;
     /** Смещение позиции для каскадного расположения */
     positionOffset?: number;
+    /** Показать кнопку «Выбрать» (окно открыто из выбора класса для персонажа) */
+    showSelectButton?: boolean;
+    /**
+     * Показать кнопки копирования в «Мастерскую» — у класса и у каждого его
+     * подкласса (окно открыто из компендиума)
+     */
+    showCopyButton?: boolean;
   }>();
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
     'bring-to-front': [];
+    /** Класс копируют в «Мастерскую» */
+    'copy': [];
+    /** Запись выбрана для листа персонажа */
+    'select': [];
   }>();
 
-  const { getSourceLabel } = useSourceLabels();
+  const { recordsFor } = useClassCatalog();
+
+  /**
+   * Класс, который показываем: к записи приклеены подклассы — свои из того же
+   * пака и заведённые в мире отдельными записями. Окно открывают по самой
+   * записи (панель предметов, браузер компендиума, ссылка из описания), а там
+   * их ещё нет.
+   */
+  const displayedClass = computed(() =>
+    props.classDefinition
+      ? withSubclassRecords(
+          props.classDefinition,
+          recordsFor({ key: props.classDefinition.key, packId: props.packId }),
+        )
+      : null,
+  );
 
   const initialPosition = computed(() =>
     props.positionOffset
@@ -63,12 +147,79 @@
       : undefined,
   );
 
-  /** Выбранный подкласс для просмотра в таблице (строка) */
-  const selectedSubclassName = ref<string | null>(null);
+  /**
+   * Заголовок списка навыков на выбор: «Можно выбрать 2 навыка». Число стоит
+   * между приставкой и хвостом, поэтому подпись склеивается строкой, а не
+   * шаблоном: подстановки подряд форматтер вправе разорвать переносом.
+   */
+  const skillChoicesTitle = computed(
+    () =>
+      CLASS_DETAIL_LABELS.skillChoicesPrefix
+      + (displayedClass.value?.skillChoices.count ?? 0)
+      + CLASS_DETAIL_LABELS.skillChoicesSuffix,
+  );
 
-  /** Все особенности базового класса сгруппированные по уровню */
+  /**
+   * Основные характеристики строкой: «Сила и Телосложение», «Сила или
+   * Ловкость». Разделитель приходит записью — у одной характеристики его нет,
+   * а у списка без разделителя остаётся запятая.
+   */
+  const primaryAbilitiesLabel = computed(() => {
+    const abilities = displayedClass.value?.primaryAbilities ?? [];
+
+    const labels = abilities.map(
+      (ability) => ABILITY_LABELS[ability] ?? ability,
+    );
+
+    const delimiter = displayedClass.value?.primaryAbilitiesDelimiter;
+
+    if (labels.length < 2 || !delimiter) {
+      return labels.join(', ');
+    }
+
+    const head = labels.slice(0, -1).join(', ');
+    const last = labels[labels.length - 1];
+
+    return `${head} ${ABILITY_DELIMITER_LABELS[delimiter]} ${last}`;
+  });
+
+  const { getSourceLabel } = useSourceLabels();
+
+  /**
+   * Ключ подкласса, выбранного для просмотра таблицы; `null` — не выбран.
+   *
+   * Ключ, а не название: два выпуска одного подкласса носят одно имя, и по
+   * имени выбор всегда попадал бы в первый из них.
+   */
+  const selectedSubclassKey = ref<string | null>(null);
+
+  /** Выбранный подкласс записи; null — подкласс не выбран. */
+  const selectedSubclass = computed(() => {
+    if (!selectedSubclassKey.value) {
+      return null;
+    }
+
+    return (
+      displayedClass.value?.subclasses.find(
+        (subclass) => subclass.key === selectedSubclassKey.value,
+      ) ?? null
+    );
+  });
+
+  /**
+   * Строка владения инструментами. Класс хранит его человекочитаемым текстом, а
+   * не ключами словаря, поэтому подпись собирает общий разбор — иначе позиция,
+   * пришедшая ссылкой разметки, показывалась бы этой ссылкой целиком.
+   */
+  const toolProficienciesDisplay = computed(() =>
+    (displayedClass.value?.toolProficiencies ?? [])
+      .map((tool) => TOOL_PROF_LABELS[tool] ?? toolProficiencyLabel(tool))
+      .join(', '),
+  );
+
+  /** Все умения базового класса сгруппированные по уровню */
   const featuresByLevel = computed(() => {
-    const classDef = props.classDefinition;
+    const classDef = displayedClass.value;
 
     if (!classDef) {
       return new Map<number, ClassFeature[]>();
@@ -76,9 +227,9 @@
 
     const map = new Map<number, ClassFeature[]>();
 
-    // Особенности ТОЛЬКО базового класса
+    // Умения ТОЛЬКО базового класса
     for (const feature of classDef.features) {
-      if (selectedSubclassName.value && isSubclassPlaceholder(feature)) {
+      if (selectedSubclass.value && isSubclassPlaceholder(feature)) {
         continue;
       }
 
@@ -89,20 +240,14 @@
       map.set(level, existing);
     }
 
-    // Особенности выбранного подкласса
-    if (selectedSubclassName.value) {
-      const subclass = classDef.subclasses.find(
-        (subclass) => subclass.name === selectedSubclassName.value,
-      );
+    // Умения выбранного подкласса
+    if (selectedSubclass.value) {
+      for (const feature of selectedSubclass.value.features) {
+        const level = feature.level;
+        const existing = map.get(level) ?? [];
 
-      if (subclass && subclass.features) {
-        for (const feature of subclass.features) {
-          const level = feature.level;
-          const existing = map.get(level) ?? [];
-
-          existing.push(feature);
-          map.set(level, existing);
-        }
+        existing.push(feature);
+        map.set(level, existing);
       }
     }
 
@@ -126,19 +271,78 @@
     return map;
   });
 
+  /**
+   * Выборы даров записи и её умений: из них выводятся колонки количества
+   * («Приёмы» воина). Ряд по уровням у выбора задан ступенями, и колонкой его
+   * набирать второй раз не нужно.
+   *
+   * @param definition - класс либо подкласс
+   */
+  function classChoices(
+    definition: Pick<ClassDefinition, 'featData' | 'features'>,
+  ): FeatChoice[] {
+    const own = definition.featData?.choices ?? [];
+
+    const fromFeatures = (definition.features ?? []).flatMap(
+      (feature) => feature.featData?.choices ?? [],
+    );
+
+    return [...own, ...fromFeatures];
+  }
+
+  /**
+   * Таблица класса вместе с колонками его ресурсов: ресурс, отмеченный
+   * «Показывать в таблице», рисуется колонкой, а её ряд по уровням берётся из
+   * прогрессии либо формулы самого ресурса — второй раз автор их не набирает.
+   *
+   * Считается при показе, а не хранится: иначе колонка разошлась бы с ресурсом
+   * при первой же его правке.
+   */
+  const classTable = computed(() => {
+    const definition = displayedClass.value;
+
+    if (!definition) {
+      return { levelTable: [], tableColumns: [] };
+    }
+
+    // Свои ресурсы класса: ресурсы подклассов из общего списка выгрузки в
+    // таблицу самого класса не идут — колонку даёт выбранный подкласс
+    return withCounterTableColumns(
+      definition.levelTable ?? [],
+      definition.tableColumns ?? [],
+      classOwnCounterDefinitions(definition),
+      classChoices(definition),
+    );
+  });
+
+  /** То же для выбранного подкласса: его ресурсы дают свои колонки. */
+  const subclassTable = computed(() => {
+    const definition = displayedClass.value;
+    const subclass = selectedSubclass.value;
+
+    if (!definition || !subclass) {
+      return null;
+    }
+
+    return withCounterTableColumns(
+      subclass.levelTable ?? [],
+      subclass.tableColumns ?? [],
+      subclassCounterDefinitions(definition, subclass.key),
+      classChoices(subclass),
+    );
+  });
+
   /** Активная таблица уровней — базовые данные, дополненные колонками подкласса */
   const activeLevelTable = computed(() => {
-    const baseTable = props.classDefinition?.levelTable ?? [];
+    const baseTable = classTable.value.levelTable;
 
-    if (selectedSubclassName.value) {
-      const subclass = props.classDefinition?.subclasses.find(
-        (sc) => sc.name === selectedSubclassName.value,
-      );
+    if (selectedSubclass.value) {
+      const subclassRows = subclassTable.value?.levelTable ?? [];
 
-      if (subclass?.levelTable) {
+      if (subclassRows.length > 0) {
         // Мержим строки: базовые данные + данные подкласса для каждого уровня
         return baseTable.map((baseRow) => {
-          const subclassRow = subclass.levelTable!.find(
+          const subclassRow = subclassRows.find(
             (subRow) => subRow.level === baseRow.level,
           );
 
@@ -152,34 +356,21 @@
 
   /** Активные колонки таблицы — базовые + колонки подкласса (если есть) */
   const activeTableColumns = computed(() => {
-    const baseColumns = props.classDefinition?.tableColumns ?? [];
+    const baseColumns = classTable.value.tableColumns;
+    const subclassColumns = subclassTable.value?.tableColumns ?? [];
 
-    if (selectedSubclassName.value) {
-      const subclass = props.classDefinition?.subclasses.find(
-        (sc) => sc.name === selectedSubclassName.value,
-      );
-
-      if (subclass?.tableColumns) {
-        return [...baseColumns, ...subclass.tableColumns];
-      }
-    }
-
-    return baseColumns;
+    return subclassColumns.length > 0
+      ? [...baseColumns, ...subclassColumns]
+      : baseColumns;
   });
 
   /** Активная заклинательная конфигурация — подкласса (если выбран и имеет свою) или базового класса */
   const activeSpellcasting = computed(() => {
-    if (selectedSubclassName.value) {
-      const subclass = props.classDefinition?.subclasses.find(
-        (sc) => sc.name === selectedSubclassName.value,
-      );
-
-      if (subclass?.spellcasting) {
-        return subclass.spellcasting;
-      }
+    if (selectedSubclass.value?.spellcasting) {
+      return selectedSubclass.value.spellcasting;
     }
 
-    return props.classDefinition?.spellcasting ?? null;
+    return displayedClass.value?.spellcasting ?? null;
   });
 
   /** Есть ли у таблицы колонки с группировкой (двухуровневая шапка) */
@@ -194,7 +385,7 @@
     for (const column of activeTableColumns.value) {
       if (column.children?.length) {
         for (const child of column.children) {
-          cols.push({ key: child.key, widthClass: 'w-[26px]' });
+          cols.push({ key: child.key, widthClass: 'w-6.5' });
         }
       } else if (column.key) {
         cols.push({ key: column.key, widthClass: 'w-16' });
@@ -206,54 +397,136 @@
 
   /** Строка владений доспехами */
   const armorProfLabel = computed(() => {
-    const classDef = props.classDefinition;
+    const classDef = displayedClass.value;
 
-    if (!classDef || classDef.armorProficiencies.length === 0) {
-      return 'Нет';
+    if (!classDef) {
+      return CLASS_DETAIL_LABELS.empty;
     }
 
-    return classDef.armorProficiencies
-      .map((armor) => ARMOR_PROF_SHORT_LABELS[armor] ?? armor)
-      .join(', ');
+    return joinProficiency(
+      classDef.armorProficiencies.map(
+        (armor) => ARMOR_PROF_SHORT_LABELS[armor] ?? armor,
+      ),
+      classDef.armorProficienciesCustom,
+    );
   });
 
   /** Строка владений оружием */
   const weaponProfLabel = computed(() => {
-    const classDef = props.classDefinition;
+    const classDef = displayedClass.value;
 
-    if (!classDef || classDef.weaponProficiencies.length === 0) {
-      return 'Нет';
+    if (!classDef) {
+      return CLASS_DETAIL_LABELS.empty;
     }
 
-    return classDef.weaponProficiencies
-      .map((weapon) => WEAPON_PROF_SHORT_LABELS[weapon] ?? weapon)
-      .join(', ');
+    return joinProficiency(
+      classDef.weaponProficiencies.map(
+        (weapon) => WEAPON_PROF_SHORT_LABELS[weapon] ?? weapon,
+      ),
+      classDef.weaponProficienciesCustom,
+    );
   });
 
-  /** Отсортированные особенности класса по уровню */
+  /** Отсортированные умения класса по уровню */
   const sortedFeatures = computed(() => {
-    if (!props.classDefinition) {
+    if (!displayedClass.value) {
       return [];
     }
 
-    return [...props.classDefinition.features].sort(
-      (a, b) => a.level - b.level,
-    );
+    return [...displayedClass.value.features].sort((a, b) => a.level - b.level);
   });
 
   /** Хранит ID развернутых подклассов */
   const expandedSubclasses = ref<Set<string>>(new Set());
 
-  /** Опции для выбора подкласса (простые строки) */
-  const subclassOptions = computed(() => {
-    const classDef = props.classDefinition;
+  /** Пункт выбора подкласса: подпись с источником и ключ-значение. */
+  interface SubclassOption {
+    label: string;
+    value: string;
+  }
+
+  /**
+   * Подпись подкласса в списке выбора: название и книга. Книга нужна там же,
+   * где ключ, — одноимённые выпуски подкласса без неё выглядят повтором.
+   *
+   * @param subclass - подкласс записи
+   */
+  function subclassOptionLabel(
+    subclass: Pick<SubclassDefinition, 'name' | 'sourceKey' | 'source'>,
+  ): string {
+    const sourceLabel = getSourceLabel(subclass.sourceKey, subclass.source);
+
+    return sourceLabel
+      ? `${subclass.name}${CLASS_DETAIL_LABELS.subclassSourceSeparator}${sourceLabel}`
+      : subclass.name;
+  }
+
+  /** Опции для выбора подкласса */
+  const subclassOptions = computed((): SubclassOption[] => {
+    const classDef = displayedClass.value;
 
     if (!classDef || !classDef.subclasses) {
       return [];
     }
 
-    return classDef.subclasses.map((subclass) => subclass.name);
+    return classDef.subclasses.map((subclass) => ({
+      label: subclassOptionLabel(subclass),
+      value: subclass.key,
+    }));
   });
+
+  /** Подпись выбранного подкласса в поле выбора; пусто — не выбран. */
+  const selectedSubclassLabel = computed(() =>
+    selectedSubclass.value ? subclassOptionLabel(selectedSubclass.value) : '',
+  );
+
+  const chatStore = useChatStore();
+
+  /**
+   * Копирует подкласс отдельной записью. Копию собирает окно, а не тот, кто
+   * его открыл: контракт карточки ядра знает только копирование всей записи.
+   * Подкласс берётся у показанного класса — у него уже уникальные ключи
+   * подклассов и общий список ресурсов.
+   *
+   * @param subclass - подкласс показанного класса
+   */
+  function copySubclass(subclass: SubclassDefinition): void {
+    if (!displayedClass.value) {
+      return;
+    }
+
+    copySubclassToWorkshop(
+      chatStore.getSocket(),
+      displayedClass.value,
+      subclass,
+      props.packId,
+    );
+  }
+
+  /**
+   * Подсказка кнопки копирования в шапке: с выбранным подклассом она копирует
+   * только его.
+   */
+  const headerCopyLabel = computed(() =>
+    selectedSubclass.value
+      ? CLASS_DETAIL_LABELS.copySubclass
+      : COPY_TO_ITEMS_LABEL,
+  );
+
+  /**
+   * Копирование из шапки. Выбранный в окне подкласс — это то, что смотрят
+   * сейчас, и копировать ради него весь класс со всеми подклассами незачем:
+   * уходит один подкласс со ссылкой на класс компендиума.
+   */
+  function copyFromHeader(): void {
+    if (selectedSubclass.value) {
+      copySubclass(selectedSubclass.value);
+
+      return;
+    }
+
+    emit('copy');
+  }
 
   function toggleSubclass(key: string) {
     if (expandedSubclasses.value.has(key)) {
@@ -289,8 +562,8 @@
 <template>
   <UDraggableModal
     :open="open"
-    :title="classDefinition?.name ?? 'Класс'"
-    :subtitle="classDefinition?.nameEn || undefined"
+    :title="displayedClass?.name ?? CLASS_DETAIL_LABELS.fallbackTitle"
+    :subtitle="displayedClass?.nameEn || undefined"
     :initial-width="1000"
     :initial-height="700"
     :min-width="600"
@@ -302,44 +575,86 @@
     @bring-to-front="emit('bring-to-front')"
   >
     <template #header-actions>
-      <UBadge
-        v-if="getSourceLabel(classDefinition?.sourceKey)"
-        :label="getSourceLabel(classDefinition?.sourceKey)"
-        color="neutral"
-        variant="subtle"
-        size="sm"
+      <SourceBadge
+        :source-key="displayedClass?.sourceKey"
+        :source="displayedClass?.source"
       />
 
       <UBadge
-        v-if="classDefinition?.isSRD !== false"
+        v-if="displayedClass?.isSRD !== false"
         label="SRD"
         color="primary"
         variant="subtle"
         size="sm"
       />
+
+      <EffectsBySubscriptionBadge :automation="displayedClass?.automation" />
+
+      <UTooltip
+        v-if="showCopyButton"
+        :text="headerCopyLabel"
+      >
+        <UButton
+          icon="tabler:copy"
+          size="xs"
+          color="primary"
+          variant="soft"
+          @click.left.exact.prevent="copyFromHeader"
+        />
+      </UTooltip>
+
+      <UTooltip
+        v-if="showSelectButton"
+        :text="SELECT_FOR_ACTOR_LABEL"
+      >
+        <UButton
+          icon="tabler:check"
+          size="xs"
+          color="primary"
+          variant="soft"
+          @click.left.exact.prevent="emit('select')"
+        />
+      </UTooltip>
     </template>
 
     <template #body>
       <div
-        v-if="classDefinition"
+        v-if="displayedClass"
         class="flex flex-col gap-4"
       >
         <!-- Описание -->
-        <ItemDescriptionRenderer :content="classDefinition.description ?? ''" />
+        <ItemDescriptionRenderer :content="displayedClass.description ?? ''" />
 
         <!-- Базовая механика -->
         <div class="flex flex-wrap gap-2">
+          <!-- Основная характеристика -->
+          <div
+            v-if="primaryAbilitiesLabel"
+            class="min-w-28 flex-1 rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
+          >
+            <span
+              class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+            >
+              {{ CLASS_DETAIL_LABELS.primaryAbilities }}
+            </span>
+
+            <p class="mt-0.5 text-sm font-semibold text-highlighted">
+              {{ primaryAbilitiesLabel }}
+            </p>
+          </div>
+
           <!-- Кость хитов -->
           <div
             class="min-w-20 flex-1 rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
           >
             <span
               class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Кость хитов</span
             >
+              {{ CLASS_DETAIL_LABELS.hitDie }}
+            </span>
 
             <p class="mt-0.5 font-mono text-base font-bold text-warning">
-              к{{ classDefinition.hitDie }}
+              {{ formatHitDie(displayedClass.hitDie) }}
             </p>
           </div>
 
@@ -349,12 +664,13 @@
           >
             <span
               class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Спасброски</span
             >
+              {{ GRANT_SECTION_LABELS.savingThrows }}
+            </span>
 
             <p class="mt-0.5 text-sm font-semibold text-highlighted">
               {{
-                classDefinition.savingThrowProficiencies
+                displayedClass.savingThrowProficiencies
                   .map((ability) => ABILITY_LABELS[ability] ?? ability)
                   .join(', ')
               }}
@@ -368,7 +684,7 @@
           >
             <span
               class="block text-[10px] font-medium tracking-wider text-magic/80 uppercase"
-              >Магия ·
+              >{{ CLASS_DETAIL_LABELS.spellcastingPrefix }}
               {{
                 CASTER_TYPE_LABELS[activeSpellcasting.type]
                 ?? activeSpellcasting.type
@@ -389,8 +705,9 @@
           >
             <span
               class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Владение снаряжением</span
             >
+              {{ CLASS_DETAIL_LABELS.equipmentProficiency }}
+            </span>
 
             <p class="mt-0.5 text-sm font-semibold text-highlighted">
               {{ armorProfLabel }}
@@ -403,8 +720,9 @@
           >
             <span
               class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Владение оружием</span
             >
+              {{ CLASS_DETAIL_LABELS.weaponProficiency }}
+            </span>
 
             <p class="mt-0.5 text-sm font-semibold text-highlighted">
               {{ weaponProfLabel }}
@@ -413,20 +731,17 @@
 
           <!-- Инструменты (если есть) -->
           <div
-            v-if="classDefinition.toolProficiencies?.length"
+            v-if="displayedClass.toolProficiencies?.length"
             class="min-w-24 flex-1 rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
           >
             <span
               class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Инструменты</span
             >
+              {{ GRANT_SECTION_LABELS.tools }}
+            </span>
 
             <p class="mt-0.5 text-sm font-semibold text-highlighted">
-              {{
-                classDefinition.toolProficiencies
-                  ?.map((tool) => TOOL_PROF_LABELS[tool] ?? tool)
-                  .join(', ')
-              }}
+              {{ toolProficienciesDisplay }}
             </p>
           </div>
         </div>
@@ -436,12 +751,12 @@
           <span
             class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
           >
-            Можно выбрать {{ classDefinition.skillChoices.count }} навыка
+            {{ skillChoicesTitle }}
           </span>
 
           <div class="flex flex-wrap gap-1.5">
             <UBadge
-              v-for="skill in classDefinition.skillChoices.from"
+              v-for="skill in displayedClass.skillChoices.from"
               :key="skill"
               :label="SKILL_LABELS[skill] ?? skill"
               color="neutral"
@@ -453,68 +768,75 @@
 
         <!-- Снаряжение -->
         <div
-          v-if="classDefinition.startingEquipment?.length"
+          v-if="displayedClass.startingEquipment?.length"
           class="mt-4"
         >
           <span
             class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
           >
-            Начальное снаряжение (на 1-ом уровне)
+            {{ CLASS_DETAIL_LABELS.startingEquipment }}
           </span>
 
           <div class="flex flex-col gap-2">
             <div
-              v-for="eq in classDefinition.startingEquipment"
+              v-for="eq in displayedClass.startingEquipment"
               :key="eq.key"
-              class="rounded-md border border-default/50 bg-elevated/30 p-2 text-sm text-toned"
+              class="flex gap-1.5 rounded-md border border-default/50 bg-elevated/30 p-2 text-sm text-toned"
             >
-              <span class="mr-1.5 font-bold text-muted">{{ eq.key }})</span>
+              <span class="font-bold text-muted">{{ eq.key }})</span>
 
-              <span>{{ eq.description }}</span>
+              <StartingEquipmentOptionBody :option="eq" />
             </div>
           </div>
         </div>
 
         <!-- Выбор подкласса для таблицы -->
         <div
-          v-if="classDefinition.subclasses?.length > 0"
-          class="mt-4 flex w-64 items-center rounded-lg border border-default/50 bg-elevated/30 p-1"
+          v-if="displayedClass.subclasses?.length > 0"
+          class="mt-4 flex w-full items-center rounded-lg border border-default/50 bg-elevated/30 p-1 sm:w-96"
         >
-          <span class="pl-2 text-xs font-medium text-muted">Подкласс:</span>
+          <span class="pl-2 text-xs font-medium text-muted">
+            {{ CLASS_DETAIL_LABELS.subclassPickerPrefix }}
+          </span>
 
           <USelectMenu
-            v-model="selectedSubclassName"
+            v-model="selectedSubclassKey"
             :items="subclassOptions"
-            placeholder="Выбрать..."
+            value-key="value"
+            :placeholder="CLASS_DETAIL_LABELS.subclassPickerPlaceholder"
             variant="none"
             class="min-w-0 flex-1"
+            :ui="{ content: 'min-w-fit' }"
             :searchable="false"
           >
             <template #label>
               <span class="truncate">
-                {{ selectedSubclassName || 'Выбрать...' }}
+                {{
+                  selectedSubclassLabel
+                  || CLASS_DETAIL_LABELS.subclassPickerPlaceholder
+                }}
               </span>
             </template>
           </USelectMenu>
 
           <UButton
-            v-if="selectedSubclassName"
+            v-if="selectedSubclassKey"
             icon="tabler:x"
-            color="gray"
+            color="neutral"
             variant="ghost"
             size="2xs"
             class="mr-1"
             :padded="false"
-            @click.left.exact.prevent="selectedSubclassName = null"
+            @click.left.exact.prevent="selectedSubclassKey = null"
           />
         </div>
 
         <!-- Таблица уровней (компактная) -->
         <div>
           <div
-            class="custom-scroll w-full overflow-hidden overflow-x-auto rounded-lg border border-default/50"
+            class="custom-scrollbar w-full overflow-hidden overflow-x-auto rounded-lg border border-default/50"
           >
-            <table class="w-full min-w-[700px] table-fixed text-xs">
+            <table class="w-full min-w-175 table-fixed text-xs">
               <colgroup>
                 <col class="w-10" />
 
@@ -535,21 +857,21 @@
                     class="w-10 px-2 py-1.5 text-left align-middle text-muted"
                     :rowspan="hasGroupedColumns ? 2 : 1"
                   >
-                    Ур.
+                    {{ CLASS_LEVEL_TABLE_LABELS.columnLevel }}
                   </th>
 
                   <th
                     class="w-12 px-2 py-1.5 text-left align-middle text-muted"
                     :rowspan="hasGroupedColumns ? 2 : 1"
                   >
-                    Мас.
+                    {{ CLASS_LEVEL_TABLE_LABELS.columnProficiency }}
                   </th>
 
                   <th
                     class="px-2 py-1.5 text-left align-middle text-muted"
                     :rowspan="hasGroupedColumns ? 2 : 1"
                   >
-                    Особенности
+                    {{ CLASS_LEVEL_TABLE_LABELS.columnFeatures }}
                   </th>
 
                   <!-- Динамические колонки (Верхний уровень) -->
@@ -612,8 +934,8 @@
                           class="transition-colors hover:underline focus:outline-none"
                           :class="
                             feature.subclassKey
-                              ? 'text-primary-400 hover:text-primary-300'
-                              : 'text-toned hover:text-primary-400'
+                              ? 'text-primary'
+                              : 'text-toned hover:text-primary'
                           "
                           @click.left.exact.prevent="scrollToFeature(feature)"
                         >
@@ -649,15 +971,15 @@
           </div>
         </div>
 
-        <!-- Особенности класса -->
+        <!-- Умения класса -->
         <div
-          v-if="classDefinition.features.length > 0"
+          v-if="displayedClass.features.length > 0"
           class="pt-2"
         >
           <span
             class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
           >
-            Особенности класса
+            {{ CLASS_DETAIL_LABELS.featuresTitle }}
           </span>
 
           <div class="flex flex-col gap-2">
@@ -674,68 +996,115 @@
 
                 <UBadge
                   size="sm"
-                  color="gray"
+                  color="neutral"
                   variant="subtle"
-                  >{{ feature.level }} ур.</UBadge
+                  >{{ formatLevelBadge(feature.level) }}</UBadge
                 >
               </div>
 
               <ItemDescriptionRenderer :content="feature.description" />
+
+              <!-- Варианты умения: манёвры, воззвания, боевые стили. Свёрнуты:
+                развёрнутыми они закрыли бы собой весь класс -->
+              <ClassFeatureChoicesView
+                v-if="feature.choices?.length"
+                :choices="feature.choices"
+                :config="feature.choiceConfig"
+              />
+
+              <ItemEffectsView
+                v-if="feature.activeEffects?.length"
+                :effects="feature.activeEffects"
+                :owner-name="feature.name"
+                class="mt-2"
+              />
             </div>
           </div>
         </div>
 
-        <!-- Подклассы -->
+        <!-- Эффекты самого класса. Своим блоком, а не рядом с умениями: их
+          даёт класс целиком, и приписывать их первому попавшемуся умению
+          значило бы соврать об источнике -->
         <div
-          v-if="classDefinition.subclasses.length > 0"
+          v-if="displayedClass.activeEffects?.length"
           class="pt-2"
         >
           <span
             class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
           >
-            {{ classDefinition.subclassLabel }} ({{
-              classDefinition.subclassLevel
-            }}
-            ур.)
+            {{ FORM_TAB_LABELS.effects }}
+          </span>
+
+          <ItemEffectsView
+            :effects="displayedClass.activeEffects"
+            :owner-name="displayedClass.name"
+          />
+        </div>
+
+        <!-- Подклассы -->
+        <div
+          v-if="displayedClass.subclasses.length > 0"
+          class="pt-2"
+        >
+          <span
+            class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
+          >
+            {{ displayedClass.subclassLabel }} ({{
+              formatLevelBadge(displayedClass.subclassLevel)
+            }})
           </span>
 
           <div class="flex flex-col gap-2">
             <div
-              v-for="subclass in classDefinition.subclasses"
+              v-for="subclass in displayedClass.subclasses"
               :key="subclass.key"
               class="flex flex-col overflow-hidden rounded-lg border border-default/50 bg-elevated/30 transition-colors"
             >
-              <button
-                class="flex w-full items-center justify-between p-3 text-left transition-colors hover:bg-accented/30"
-                @click.left.exact.prevent="toggleSubclass(subclass.key)"
-              >
-                <div class="flex items-center gap-2">
-                  <span class="text-sm font-medium text-highlighted">{{
-                    subclass.name
-                  }}</span>
+              <div class="flex items-center">
+                <button
+                  class="flex min-w-0 flex-1 items-center justify-between p-3 text-left transition-colors hover:bg-accented/30"
+                  @click.left.exact.prevent="toggleSubclass(subclass.key)"
+                >
+                  <div class="flex items-center gap-2">
+                    <span class="text-sm font-medium text-highlighted">{{
+                      subclass.name
+                    }}</span>
 
-                  <span class="text-xs text-dimmed">{{ subclass.nameEn }}</span>
+                    <span class="text-xs text-dimmed">{{
+                      subclass.nameEn
+                    }}</span>
 
-                  <UBadge
-                    v-if="getSourceLabel(subclass.sourceKey)"
-                    size="sm"
+                    <SourceBadge
+                      :source-key="subclass.sourceKey"
+                      :source="subclass.source"
+                      class="ml-2"
+                    />
+                  </div>
+
+                  <UIcon
+                    :name="
+                      expandedSubclasses.has(subclass.key)
+                        ? 'tabler:chevron-down'
+                        : 'tabler:chevron-right'
+                    "
+                    class="h-5 w-5 text-dimmed"
+                  />
+                </button>
+
+                <UTooltip
+                  v-if="showCopyButton"
+                  :text="CLASS_DETAIL_LABELS.copySubclass"
+                >
+                  <UButton
+                    icon="tabler:copy"
+                    size="xs"
                     color="primary"
-                    variant="subtle"
-                    class="ml-2"
-                  >
-                    {{ getSourceLabel(subclass.sourceKey) }}
-                  </UBadge>
-                </div>
-
-                <UIcon
-                  :name="
-                    expandedSubclasses.has(subclass.key)
-                      ? 'tabler:chevron-down'
-                      : 'tabler:chevron-right'
-                  "
-                  class="h-5 w-5 text-dimmed"
-                />
-              </button>
+                    variant="ghost"
+                    class="mx-2 shrink-0"
+                    @click.left.exact.prevent="copySubclass(subclass)"
+                  />
+                </UTooltip>
+              </div>
 
               <div
                 v-if="expandedSubclasses.has(subclass.key)"
@@ -746,7 +1115,7 @@
                   class="text-muted"
                 />
 
-                <!-- Особенности подкласса -->
+                <!-- Умения подкласса -->
                 <div
                   v-if="subclass.features?.length"
                   class="mt-3 grid grid-cols-2 gap-2 border-t border-default/50 pt-3"
@@ -764,16 +1133,23 @@
 
                       <UBadge
                         size="sm"
-                        color="gray"
+                        color="neutral"
                         variant="subtle"
-                        >{{ feature.level }} ур.</UBadge
+                        >{{ formatLevelBadge(feature.level) }}</UBadge
                       >
                     </div>
 
                     <ItemDescriptionRenderer
                       :content="feature.description"
                       class="mt-1 line-clamp-3 text-sm text-muted"
-                      :title="feature.description"
+                      :title="stripDiceRollMarkers(feature.description)"
+                    />
+
+                    <ClassFeatureChoicesView
+                      v-if="feature.choices?.length"
+                      :choices="feature.choices"
+                      :config="feature.choiceConfig"
+                      is-subclass
                     />
                   </div>
                 </div>

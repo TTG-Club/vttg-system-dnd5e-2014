@@ -10,17 +10,31 @@ import type {
   WeaponCategoryDefinition,
   WeaponPropertyDefinition,
 } from '@vtt/shared';
+import type { SpeciesDefinition } from '@vtt/shared/system/dnd.js';
 
 import { defineStore } from 'pinia';
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
+
+import { SYSTEM_ID } from '@vtt/shared/system/dnd.js';
+
+/** Имя хранилища: приставка — id системы из манифеста. */
+const STORE_ID = `${SYSTEM_ID}:system-data`;
 
 /**
- * Хранилище системных данных D&D (свойства оружия, типы урона и т.д.)
+ * Хранилище справочных данных D&D (свойства оружия, типы урона и т.д.) —
+ * единственное своё хранилище системы. Наполняется один раз при подключении к
+ * миру (`systemDataSync`) и читается всеми окнами.
  *
- * Загружается один раз при подключении к миру
- * и используется всеми компонентами для доступа к системным определениям.
+ * Имя с префиксом системы: pinia у нас общая с приложением, и имена хранилищ в
+ * ней — плоский общий список. Совпади оно с чужим — два разных хранилища молча
+ * стали бы одним.
+ *
+ * Наружу списки уходят только на чтение: класть в них — дело слоя
+ * синхронизации, а из окна это меняло бы данные сразу у всех остальных. Что
+ * окну и правда нужно записать, у того есть своё названное действие
+ * (`rememberSource`, `rememberSpeciesDefinitions`).
  */
-export const useSystemDataStore = defineStore('systemData', () => {
+export const useSystemDataStore = defineStore(STORE_ID, () => {
   /** Определения свойств оружия */
   const weaponProperties = ref<WeaponPropertyDefinition[]>([]);
 
@@ -36,8 +50,40 @@ export const useSystemDataStore = defineStore('systemData', () => {
   /** Определения типов боеприпасов */
   const ammunitionTypes = ref<AmmunitionTypeDefinition[]>([]);
 
-  /** Определения источников контента */
-  const sources = ref<SourceDefinition[]>([]);
+  /** Источники, встроенные в систему (базовые книги из `data/sources.json`) */
+  const builtinSources = ref<SourceDefinition[]>([]);
+
+  /** Источники, приехавшие с паками компендиума (из манифеста пака) */
+  const packSources = ref<SourceDefinition[]>([]);
+
+  /** Источники, вписанные пользователем при создании своего контента */
+  const customSources = ref<SourceDefinition[]>([]);
+
+  /**
+   * Источники контента: вписанные пользователем, приехавшие с паками и
+   * встроенные.
+   *
+   * Система знает только базовые книги, а в компендиуме встречается что угодно
+   * (`lfl`, `efa`, …) — без слияния такие записи оставались бы без подписи, а их
+   * источник нельзя было бы выбрать при создании своего контента. Порядок
+   * приоритета обратный порядку доверия: при совпадении ключа выигрывает
+   * встроенный (его название выверено и от пака не зависит), затем пак, и лишь
+   * потом вписанное вручную — опечатка в своей книге не должна переименовывать
+   * «Книгу игрока».
+   */
+  const sources = computed<SourceDefinition[]>(() => {
+    const byKey = new Map<string, SourceDefinition>();
+
+    for (const source of [
+      ...customSources.value,
+      ...packSources.value,
+      ...builtinSources.value,
+    ]) {
+      byKey.set(source.key, source);
+    }
+
+    return [...byKey.values()];
+  });
 
   /** Определения категорий доспехов */
   const armorCategories = ref<EquipmentCategoryDefinition[]>([]);
@@ -52,9 +98,7 @@ export const useSystemDataStore = defineStore('systemData', () => {
   const toolProperties = ref<ToolPropertyDefinition[]>([]);
 
   /** Определения видов (расы) */
-  const speciesDefinitions = ref<
-    import('@vtt/shared/system/dnd.js').SpeciesDefinition[]
-  >([]);
+  const speciesDefinitions = ref<SpeciesDefinition[]>([]);
 
   /**
    * Устанавливает свойства оружия из серверных данных
@@ -97,11 +141,39 @@ export const useSystemDataStore = defineStore('systemData', () => {
   }
 
   /**
-   * Устанавливает источники контента из серверных данных
+   * Устанавливает встроенные источники системы из серверных данных
    * @param items - массив определений источников
    */
   function setSources(items: SourceDefinition[]): void {
-    sources.value = items;
+    builtinSources.value = items;
+  }
+
+  /**
+   * Устанавливает источники, приехавшие с паками компендиума
+   * @param items - определения источников из манифестов паков
+   */
+  function setPackSources(items: SourceDefinition[]): void {
+    packSources.value = items;
+  }
+
+  /**
+   * Запоминает источник, вписанный пользователем, чтобы он предлагался и в
+   * следующих формах. Записи со своим источником везут его определение с собой,
+   * поэтому подпись не потеряется и без этого списка — здесь копится только
+   * то, что показывать в подсказках при вводе.
+   *
+   * @param definition - определение источника (ключ уже нормализован)
+   */
+  function rememberSource(definition: SourceDefinition): void {
+    if (!definition.key) {
+      return;
+    }
+
+    const rest = customSources.value.filter(
+      (source) => source.key !== definition.key,
+    );
+
+    customSources.value = [...rest, definition];
   }
 
   /**
@@ -138,24 +210,33 @@ export const useSystemDataStore = defineStore('systemData', () => {
   }
 
   /**
-   * Устанавливает виды (расы) из серверных данных
+   * Запоминает виды, собранные листом персонажа из компендиума: вкладка умений
+   * читает по ним варианты особенностей вида. Сервер виды не присылает — их
+   * знает только тот, кто открыл лист, и список живёт до следующего листа.
+   *
+   * @param speciesList - виды одним списком (паки компендиума мира)
    */
-  function setSpeciesDefinitions(
-    speciesList: import('@vtt/shared/system/dnd.js').SpeciesDefinition[],
-  ): void {
+  function rememberSpeciesDefinitions(speciesList: SpeciesDefinition[]): void {
     speciesDefinitions.value = speciesList;
   }
 
   /**
-   * Очищает все данные (при отключении от мира)
+   * Отпускает всё, что собрано за сессию мира: справочники сервера, источники
+   * паков и вписанные пользователем, виды из компендиума. Зовётся, когда
+   * пользователь ушёл из мира (`world:closed`): следующий мир может быть с
+   * другими паками и другим автором, и его данные не должны смешаться с
+   * прежними. На обрыв связи не зовётся — справочники приедут заново сами, а
+   * вписанный источник пропал бы на первом моргании сети.
    */
-  function reset(): void {
+  function releaseWorldData(): void {
     weaponProperties.value = [];
     weaponBaseTypes.value = [];
     damageTypes.value = [];
     weaponCategories.value = [];
     ammunitionTypes.value = [];
-    sources.value = [];
+    builtinSources.value = [];
+    packSources.value = [];
+    customSources.value = [];
     armorCategories.value = [];
     armorBaseTypes.value = [];
     equipmentProperties.value = [];
@@ -164,28 +245,32 @@ export const useSystemDataStore = defineStore('systemData', () => {
   }
 
   return {
-    weaponProperties,
-    weaponBaseTypes,
-    damageTypes,
-    weaponCategories,
-    ammunitionTypes,
+    // Списки — через `computed`: снаружи их видно, но не переписать целиком
+    weaponProperties: computed(() => weaponProperties.value),
+    weaponBaseTypes: computed(() => weaponBaseTypes.value),
+    damageTypes: computed(() => damageTypes.value),
+    weaponCategories: computed(() => weaponCategories.value),
+    ammunitionTypes: computed(() => ammunitionTypes.value),
     sources,
-    armorCategories,
-    armorBaseTypes,
+    armorCategories: computed(() => armorCategories.value),
+    armorBaseTypes: computed(() => armorBaseTypes.value),
+    equipmentProperties: computed(() => equipmentProperties.value),
+    toolProperties: computed(() => toolProperties.value),
+    speciesDefinitions: computed(() => speciesDefinitions.value),
+    // Действия: первые десять зовёт слой синхронизации, два последних — окна
     setWeaponProperties,
     setWeaponBaseTypes,
     setDamageTypes,
     setWeaponCategories,
     setAmmunitionTypes,
     setSources,
+    setPackSources,
     setArmorCategories,
     setArmorBaseTypes,
     setEquipmentProperties,
     setToolProperties,
-    setSpeciesDefinitions,
-    equipmentProperties,
-    toolProperties,
-    speciesDefinitions,
-    reset,
+    rememberSource,
+    rememberSpeciesDefinitions,
+    releaseWorldData,
   };
 });

@@ -1,25 +1,77 @@
 <script setup lang="ts">
-  import type { ActorMovement } from '@vtt/shared';
-  import type { CreatureSystem } from '@vtt/shared/system/dnd.js';
-
-  import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
-  import {
-    getMovementList,
-    rollDamageFormula,
+  import type { AbilityType, ActorMovement, MovementType } from '@vtt/shared';
+  import type {
+    ActiveEffect,
+    CreatureSystem,
+    DnDCustomBonus,
+    DnDCustomBonusContext,
+    DnDProficiencySettings,
   } from '@vtt/shared/system/dnd.js';
+
   import { computed, ref } from 'vue';
 
   import FieldsetLabel from '@/shared_ui/components/FieldsetLabel.vue';
+  import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
+  import {
+    BASE_UNARMORED_AC,
+    calculateAbilityModifier,
+    getCustomBonusesValue,
+    getDisplayMovement,
+    getMovementList,
+    rollDamageFormula,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { useProficiencyBonus } from '../../composables/useProficiencyBonus';
   import ArmorClassModal from '../actor/ArmorClassModal.vue';
+  import {
+    ARMOR_CLASS_SETTINGS_LABELS,
+    HIT_POINTS_LABELS,
+    INITIATIVE_ROLL_LABELS,
+    INITIATIVE_SETTINGS_LABELS,
+    MOVEMENT_SETTINGS_LABELS,
+    PROFICIENCY_SETTINGS_LABELS,
+    SHEET_TILE_ICONS,
+    SHEET_TILE_LABELS,
+    SHEET_TILE_SHORT_LABELS,
+  } from '../actor/constants';
   import DiceRollModal from '../actor/DiceRollModal.vue';
   import InitiativeModal from '../actor/InitiativeModal.vue';
+  import MovementModal from '../actor/MovementModal.vue';
+  import ProficiencyBonusModal from '../actor/ProficiencyBonusModal.vue';
+  import SheetSettingsGear from '../actor/SheetSettingsGear.vue';
+  import { formatSignedNumber } from '../actor/utils/formatSignedNumber';
+  import { getSheetBlockClass } from '../actor/utils/sheetBlockClass';
+  import {
+    CREATURE_COMBAT_LABELS,
+    CREATURE_MOVEMENT_EMPTY,
+    CREATURE_PROFICIENCY_RULE_TITLE,
+  } from './constants';
   import CreatureHitPointsModal from './CreatureHitPointsModal.vue';
-  import CreatureMovementModal from './CreatureMovementModal.vue';
 
   interface Props {
     system: CreatureSystem;
     isEditMode: boolean;
+    /** Модификаторы характеристик листа — для бонусов от характеристики */
+    abilityMods: Record<AbilityType, number>;
+    /** Итоговый бонус мастерства листа с учётом активных эффектов */
+    proficiencyBonus?: number;
+    /**
+     * Итоговый класс доспеха листа: в нём уже учтены свои бонусы и активные
+     * эффекты. Нет — показывается записанное значение.
+     */
+    armorClass?: number;
+    /** Итоговые скорости листа — с теми же поправками */
+    resolvedMovement?: Partial<Record<MovementType, number>>;
+    /**
+     * Действующие эффекты листа: окно передвижения называет по ним, что именно
+     * изменило скорость — своими числами такое изменение не видно.
+     */
+    activeEffects?: readonly ActiveEffect[];
+    /**
+     * Числа листа для формулы хитов: по записи, без активных эффектов — окно
+     * здоровья считает по ним бонус за кость и свои бонусы формулы.
+     */
+    hitDiceBonusContext: DnDCustomBonusContext | null;
   }
 
   const props = defineProps<Props>();
@@ -28,11 +80,91 @@
     'update:system': [updates: Partial<CreatureSystem>];
   }>();
 
-  const dexModifier = computed(() => {
-    const score = props.system.abilities?.dexterity ?? 10;
+  /**
+   * Оформление плитки, которую настраивают только в правке: там она нажимается
+   * целиком, а в просмотре лишь показывает число. Правило и цвета — общие с
+   * листом персонажа.
+   */
+  const editableTileClass = computed(() =>
+    getSheetBlockClass({
+      isEditMode: props.isEditMode,
+      isClickable: props.isEditMode,
+    }),
+  );
 
-    return Math.floor((score - 10) / 2);
+  /** Оформление блока, нажимаемого в любом режиме: инициатива и здоровье */
+  const clickableBlockClass = computed(() =>
+    getSheetBlockClass({ isEditMode: props.isEditMode, isClickable: true }),
+  );
+
+  /**
+   * Подпись плитки класса доспеха: в правке рядом встаёт шестерёнка, и полное
+   * название перестаёт помещаться — там подпись сокращается. Полное остаётся у
+   * скринридера.
+   */
+  const armorClassLabel = computed(() =>
+    props.isEditMode
+      ? SHEET_TILE_SHORT_LABELS.armorClass
+      : SHEET_TILE_LABELS.armorClass,
+  );
+
+  const dexModifier = computed(() =>
+    calculateAbilityModifier(props.system.abilities?.dexterity ?? 10),
+  );
+
+  /** Класс доспеха плитки: итог листа, а без него — записанное значение */
+  const effectiveArmorClass = computed(
+    () =>
+      props.armorClass ?? props.system.armorClass?.value ?? BASE_UNARMORED_AC,
+  );
+
+  // --- Бонус мастерства ---
+
+  /** Подпись основы по правилам: показатель опасности существа */
+  const proficiencyRuleTitle = computed(
+    () =>
+      `${CREATURE_PROFICIENCY_RULE_TITLE} ${props.system.challengeRating || '—'}`,
+  );
+
+  const {
+    settings: proficiencySettings,
+    value: proficiencyValue,
+    tooltip: proficiencyTooltip,
+  } = useProficiencyBonus({
+    settings: () => props.system.proficiencySettings,
+    ruleValue: () => props.system.proficiencyBonus,
+    ruleTitle: proficiencyRuleTitle,
+    abilityMods: () => props.abilityMods,
+    resolvedValue: () => props.proficiencyBonus,
   });
+
+  const formattedProficiency = computed(() =>
+    formatSignedNumber(proficiencyValue.value),
+  );
+
+  /** Числа листа, от которых считается вклад своих бонусов */
+  const bonusContext = computed<DnDCustomBonusContext>(() => ({
+    abilityMods: props.abilityMods,
+    proficiencyBonus: proficiencyValue.value,
+  }));
+
+  const isProficiencyBonusOpen = ref(false);
+
+  /** Открывает окно настройки бонуса мастерства — только в правке */
+  function openProficiencyBonus(): void {
+    if (props.isEditMode) {
+      isProficiencyBonusOpen.value = true;
+    }
+  }
+
+  /**
+   * Применяет настройку бонуса мастерства из окна.
+   *
+   * @param settings - своя основа и свои бонусы
+   */
+  function onProficiencySettingsApply(settings: DnDProficiencySettings): void {
+    emit('update:system', { proficiencySettings: settings });
+  }
 
   // --- Передвижение ---
 
@@ -51,7 +183,39 @@
     () => props.system.movement ?? DEFAULT_MOVEMENT,
   );
 
-  const movementList = computed(() => getMovementList(creatureMovement.value));
+  /**
+   * Скорости для показа: итоговые, если лист их посчитал. Правятся при этом
+   * записанные — как и у листа персонажа.
+   */
+  const displayedMovement = computed<ActorMovement>(() => {
+    const resolved = props.resolvedMovement;
+    const base = creatureMovement.value;
+
+    if (!resolved) {
+      return base;
+    }
+
+    return {
+      ...base,
+      walk: resolved.walk ?? base.walk,
+      swim: resolved.swim ?? base.swim,
+      fly: resolved.fly ?? base.fly,
+      climb: resolved.climb ?? base.climb,
+      burrow: resolved.burrow ?? base.burrow,
+    };
+  });
+
+  /** Главный вид передвижения — он и стоит в плитке */
+  const displayMovement = computed(() =>
+    getDisplayMovement(displayedMovement.value),
+  );
+
+  const movementList = computed(() => getMovementList(displayedMovement.value));
+
+  /** Сокращение единиц измерения — оно одно у плитки и у подсказки */
+  const movementUnitLabel = computed(
+    () => DISTANCE_UNIT_SHORT[creatureMovement.value.units ?? 'ft'],
+  );
 
   const isMovementOpen = ref(false);
 
@@ -62,16 +226,35 @@
   /**
    * Применяет обновлённые данные передвижения
    */
-  function onMovementApply(movement: ActorMovement) {
-    emit('update:system', { movement });
+  /**
+   * Применяет передвижение из окна: скорости и свои бонусы к ним правятся там
+   * вместе.
+   *
+   * @param payload - настройка из окна
+   * @param payload.movement - скорости существа
+   * @param payload.bonuses - свои бонусы по видам передвижения
+   */
+  function onMovementApply(payload: {
+    movement: ActorMovement;
+    bonuses: Partial<Record<MovementType, DnDCustomBonus[]>>;
+  }) {
+    emit('update:system', {
+      movement: payload.movement,
+      movementBonuses: payload.bonuses,
+    });
   }
 
   // --- Хиты ---
   const isHitPointsOpen = ref(false);
 
+  /** Открывает окно здоровья: оно правит числа и в просмотре листа */
+  function openHitPoints(): void {
+    isHitPointsOpen.value = true;
+  }
+
   /** Класс значения временных ХП: золото при наличии, приглушённый при нуле */
   const tempHitPointsClass = computed(() =>
-    (props.system.hitPoints?.temp ?? 0) > 0 ? 'text-gold/80' : 'text-dimmed',
+    (props.system.hitPoints?.temp ?? 0) > 0 ? 'text-primary/80' : 'text-dimmed',
   );
 
   function onHitPointsApply(
@@ -111,19 +294,46 @@
   // --- КД ---
   const isArmorClassOpen = ref(false);
 
-  function onArmorClassApply(
-    armorClass: import('@vtt/shared').ActorArmorClass,
-  ) {
-    emit('update:system', { armorClass });
+  /** Открывает окно класса доспеха — только в правке */
+  function openArmorClass(): void {
+    if (props.isEditMode) {
+      isArmorClassOpen.value = true;
+    }
+  }
+
+  /**
+   * Применяет класс доспеха из окна: расчёт и свои бонусы правятся вместе.
+   *
+   * @param payload - настройка из окна
+   * @param payload.armorClass - расчёт класса доспеха
+   * @param payload.bonuses - свои бонусы к классу доспеха
+   */
+  function onArmorClassApply(payload: {
+    armorClass: import('@vtt/shared').ActorArmorClass;
+    bonuses: DnDCustomBonus[];
+  }) {
+    emit('update:system', {
+      armorClass: payload.armorClass,
+      armorClassBonuses: payload.bonuses,
+    });
   }
 
   // --- Инициатива ---
   const initiative = computed(() => {
     const ability = props.system.initiativeAbility ?? 'dexterity';
-    const score = props.system.abilities?.[ability] ?? 10;
-    const mod = Math.floor((score - 10) / 2);
 
-    return mod + (props.system.initiativeBonus ?? 0);
+    const abilityModifier = calculateAbilityModifier(
+      props.system.abilities?.[ability] ?? 10,
+    );
+
+    return (
+      abilityModifier
+      + (props.system.initiativeBonus ?? 0)
+      + getCustomBonusesValue(
+        bonusContext.value,
+        props.system.initiativeBonuses ?? [],
+      )
+    );
   });
 
   const formattedInitiative = computed(() => {
@@ -141,48 +351,84 @@
     rollLabel: '',
   });
 
+  /** Открывает окно настройки инициативы */
+  function openInitiativeSettings(): void {
+    isInitiativeOpen.value = true;
+  }
+
   function handleInitiativeClick() {
     if (props.isEditMode) {
-      isInitiativeOpen.value = true;
+      openInitiativeSettings();
     } else {
       diceRollConfig.value = {
         modifier: initiative.value,
-        title: 'Бросок инициативы',
-        rollLabel: 'Инициатива',
+        title: INITIATIVE_ROLL_LABELS.title,
+        rollLabel: INITIATIVE_ROLL_LABELS.rollLabel,
       };
 
       isDiceRollOpen.value = true;
     }
   }
 
+  /**
+   * Применяет настройку инициативы из окна.
+   *
+   * @param data - настройка из окна
+   * @param data.initiativeBonus - плоская прибавка к инициативе
+   * @param data.initiativeAbility - характеристика расчёта
+   * @param data.bonuses - свои бонусы к инициативе
+   */
   function onInitiativeApply(data: {
     initiativeBonus: number;
-    initiativeAbility: import('@vtt/shared').AbilityType;
+    initiativeAbility: AbilityType;
+    bonuses: DnDCustomBonus[];
   }) {
-    emit('update:system', data);
+    emit('update:system', {
+      initiativeBonus: data.initiativeBonus,
+      initiativeAbility: data.initiativeAbility,
+      initiativeBonuses: data.bonuses,
+    });
   }
 </script>
 
 <template>
   <div class="flex flex-col gap-3">
-    <div class="grid grid-cols-[1fr_min-content] gap-3">
+    <!-- Плитки стоят сеткой два на два, как в листе персонажа: четыре коротких
+      числа читаются рядом, и ни одно из них не растягивается на всю колонку -->
+    <div class="grid grid-cols-2 gap-3">
       <!-- КД -->
       <FieldsetLabel
-        label="Класс доспеха"
+        :label="armorClassLabel"
+        :aria-label="SHEET_TILE_LABELS.armorClass"
         center
         class="group h-full bg-default/20 transition-colors"
-        :class="
-          isEditMode
-            ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-            : 'border-muted'
-        "
-        @click.left.exact.prevent="isEditMode && (isArmorClassOpen = true)"
+        :class="editableTileClass"
+        @click.left.exact.prevent="openArmorClass"
       >
+        <!-- Шестерёнка ведёт в то же окно, что и клик по плитке: значок
+          называет настройку, а не прячет её за догадкой -->
+        <template
+          v-if="isEditMode"
+          #actions
+        >
+          <SheetSettingsGear
+            :label="ARMOR_CLASS_SETTINGS_LABELS.open"
+            @open="openArmorClass"
+          />
+        </template>
+
         <div class="flex h-full flex-col items-center justify-center p-2 pt-0">
-          <div
-            class="text-center text-xl font-bold text-highlighted tabular-nums"
-          >
-            {{ system.armorClass?.value ?? 10 }}
+          <div class="flex items-center justify-center gap-1">
+            <UIcon
+              :name="SHEET_TILE_ICONS.armorClass"
+              class="size-5 shrink-0 text-primary"
+            />
+
+            <span
+              class="text-center text-xl font-bold text-highlighted tabular-nums"
+            >
+              {{ effectiveArmorClass }}
+            </span>
           </div>
 
           <div
@@ -196,16 +442,22 @@
 
       <!-- Инициатива -->
       <FieldsetLabel
-        label="Инициатива"
+        :label="SHEET_TILE_LABELS.initiative"
         center
         class="h-full bg-default/20 transition-colors"
-        :class="
-          isEditMode
-            ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-            : 'cursor-pointer border-muted hover:border-primary/50'
-        "
+        :class="clickableBlockClass"
         @click.left.exact.prevent="handleInitiativeClick"
       >
+        <template
+          v-if="isEditMode"
+          #actions
+        >
+          <SheetSettingsGear
+            :label="INITIATIVE_SETTINGS_LABELS.open"
+            @open="openInitiativeSettings"
+          />
+        </template>
+
         <div class="flex h-full items-center justify-center p-2 pt-0">
           <div
             class="text-xl font-bold tabular-nums"
@@ -215,19 +467,123 @@
           </div>
         </div>
       </FieldsetLabel>
+
+      <!-- Мастерство -->
+      <FieldsetLabel
+        :label="SHEET_TILE_LABELS.proficiency"
+        center
+        class="h-full bg-default/20 transition-colors"
+        :class="editableTileClass"
+        @click.left.exact.prevent="openProficiencyBonus"
+      >
+        <template
+          v-if="isEditMode"
+          #actions
+        >
+          <SheetSettingsGear
+            :label="PROFICIENCY_SETTINGS_LABELS.open"
+            @open="openProficiencyBonus"
+          />
+        </template>
+
+        <!-- Подсказка на содержимом, а не на всей плитке: вложенная в неё
+          подсказка шестерёнки показалась бы вместе с этой -->
+        <UTooltip
+          :text="proficiencyTooltip"
+          :delay-duration="300"
+          :ui="{ content: 'h-auto' }"
+        >
+          <div class="flex h-full items-center justify-center p-2 pt-0">
+            <div class="text-xl font-bold text-highlighted tabular-nums">
+              {{ formattedProficiency }}
+            </div>
+          </div>
+        </UTooltip>
+      </FieldsetLabel>
+
+      <!-- Скорость: в плитке главный вид передвижения, остальные — в подсказке.
+        Так же она стоит и в листе персонажа -->
+      <FieldsetLabel
+        :label="displayMovement.label"
+        center
+        class="h-full bg-default/20 transition-colors"
+        :class="editableTileClass"
+        @click.left.exact.prevent="isEditMode && openMovement()"
+      >
+        <template
+          v-if="isEditMode"
+          #actions
+        >
+          <SheetSettingsGear
+            :label="MOVEMENT_SETTINGS_LABELS.open"
+            @open="openMovement"
+          />
+        </template>
+
+        <UTooltip
+          :delay-duration="300"
+          :ui="{ content: 'h-auto' }"
+        >
+          <div class="flex h-full items-center justify-center p-2 pt-0">
+            <div class="flex items-baseline gap-1">
+              <span class="text-xl font-bold text-highlighted tabular-nums">
+                {{ displayMovement.value }}
+              </span>
+
+              <span class="text-[10px] font-medium text-dimmed">
+                {{ movementUnitLabel }}
+              </span>
+            </div>
+          </div>
+
+          <template #content>
+            <div class="flex flex-col gap-1">
+              <div
+                v-for="item in movementList"
+                :key="item.type"
+                class="flex items-center gap-2"
+              >
+                <span class="tabular-nums opacity-70">
+                  {{ item.value }} {{ movementUnitLabel }}
+                </span>
+
+                <span>
+                  {{ item.label }}
+                  <span
+                    v-if="item.type === 'fly' && creatureMovement.hover"
+                    class="text-xs italic opacity-70"
+                  >
+                    {{ CREATURE_COMBAT_LABELS.hoverBadge }}
+                  </span>
+                </span>
+              </div>
+
+              <span v-if="movementList.length === 0">
+                {{ CREATURE_MOVEMENT_EMPTY }}
+              </span>
+            </div>
+          </template>
+        </UTooltip>
+      </FieldsetLabel>
     </div>
 
     <!-- Здоровье -->
     <FieldsetLabel
-      label="Здоровье"
-      class="group h-full cursor-pointer bg-default/20 transition-colors"
-      :class="
-        isEditMode
-          ? 'border-gold/30 hover:border-gold/50'
-          : 'border-muted hover:border-primary/50'
-      "
-      @click.left.exact.prevent="isHitPointsOpen = true"
+      :label="SHEET_TILE_LABELS.hitPoints"
+      class="group h-full bg-default/20 transition-colors"
+      :class="clickableBlockClass"
+      @click.left.exact.prevent="openHitPoints"
     >
+      <template
+        v-if="isEditMode"
+        #actions
+      >
+        <SheetSettingsGear
+          :label="CREATURE_COMBAT_LABELS.hitPointsOpen"
+          @open="openHitPoints"
+        />
+      </template>
+
       <div class="flex h-full flex-col items-center justify-center p-2 pt-0">
         <!-- ХП: цифры + подписи -->
         <div class="flex w-full items-center">
@@ -259,7 +615,7 @@
           <span
             class="flex-1 text-center text-xs font-medium tracking-wider text-dimmed uppercase"
           >
-            Сейчас
+            {{ HIT_POINTS_LABELS.current }}
           </span>
 
           <span class="w-3" />
@@ -267,7 +623,7 @@
           <span
             class="flex-1 text-center text-xs font-medium tracking-wider text-dimmed uppercase"
           >
-            Всего
+            {{ HIT_POINTS_LABELS.total }}
           </span>
 
           <div class="mx-2 w-px" />
@@ -275,7 +631,7 @@
           <span
             class="flex-1 text-center text-xs font-medium tracking-wider text-dimmed uppercase"
           >
-            Врем.
+            {{ HIT_POINTS_LABELS.temporary }}
           </span>
         </div>
 
@@ -284,7 +640,7 @@
         <div class="relative flex w-full items-center justify-center gap-1">
           <UTooltip
             v-if="isEditMode && system.hitPoints?.formula"
-            text="Сгенерировать здоровье по формуле"
+            :text="CREATURE_COMBAT_LABELS.generateHitPoints"
           >
             <UButton
               icon="tabler:dice-5"
@@ -297,7 +653,7 @@
           </UTooltip>
 
           <span class="text-xs font-bold tracking-wider text-dimmed uppercase">
-            Формула:
+            {{ CREATURE_COMBAT_LABELS.formulaPrefix }}
           </span>
 
           <span class="text-xs font-medium text-toned">
@@ -313,65 +669,26 @@
         </div>
       </div>
     </FieldsetLabel>
-
-    <!-- Скорость -->
-    <FieldsetLabel
-      label="Скорость"
-      class="bg-default/20 transition-colors"
-      :class="[
-        isEditMode
-          ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-          : 'border-muted',
-      ]"
-      @click.left.exact.prevent="isEditMode && openMovement()"
-    >
-      <div class="flex flex-col gap-0.5 p-2 pt-1">
-        <div
-          v-for="item in movementList"
-          :key="item.type"
-          class="flex items-center justify-between text-sm"
-        >
-          <span class="text-toned">
-            {{ item.label }}
-            <span
-              v-if="item.type === 'fly' && creatureMovement.hover"
-              class="text-xs text-dimmed italic"
-              >(зависание)</span
-            >
-          </span>
-
-          <div class="flex items-baseline gap-0.5">
-            <span class="font-bold text-highlighted tabular-nums">{{
-              item.value
-            }}</span>
-
-            <span class="text-xs text-dimmed">{{
-              DISTANCE_UNIT_SHORT[creatureMovement.units ?? 'ft']
-            }}</span>
-          </div>
-        </div>
-
-        <div
-          v-if="movementList.length === 0"
-          class="text-center text-xs text-dimmed italic"
-        >
-          —
-        </div>
-      </div>
-    </FieldsetLabel>
   </div>
 
-  <!-- Модалка передвижения -->
-  <CreatureMovementModal
+  <!-- Модалка передвижения — та же, что и в листе персонажа -->
+  <MovementModal
     v-model:open="isMovementOpen"
     :movement="creatureMovement"
+    :bonuses="system.movementBonuses"
+    :context="bonusContext"
+    :active-effects="activeEffects"
+    :resolved-movement="displayedMovement"
     @apply="onMovementApply"
   />
 
   <!-- Модалка очков здоровья -->
   <CreatureHitPointsModal
+    v-if="hitDiceBonusContext"
     v-model:open="isHitPointsOpen"
     :hit-points="system.hitPoints"
+    :size="system.size"
+    :context="hitDiceBonusContext"
     @apply="onHitPointsApply"
   />
 
@@ -379,9 +696,24 @@
   <ArmorClassModal
     v-model:open="isArmorClassOpen"
     :armor-class="system.armorClass"
+    :bonuses="system.armorClassBonuses"
+    :context="bonusContext"
     :dex-modifier="dexModifier"
+    :resolved-armor-class="armorClass"
+    :active-effects="activeEffects"
     is-creature-mode
     @apply="onArmorClassApply"
+  />
+
+  <!-- Модалка настройки бонуса мастерства -->
+  <ProficiencyBonusModal
+    v-model:open="isProficiencyBonusOpen"
+    :settings="proficiencySettings"
+    :ability-mods="abilityMods"
+    :rule-value="system.proficiencyBonus"
+    :rule-title="proficiencyRuleTitle"
+    :sheet-value="proficiencyValue"
+    @apply="onProficiencySettingsApply"
   />
 
   <!-- Модалка инициативы -->
@@ -390,6 +722,8 @@
     :initiative-bonus="system.initiativeBonus ?? 0"
     :initiative-ability="system.initiativeAbility ?? 'dexterity'"
     :ability-scores="system.abilities"
+    :bonuses="system.initiativeBonuses"
+    :context="bonusContext"
     @apply="onInitiativeApply"
   />
 
@@ -399,7 +733,7 @@
     :modifier="diceRollConfig.modifier"
     :title="diceRollConfig.title"
     :roll-label="diceRollConfig.rollLabel"
-    roll-button-text="Бросить инициативу"
+    :roll-button-text="INITIATIVE_ROLL_LABELS.button"
     initial-roll-mode="normal"
   />
 </template>

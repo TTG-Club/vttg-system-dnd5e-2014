@@ -7,8 +7,11 @@
 
   import type { SpeciesWizardState } from './useSpeciesWizard';
 
-  import { SKILLS_LIST } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
+
+  import { SKILLS_LIST } from '@vtt/shared/system/dnd.js';
+
+  import { GRANT_SECTION_LABELS, WIZARD_GRANTS_LABELS } from '../constants';
 
   const props = defineProps<{
     speciesDefinition: SpeciesDefinition;
@@ -25,7 +28,7 @@
   });
 
   const grantsWithChoices = computed(() => {
-    return props.speciesDefinition.grants
+    return (props.speciesDefinition.grants ?? [])
       .map((grant, index) => ({ grant, index }))
       .filter(({ grant }) => {
         if (grant.type === 'skillProficiency' && grant.count > 0) {
@@ -99,13 +102,17 @@
     <div
       v-for="{ grant, index } in grantsWithChoices"
       :key="index"
-      class="flex flex-col gap-3 rounded-lg bg-elevated/50 p-4"
+      class="flex flex-col gap-3 rounded-lg border border-default/50 bg-elevated/30 p-4"
     >
       <template v-if="grant.type === 'skillProficiency'">
         <div class="flex flex-col gap-1">
-          <span class="text-sm font-medium text-highlighted"> Навыки </span>
+          <span class="text-sm font-medium text-highlighted">
+            {{ GRANT_SECTION_LABELS.skills }}
+          </span>
 
-          <span class="text-xs text-muted"> Выберите {{ grant.count }}: </span>
+          <span class="text-xs text-muted">
+            {{ WIZARD_GRANTS_LABELS.choosePrefix }} {{ grant.count }}:
+          </span>
         </div>
 
         <div class="grid grid-cols-2 gap-3">
@@ -131,19 +138,19 @@
           <span class="text-sm font-medium text-highlighted">
             {{
               grant.type === 'weaponProficiency'
-                ? 'Владение оружием'
+                ? WIZARD_GRANTS_LABELS.weaponProficiency
                 : grant.type === 'armorProficiency'
-                  ? 'Владение бронёй'
+                  ? WIZARD_GRANTS_LABELS.armorProficiency
                   : grant.type === 'toolProficiency'
-                    ? 'Владение инструментами'
+                    ? WIZARD_GRANTS_LABELS.toolProficiency
                     : grant.type === 'language'
-                      ? 'Языки'
-                      : 'Выбор'
+                      ? GRANT_SECTION_LABELS.languages
+                      : WIZARD_GRANTS_LABELS.choice
             }}
           </span>
 
           <span class="text-xs text-muted">
-            Выберите {{ grant.choices.count }}:
+            {{ WIZARD_GRANTS_LABELS.choosePrefix }} {{ grant.choices.count }}:
           </span>
         </div>
 

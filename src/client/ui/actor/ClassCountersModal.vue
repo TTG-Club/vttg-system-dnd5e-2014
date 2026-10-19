@@ -2,20 +2,45 @@
   import type {
     ActorCounterState,
     ClassCounterDefinition,
-    CounterRecovery,
+    CounterRecoveryRule,
+    DnDActor,
   } from '@vtt/shared/system/dnd.js';
 
   import { computed, ref, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
+  import { generateId } from '@vtt/shared';
+  import {
+    buildCounterFormulaContext,
+    COUNTER_COUNT_MIN,
+    COUNTER_RECOVERY_AMOUNT_MIN,
+    CUSTOM_COUNTER_CLASS_KEY,
+    getCounterRecoveryRules,
+    normalizeCounterRecoveryRule,
+    resolveCounterMaxIn,
+  } from '@vtt/shared/system/dnd.js';
 
+  import {
+    CLASS_COUNTERS_LABELS,
+    CLASS_COUNTERS_MODAL_LABELS,
+    COUNTER_RESOURCE_LABELS,
+    FORM_FIELD_LABELS,
+    MODAL_BUTTON_LABELS,
+    SHEET_COUNTER_DEFAULTS,
+  } from './constants';
+  import { findInvalidCounterKeys } from './counterEditorTypes';
+  import CounterMaxField from './CounterMaxField.vue';
+  import CounterRecoveryFields from './CounterRecoveryFields.vue';
+  import FieldHint from './FieldHint.vue';
   import { findCounterDefinition } from './utils/classCounters';
 
   interface Props {
     open: boolean;
     counters: ActorCounterState[];
     counterDefinitions: ClassCounterDefinition[];
+    /** Лист персонажа: по нему считается максимум ресурса с формулой */
+    actor: DnDActor;
   }
 
   const props = defineProps<Props>();
@@ -30,20 +55,52 @@
     set: (value) => emit('update:open', value),
   });
 
-  const recoveryOptions: Array<{ label: string; value: CounterRecovery }> = [
-    { label: 'Короткий отдых', value: 'short' },
-    { label: 'Продолжительный отдых', value: 'long' },
-  ];
+  /**
+   * Счётчик в форме: правила отдыха разложены всегда, даже у записи с одним
+   * легаси-словом. Иначе каждое поле формы носило бы свой запасной вариант.
+   *
+   * `draftId` держит карточку формы: ключ своего ресурса игрок правит, и
+   * опознание по ключу менялось бы с каждой буквой, а у двух ресурсов с одним
+   * ключом правка попадала бы в оба.
+   */
+  type CounterDraft = ActorCounterState & {
+    draftId: string;
+    shortRest: CounterRecoveryRule;
+    longRest: CounterRecoveryRule;
+  };
 
-  const localCounters = ref<ActorCounterState[]>([]);
+  const localCounters = ref<CounterDraft[]>([]);
 
+  /** Контекст формул листа: собирается один раз на весь список счётчиков. */
+  const formulaContext = computed(() =>
+    buildCounterFormulaContext(props.actor),
+  );
+
+  /**
+   * Свои ресурсы с пустым или повторённым ключом: эффект не нашёл бы ресурс.
+   * Книжные не проверяются — их ключ игрок не правит, и совпадение двух
+   * классов мультикласса не должно запирать сохранение формы.
+   */
+  const invalidKeyIndexes = computed(() => {
+    const invalid = findInvalidCounterKeys(
+      localCounters.value.map((counter) => counter.counterKey),
+    );
+
+    return new Set(
+      [...invalid].filter((index) =>
+        isCounterKeyEditable(localCounters.value[index]),
+      ),
+    );
+  });
+
+  // Ресурс без обеих подписей стал бы на листе пустой строкой
   const hasInvalidCounters = computed(() => {
-    return localCounters.value.some(
-      (counter) =>
-        !resolveCounterName(counter)
-        || !resolveCounterShortName(counter)
-        || counter.max < 1
-        || counter.current < 0,
+    return (
+      invalidKeyIndexes.value.size > 0
+      || localCounters.value.some(
+        (counter) =>
+          !resolveCounterName(counter) || !resolveCounterShortName(counter),
+      )
     );
   });
 
@@ -51,19 +108,40 @@
     () => props.open,
     (opened) => {
       if (opened) {
-        localCounters.value = props.counters.map((counter) => ({
-          ...counter,
-        }));
+        localCounters.value = props.counters.map(toCounterDraft);
       }
     },
   );
 
-  function createCounterId(counter: ActorCounterState): string {
-    return [
-      counter.classKey,
-      counter.subclassKey ?? 'class',
-      counter.counterKey,
-    ].join(':');
+  /**
+   * Копия счётчика для формы с разложенным восстановлением.
+   *
+   * Правила отдыха достаются из легаси-поля `recovery` сразу, а не при
+   * сохранении: иначе форма открывала бы старый счётчик с пустыми плитками
+   * отдыха, и игрок читал бы «ничего не возвращается» там, где отдых работает.
+   *
+   * @param counter - счётчик листа
+   */
+  function toCounterDraft(counter: ActorCounterState): CounterDraft {
+    const rules = getCounterRecoveryRules(counter);
+
+    return {
+      ...counter,
+      draftId: generateId('counter'),
+      shortRest: { ...rules.shortRest },
+      longRest: { ...rules.longRest },
+    };
+  }
+
+  /**
+   * Правит ли игрок ключ ресурса. Только у своего: ключ ресурса класса, черты
+   * или вида задан записью, на него ссылаются её эффекты, а пересборка листа
+   * по записи вернула бы книжный ключ.
+   *
+   * @param counter - счётчик формы
+   */
+  function isCounterKeyEditable(counter: ActorCounterState): boolean {
+    return counter.classKey === CUSTOM_COUNTER_CLASS_KEY;
   }
 
   function resolveCounterName(counter: ActorCounterState): string {
@@ -82,87 +160,122 @@
     );
   }
 
-  function resolveCounterRecovery(counter: ActorCounterState): CounterRecovery {
-    return (
-      counter.recovery
-      || findCounterDefinition(counter, props.counterDefinitions)?.recovery
-      || 'long'
-    );
+  /**
+   * Посчитанный максимум счётчика: с формулой он считается от листа и меняется
+   * прямо в форме, когда игрок правит источник.
+   *
+   * @param counter - счётчик формы
+   */
+  function counterMax(counter: ActorCounterState): number {
+    return resolveCounterMaxIn(formulaContext.value, counter);
   }
 
   function toTextInputValue(value: string | number): string {
     return String(value);
   }
 
-  function toNumberInputValue(value: string | number): number {
-    const numericValue = Number(value);
-
-    return Number.isNaN(numericValue) ? 0 : numericValue;
-  }
-
-  function isCounterRecovery(value: string): value is CounterRecovery {
-    return value === 'short' || value === 'long';
-  }
-
   function updateCounter(
-    targetCounter: ActorCounterState,
-    updates: Partial<ActorCounterState>,
+    targetCounter: CounterDraft,
+    updates: Partial<CounterDraft>,
   ): void {
-    const targetCounterId = createCounterId(targetCounter);
-
     localCounters.value = localCounters.value.map((counter) =>
-      createCounterId(counter) === targetCounterId
+      counter.draftId === targetCounter.draftId
         ? { ...counter, ...updates }
         : counter,
     );
   }
 
   function updateCounterName(
-    counter: ActorCounterState,
+    counter: CounterDraft,
     value: string | number,
   ): void {
     updateCounter(counter, { name: toTextInputValue(value) });
   }
 
   function updateCounterShortName(
-    counter: ActorCounterState,
+    counter: CounterDraft,
     value: string | number,
   ): void {
     updateCounter(counter, { shortName: toTextInputValue(value) });
   }
 
-  function updateCounterCurrent(
-    counter: ActorCounterState,
+  function updateCounterKey(
+    counter: CounterDraft,
     value: string | number,
   ): void {
-    const current = Math.max(0, toNumberInputValue(value));
-
-    updateCounter(counter, {
-      current: Math.min(current, counter.max),
-    });
+    updateCounter(counter, { counterKey: toTextInputValue(value).trim() });
   }
 
-  function updateCounterMax(
-    counter: ActorCounterState,
-    value: string | number,
+  /**
+   * Записывает правило короткого отдыха.
+   *
+   * @param counter - счётчик формы
+   * @param shortRest - что возвращает короткий отдых
+   */
+  function updateCounterShortRest(
+    counter: CounterDraft,
+    shortRest: CounterRecoveryRule,
   ): void {
-    const max = Math.max(1, toNumberInputValue(value));
+    updateCounter(counter, { shortRest });
+  }
+
+  /**
+   * Записывает правило продолжительного отдыха.
+   *
+   * @param counter - счётчик формы
+   * @param longRest - что возвращает продолжительный отдых
+   */
+  function updateCounterLongRest(
+    counter: CounterDraft,
+    longRest: CounterRecoveryRule,
+  ): void {
+    updateCounter(counter, { longRest });
+  }
+
+  /**
+   * Записывает формулу максимума, приводя остаток.
+   *
+   * Полный ресурс остаётся полным: новый заводится полным и обязан таким и
+   * сохраниться, когда игрок выберет источник максимума, — поля остатка в форме
+   * нет. Начатый ресурс сохраняет потраченное: смена настройки не восполняет
+   * заряды. Снижение максимума остаток подрезает — иначе осталось бы «3/2».
+   *
+   * @param counter - счётчик формы
+   * @param maxFormula - формула максимума
+   */
+  function updateCounterMaxFormula(
+    counter: CounterDraft,
+    maxFormula: string,
+  ): void {
+    const wasFull = counter.current >= counterMax(counter);
+    const max = counterMax({ ...counter, maxFormula });
 
     updateCounter(counter, {
-      current: Math.min(counter.current, max),
+      maxFormula,
       max,
+      current: wasFull ? max : Math.min(counter.current, max),
     });
   }
 
-  function updateCounterRecovery(
-    counter: ActorCounterState,
-    value: string,
-  ): void {
-    if (!isCounterRecovery(value)) {
-      return;
-    }
+  /**
+   * Записывает нижнюю граница максимума, приводя остаток.
+   *
+   * Граница поднимает максимум так же, как это делает формула, поэтому остаток
+   * подрезается по тому же правилу: полный ресурс остаётся полным, начатый
+   * сохраняет потраченное.
+   *
+   * @param counter - счётчик формы
+   * @param minimum - нижняя граница максимума; 0 — границы нет
+   */
+  function updateCounterMinimum(counter: CounterDraft, minimum: number): void {
+    const wasFull = counter.current >= counterMax(counter);
+    const max = counterMax({ ...counter, min: minimum });
 
-    updateCounter(counter, { recovery: value });
+    updateCounter(counter, {
+      min: minimum,
+      max,
+      current: wasFull ? max : Math.min(counter.current, max),
+    });
   }
 
   function createCustomCounterKey(): string {
@@ -185,33 +298,49 @@
     localCounters.value = [
       ...localCounters.value,
       {
+        draftId: generateId('counter'),
         counterKey: createCustomCounterKey(),
-        classKey: 'custom',
-        name: 'Новый счётчик',
-        shortName: 'НС',
-        recovery: 'long',
+        classKey: CUSTOM_COUNTER_CLASS_KEY,
+        name: SHEET_COUNTER_DEFAULTS.name,
+        shortName: SHEET_COUNTER_DEFAULTS.shortName,
+        // Новый ресурс — своё число: правило заводится, только если игрок сам
+        // выберет источник. Восстановление по умолчанию продолжительным
+        // целиком: так работает большинство счётчиков
+        maxFormula: '1',
+        shortRest: { mode: 'none', amount: COUNTER_RECOVERY_AMOUNT_MIN },
+        longRest: { mode: 'all', amount: COUNTER_RECOVERY_AMOUNT_MIN },
         current: 1,
         max: 1,
       },
     ];
   }
 
-  function removeCounter(targetCounter: ActorCounterState): void {
-    const targetCounterId = createCounterId(targetCounter);
-
+  function removeCounter(targetCounter: CounterDraft): void {
     localCounters.value = localCounters.value.filter(
-      (counter) => createCounterId(counter) !== targetCounterId,
+      (counter) => counter.draftId !== targetCounter.draftId,
     );
   }
 
-  function normalizeCounter(counter: ActorCounterState): ActorCounterState {
-    const max = Math.max(1, counter.max);
+  /**
+   * Счётчик к сохранению: подписи достроены, максимум пересчитан, число зарядов
+   * в правилах отдыха приведено к его границам.
+   *
+   * Легаси-поле `recovery` снимается: правила отдыха теперь заданы явно, и
+   * оставленное слово читалось бы вместо них на листах, где правила пустые.
+   *
+   * @param counter - счётчик формы
+   */
+  function normalizeCounter(counter: CounterDraft): ActorCounterState {
+    const max = counterMax(counter);
+    const { draftId: _draftId, ...counterState } = counter;
 
     return {
-      ...counter,
+      ...counterState,
+      recovery: undefined,
       name: resolveCounterName(counter),
       shortName: resolveCounterShortName(counter),
-      recovery: resolveCounterRecovery(counter),
+      shortRest: normalizeCounterRecoveryRule(counter.shortRest, max),
+      longRest: normalizeCounterRecoveryRule(counter.longRest, max),
       current: Math.min(Math.max(0, counter.current), max),
       max,
     };
@@ -231,14 +360,15 @@
     :blocking="true"
     :min-width="620"
     :min-height="420"
-    title="Счётчики ресурсов"
+    :title="CLASS_COUNTERS_MODAL_LABELS.title"
     :z-index="Z_INDEX.MODAL_ELEVATED"
   >
     <template #body>
       <div class="flex flex-col gap-3">
         <div class="flex items-center justify-between">
           <span class="text-sm text-muted">
-            {{ localCounters.length }} шт.
+            {{ localCounters.length }}
+            {{ CLASS_COUNTERS_MODAL_LABELS.countUnit }}
           </span>
 
           <UButton
@@ -248,7 +378,7 @@
             icon="tabler:plus"
             @click.left.exact.prevent="addCounter"
           >
-            Добавить
+            {{ MODAL_BUTTON_LABELS.add }}
           </UButton>
         </div>
 
@@ -256,20 +386,20 @@
           v-if="localCounters.length === 0"
           class="rounded-lg border border-dashed border-muted p-4 text-center text-sm text-dimmed"
         >
-          Нет счётчиков
+          {{ CLASS_COUNTERS_MODAL_LABELS.empty }}
         </div>
 
-        <div class="flex max-h-[460px] flex-col gap-2 overflow-y-auto pr-1">
+        <div class="flex max-h-115 flex-col gap-2 overflow-y-auto pr-1">
           <div
-            v-for="counter in localCounters"
-            :key="createCounterId(counter)"
-            class="relative rounded-lg border border-default/50 bg-elevated/20 p-4 transition-all duration-200 hover:border-gold/30 hover:bg-elevated/30"
+            v-for="(counter, index) in localCounters"
+            :key="counter.draftId"
+            class="relative rounded-lg border border-default/50 bg-elevated/20 p-4 transition-all duration-200 hover:border-primary/30 hover:bg-elevated/30"
           >
             <!-- Кнопка удаления в правом верхнем углу -->
             <div class="absolute top-4 right-4 z-10">
               <UTooltip
                 :delay-duration="300"
-                text="Удалить счётчик"
+                :text="CLASS_COUNTERS_LABELS.removeCounter"
               >
                 <UButton
                   size="xs"
@@ -284,20 +414,20 @@
 
             <!-- Контентная часть карточки с отступом справа под кнопку -->
             <div class="flex flex-col gap-3 pr-8">
-              <!-- Первый ряд: Название и Краткое имя -->
-              <div class="grid grid-cols-[1fr_6rem] gap-3">
+              <!-- Первый ряд: Название, Краткое имя и Ключ -->
+              <div class="grid grid-cols-[1fr_6rem_7rem] gap-3">
                 <label class="flex flex-col gap-1">
                   <span
                     class="text-[10px] font-bold tracking-wider text-toned/80 uppercase"
                   >
-                    Название
+                    {{ FORM_FIELD_LABELS.name }}
                   </span>
 
                   <UInput
                     :model-value="resolveCounterName(counter)"
                     size="sm"
                     class="w-full"
-                    placeholder="Например, Очки чародейства"
+                    :placeholder="CLASS_COUNTERS_MODAL_LABELS.namePlaceholder"
                     @update:model-value="updateCounterName(counter, $event)"
                   />
                 </label>
@@ -306,73 +436,63 @@
                   <span
                     class="text-[10px] font-bold tracking-wider text-toned/80 uppercase"
                   >
-                    Кратко
+                    {{ CLASS_COUNTERS_MODAL_LABELS.shortName }}
                   </span>
 
                   <UInput
                     :model-value="resolveCounterShortName(counter)"
                     size="sm"
-                    placeholder="ОЧ"
+                    :placeholder="
+                      CLASS_COUNTERS_MODAL_LABELS.shortNamePlaceholder
+                    "
                     class="w-full"
                     @update:model-value="
                       updateCounterShortName(counter, $event)
                     "
                   />
                 </label>
+
+                <!-- Ключ виден, чтобы знать, что вписать в «Тратит ресурс» у
+                  эффекта. Ошибка — только рамкой: строка под полем сбила бы ряд -->
+                <div class="flex flex-col gap-1">
+                  <span
+                    class="flex items-center gap-1 text-[10px] font-bold tracking-wider text-toned/80 uppercase"
+                  >
+                    {{ COUNTER_RESOURCE_LABELS.key }}
+
+                    <FieldHint :text="CLASS_COUNTERS_MODAL_LABELS.keyHint" />
+                  </span>
+
+                  <!-- Рамка ошибки — так же, как у ключа в редакторе записи -->
+                  <UFormField :error="invalidKeyIndexes.has(index)">
+                    <UInput
+                      :model-value="counter.counterKey"
+                      :placeholder="COUNTER_RESOURCE_LABELS.keyPlaceholder"
+                      :disabled="!isCounterKeyEditable(counter)"
+                      size="sm"
+                      class="w-full"
+                      @update:model-value="updateCounterKey(counter, $event)"
+                    />
+                  </UFormField>
+                </div>
               </div>
 
-              <!-- Второй ряд: Восстановление, Текущее значение, Максимум -->
-              <div class="grid grid-cols-[1fr_6rem_6rem] gap-3">
-                <label class="flex flex-col gap-1">
-                  <span
-                    class="text-[10px] font-bold tracking-wider text-toned/80 uppercase"
-                  >
-                    Восстановление
-                  </span>
+              <!-- Второй ряд: от чего считается максимум. Остатка здесь нет:
+                новый ресурс заводится полным, а тратят его кнопками на листе -->
+              <CounterMaxField
+                :model-value="counter.maxFormula ?? String(counter.max)"
+                :minimum="counter.min ?? COUNTER_COUNT_MIN"
+                :computed-max="counterMax(counter)"
+                @update:model-value="updateCounterMaxFormula(counter, $event)"
+                @update:minimum="updateCounterMinimum(counter, $event)"
+              />
 
-                  <USelect
-                    :model-value="resolveCounterRecovery(counter)"
-                    :items="recoveryOptions"
-                    size="sm"
-                    class="w-full"
-                    @update:model-value="updateCounterRecovery(counter, $event)"
-                  />
-                </label>
-
-                <label class="flex flex-col gap-1">
-                  <span
-                    class="text-[10px] font-bold tracking-wider text-toned/80 uppercase"
-                  >
-                    Сейчас
-                  </span>
-
-                  <UInput
-                    :model-value="counter.current"
-                    type="number"
-                    :min="0"
-                    size="sm"
-                    class="w-full"
-                    @update:model-value="updateCounterCurrent(counter, $event)"
-                  />
-                </label>
-
-                <label class="flex flex-col gap-1">
-                  <span
-                    class="text-[10px] font-bold tracking-wider text-toned/80 uppercase"
-                  >
-                    Максимум
-                  </span>
-
-                  <UInput
-                    :model-value="counter.max"
-                    type="number"
-                    :min="1"
-                    size="sm"
-                    class="w-full"
-                    @update:model-value="updateCounterMax(counter, $event)"
-                  />
-                </label>
-              </div>
+              <CounterRecoveryFields
+                :short-rest="counter.shortRest"
+                :long-rest="counter.longRest"
+                @update:short-rest="updateCounterShortRest(counter, $event)"
+                @update:long-rest="updateCounterLongRest(counter, $event)"
+              />
             </div>
           </div>
         </div>
@@ -386,7 +506,7 @@
           variant="ghost"
           @click.left.exact.prevent="isOpen = false"
         >
-          Отмена
+          {{ MODAL_BUTTON_LABELS.cancel }}
         </UButton>
 
         <UButton
@@ -394,7 +514,7 @@
           :disabled="hasInvalidCounters"
           @click.left.exact.prevent="applyCounters"
         >
-          Сохранить
+          {{ MODAL_BUTTON_LABELS.save }}
         </UButton>
       </div>
     </template>

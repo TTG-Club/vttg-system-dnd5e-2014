@@ -2,56 +2,159 @@
   import type {
     AbilityType,
     ActorMovement,
+    MovementType,
     ProficiencyLevel,
     SkillType,
   } from '@vtt/shared';
   import type {
-    Actor,
     AttackRollMode,
     ClassCounterDefinition,
+    DnDActor,
+    DnDCustomBonus,
+    DnDCustomBonusContext,
+    DnDCustomSkill,
+    DnDSkillSettings,
+    SkillEffectInfluence,
   } from '@vtt/shared/system/dnd.js';
 
-  import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
-  import {
-    calculateAbilityModifier,
-    getDisplayMovement,
-    getMovementList,
-    getSkillAbility,
-    SKILLS_LIST,
-  } from '@vtt/shared/system/dnd.js';
+  import type { RollBonusEvaluator } from '../../composables/rollBonusEvaluator';
+
   import { computed, ref, toRef } from 'vue';
 
   import FieldsetLabel from '@/shared_ui/components/FieldsetLabel.vue';
+  import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
+  import {
+    ABILITY_LABELS,
+    calculateAbilityModifier,
+    getActorAbilityModifiers,
+    getActorProficiencyBonus,
+    getCustomBonusesValue,
+    getCustomBonusValue,
+    getCustomSkillValue,
+    getDisplayMovement,
+    getMovementList,
+    getProficiencyContribution,
+    getSkillCheckBonusKeys,
+    getSkillRowGroups,
+    getSkillSetting,
+    getSkillSettingAbility,
+    isChangedSkill,
+    isProficiencyLevel,
+    listSkillEffectInfluences,
+    resolveAbilityCheckRollMode,
+    resolveInitiativeRollMode,
+    SKILL_PROFICIENCY_NEXT,
+    SKILLS_LIST,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { buildRollBonusEvaluator } from '../../composables/rollBonusEvaluator';
   import { useResolvedStats } from '../../composables/useResolvedStats';
   import ClassCounters from './ClassCounters.vue';
+  import {
+    ABILITY_CHECK_ROLL_LABELS,
+    CUSTOM_BONUS_LABELS,
+    DICE_ROLL_DEFAULT_BUTTON,
+    GRANT_SECTION_LABELS,
+    INITIATIVE_ROLL_LABELS,
+    INITIATIVE_SETTINGS_LABELS,
+    MOVEMENT_SETTINGS_LABELS,
+    SHEET_SUMMARY_COMPACT_CLASSES,
+    SHEET_SUMMARY_WIDE_CLASSES,
+    SHEET_TILE_LABELS,
+    SKILL_GROUP_LABEL_CLASS,
+    SKILL_SETTINGS_LABELS,
+  } from './constants';
   import DiceRollModal from './DiceRollModal.vue';
   import InitiativeModal from './InitiativeModal.vue';
   import MovementModal from './MovementModal.vue';
+  import SheetSettingsGear from './SheetSettingsGear.vue';
   import SkillItem from './SkillItem.vue';
+  import SkillSettingsModal from './SkillSettingsModal.vue';
+  import { formatSignedNumber } from './utils/formatSignedNumber';
+  import { getSheetBlockClass } from './utils/sheetBlockClass';
 
   interface Props {
-    actor: Actor;
+    actor: DnDActor;
     isEditMode: boolean;
     /** Определения счётчиков из компендиума */
     counterDefinitions: ClassCounterDefinition[];
+    /**
+     * Характеристика под курсором: её навыки подсвечиваются в списке. `null` —
+     * подсвечивать нечего.
+     */
+    highlightedAbility?: AbilityType | null;
+    /**
+     * Узкий лист: панель стоит не колонкой, а растворяется в общей сетке
+     * сводки — её блоки встают туда по порядку чтения с телефона.
+     */
+    isCompact?: boolean;
   }
 
   defineOptions({ inheritAttrs: false });
 
   const props = defineProps<Props>();
 
-  const emit = defineEmits<{
-    'update:actor': [updates: Partial<Actor>];
-  }>();
+  /** Классы раскладки блоков: колонкой на широком листе, сеткой на узком */
+  const layoutClasses = computed(() =>
+    props.isCompact
+      ? SHEET_SUMMARY_COMPACT_CLASSES
+      : SHEET_SUMMARY_WIDE_CLASSES,
+  );
 
-  const skills = SKILLS_LIST;
+  const emit = defineEmits<{
+    'update:actor': [updates: Partial<DnDActor>];
+  }>();
 
   const { resolvedStats, combinedEffects } = useResolvedStats(
     toRef(() => props.actor),
   );
 
+  /**
+   * Оформление плитки, которую настраивают только в правке: там она нажимается
+   * целиком, а в просмотре лишь показывает число.
+   */
+  const editableTileClass = computed(() =>
+    getSheetBlockClass({
+      isEditMode: props.isEditMode,
+      isClickable: props.isEditMode,
+    }),
+  );
+
+  /** Оформление плитки инициативы: вне правки по ней бросают */
+  const initiativeTileClass = computed(() =>
+    getSheetBlockClass({ isEditMode: props.isEditMode, isClickable: true }),
+  );
+
+  /** Оформление блока, который целиком не нажимается: настройка — в шестерёнке */
+  const blockClass = computed(() =>
+    getSheetBlockClass({ isEditMode: props.isEditMode }),
+  );
+
   // --- Ходьба ---
+
+  /**
+   * Модификаторы характеристик с учётом эффектов — по ним считаются навыки,
+   * инициатива и разбор значений. Без разрешённых статов модификаторы берутся
+   * прямо из значений характеристик листа.
+   */
+  const sheetAbilityMods = computed<Record<AbilityType, number>>(
+    () =>
+      resolvedStats.value?.abilityMods ?? getActorAbilityModifiers(props.actor),
+  );
+
+  /**
+   * Бонус мастерства с учётом эффектов; без разрешённых статов — расчёт по
+   * уровню с поправками настройки листа.
+   */
+  const sheetProficiencyBonus = computed(() =>
+    getActorProficiencyBonus(props.actor, resolvedStats.value),
+  );
+
+  /** Числа листа, от которых считается вклад своих бонусов */
+  const bonusContext = computed<DnDCustomBonusContext>(() => ({
+    abilityMods: sheetAbilityMods.value,
+    proficiencyBonus: sheetProficiencyBonus.value,
+  }));
 
   /** Конечные скорости передвижения (база + бонусы от эффектов) */
   const resolvedMovement = computed<ActorMovement>(() => {
@@ -84,25 +187,28 @@
     isMovementOpen.value = true;
   }
 
-  function onMovementApply(movement: ActorMovement) {
+  /**
+   * Применяет передвижение из окна: скорости и свои бонусы к ним правятся там
+   * вместе.
+   *
+   * @param payload - настройка из окна
+   * @param payload.movement - скорости листа
+   * @param payload.bonuses - свои бонусы по видам передвижения
+   */
+  function onMovementApply(payload: {
+    movement: ActorMovement;
+    bonuses: Partial<Record<MovementType, DnDCustomBonus[]>>;
+  }) {
     emit('update:actor', {
-      system: { ...props.actor.system, movement },
+      system: {
+        ...props.actor.system,
+        movement: payload.movement,
+        movementBonuses: payload.bonuses,
+      },
     });
   }
 
   // --- Инициатива ---
-
-  const abilities: Array<{
-    key: AbilityType;
-    label: string;
-  }> = [
-    { key: 'strength', label: 'Сила' },
-    { key: 'intelligence', label: 'Интеллект' },
-    { key: 'dexterity', label: 'Ловкость' },
-    { key: 'wisdom', label: 'Мудрость' },
-    { key: 'constitution', label: 'Телосложение' },
-    { key: 'charisma', label: 'Харизма' },
-  ];
 
   const initiative = computed(() => {
     return resolvedStats.value?.initiative ?? 0;
@@ -114,52 +220,69 @@
       : `${initiative.value}`;
   });
 
+  /** Подсказка плитки инициативы: из чего сложилось её число */
   const initiativeTooltip = computed(() => {
     const ability = props.actor.system.initiativeAbility ?? 'dexterity';
-
-    const abilityLabel =
-      abilities.find((abilityDef) => abilityDef.key === ability)?.label
-      ?? 'Ловкость';
-
     const abilityScore = props.actor.system.abilities[ability];
     const abilityMod = calculateAbilityModifier(abilityScore);
     const bonus = props.actor.system.initiativeBonus ?? 0;
 
-    let text = `${abilityLabel}: ${abilityMod >= 0 ? '+' : ''}${abilityMod}`;
+    const parts = [
+      `${ABILITY_LABELS[ability]} ${formatSignedNumber(abilityMod)}`,
+    ];
 
     if (bonus !== 0) {
-      text += ` | Бонус: ${bonus >= 0 ? '+' : ''}${bonus}`;
+      parts.push(
+        `${INITIATIVE_SETTINGS_LABELS.flatBonus} ${formatSignedNumber(bonus)}`,
+      );
     }
 
-    return text;
+    for (const customBonus of props.actor.system.initiativeBonuses ?? []) {
+      const label = customBonus.label.trim() || CUSTOM_BONUS_LABELS.unnamed;
+
+      parts.push(
+        `${label} ${formatSignedNumber(
+          getCustomBonusValue(bonusContext.value, customBonus),
+        )}`,
+      );
+    }
+
+    return parts.join(' · ');
   });
 
   const isInitiativeOpen = ref(false);
 
   const isDiceRollOpen = ref(false);
 
-  const diceRollConfig = ref({
+  /** Настройка окна броска: собирается перед каждым открытием */
+  interface DiceRollConfig {
+    modifier: number;
+    title: string;
+    rollLabel: string;
+    rollButtonText: string;
+    initialRollMode: AttackRollMode;
+    evaluateBonusRollFormulas?: RollBonusEvaluator;
+  }
+
+  const diceRollConfig = ref<DiceRollConfig>({
     modifier: 0,
     title: '',
     rollLabel: '',
-    rollButtonText: 'Бросить',
-    initialRollMode: 'normal' as AttackRollMode,
+    rollButtonText: DICE_ROLL_DEFAULT_BUTTON,
+    initialRollMode: 'normal',
   });
 
   /**
    * Открывает универсальную модалку броска кубиков
    * @param config - конфигурация броска
    */
-  function openDiceRoll(config: {
-    modifier: number;
-    title: string;
-    rollLabel: string;
-    rollButtonText?: string;
-    initialRollMode?: AttackRollMode;
-  }) {
+  function openDiceRoll(
+    config: Partial<DiceRollConfig>
+      & Pick<DiceRollConfig, 'modifier' | 'title' | 'rollLabel'>,
+  ) {
     diceRollConfig.value = {
       ...config,
-      rollButtonText: config.rollButtonText ?? 'Бросить',
+      rollButtonText: config.rollButtonText ?? DICE_ROLL_DEFAULT_BUTTON,
       initialRollMode: config.initialRollMode ?? 'normal',
     };
 
@@ -167,35 +290,22 @@
   }
 
   function openInitiativeRoll() {
-    let initialRollMode: AttackRollMode = 'normal';
-
-    const flags = resolvedStats.value?.activeFlags ?? new Set();
-
-    const hasAdvantage =
-      flags.has('initiative.advantage')
-      || flags.has('abilityCheck.advantage.dexterity')
-      || flags.has('abilityCheck.advantage');
-
-    const hasDisadvantage =
-      flags.has('initiative.disadvantage')
-      || flags.has('abilityCheck.disadvantage.dexterity')
-      || flags.has('abilityCheck.disadvantage');
-
-    if (hasAdvantage && !hasDisadvantage) {
-      initialRollMode = 'advantage';
-    }
-
-    if (!hasAdvantage && hasDisadvantage) {
-      initialRollMode = 'disadvantage';
-    }
-
     openDiceRoll({
       modifier: initiative.value,
-      title: 'Бросок инициативы',
-      rollLabel: 'Инициатива',
-      rollButtonText: 'Бросить инициативу',
-      initialRollMode,
+      title: INITIATIVE_ROLL_LABELS.title,
+      rollLabel: INITIATIVE_ROLL_LABELS.rollLabel,
+      rollButtonText: INITIATIVE_ROLL_LABELS.button,
+      // Флаги преимущества/помехи инициативы читает движок — тем же правилом,
+      // что и окно броска из трекера боя
+      initialRollMode: resolveInitiativeRollMode(
+        resolvedStats.value?.activeFlags ?? new Set<string>(),
+      ),
     });
+  }
+
+  /** Открывает окно настройки инициативы */
+  function openInitiativeSettings(): void {
+    isInitiativeOpen.value = true;
   }
 
   /**
@@ -205,54 +315,324 @@
    */
   function handleInitiativeClick() {
     if (props.isEditMode) {
-      isInitiativeOpen.value = true;
+      openInitiativeSettings();
     } else {
       openInitiativeRoll();
     }
   }
 
+  /**
+   * Применяет настройку инициативы из окна.
+   *
+   * @param data - настройка из окна
+   * @param data.initiativeBonus - плоская прибавка к инициативе
+   * @param data.initiativeAbility - характеристика расчёта
+   * @param data.bonuses - свои бонусы к инициативе
+   */
   function onInitiativeApply(data: {
     initiativeBonus: number;
     initiativeAbility: AbilityType;
+    bonuses: DnDCustomBonus[];
   }) {
     emit('update:actor', {
-      system: { ...props.actor.system, ...data },
+      system: {
+        ...props.actor.system,
+        initiativeBonus: data.initiativeBonus,
+        initiativeAbility: data.initiativeAbility,
+        initiativeBonuses: data.bonuses,
+      },
     });
   }
 
   // --- Навыки ---
 
-  /** Порядок переключения уровней владения */
-  const LEVEL_ORDER: ProficiencyLevel[] = [
-    'none',
-    'half',
-    'proficient',
-    'expertise',
-  ];
+  /** Строка списка навыков: навык правил либо заведённый игроком */
+  interface SkillRow {
+    /** Ключ строки списка */
+    id: string;
+    /** Ключ навыка правил; не задан — свой навык */
+    key?: SkillType;
+    label: string;
+    /** Характеристика расчёта: в настройке её подменяют */
+    ability: AbilityType;
+    proficiencyLevel: ProficiencyLevel;
+    modifier: number;
+    isCustom: boolean;
+    /** Разбор значения; пусто — навык считается по правилам */
+    valueHint: string;
+    /** Что сейчас влияет на бросок навыка: эффекты и доспех */
+    influences: SkillEffectInfluence[];
+    /**
+     * Характеристики своих бонусов навыка: наведение на любую из них тоже
+     * связывает её с навыком, хоть навык и не её.
+     */
+    bonusAbilities: AbilityType[];
+  }
+
+  /**
+   * Характеристики, от модификаторов которых зависят свои бонусы навыка.
+   *
+   * @param bonuses - свои бонусы навыка
+   * @returns характеристики бонусов без повторов
+   */
+  function getBonusAbilities(
+    bonuses: DnDCustomSkill['bonuses'],
+  ): AbilityType[] {
+    return [
+      ...new Set(
+        bonuses
+          .filter((bonus) => bonus.kind === 'ability')
+          .map((bonus) => bonus.ability),
+      ),
+    ];
+  }
+
+  /**
+   * Разбор значения навыка: из чего оно сложилось. Показывается только у
+   * навыков не по правилам — у остальных сокращение характеристики в строке и
+   * так всё объясняет.
+   *
+   * Вклад активных эффектов идёт отдельной частью: без него слагаемые в
+   * подсказке не сходились бы с числом в строке, и разбор вводил бы в
+   * заблуждение как раз там, где он нужнее всего.
+   *
+   * @param ability - характеристика расчёта
+   * @param proficiencyLevel - уровень владения
+   * @param bonuses - свои бонусы навыка
+   * @param effectsBonus - вклад активных эффектов
+   * @returns строка разбора
+   */
+  function buildSkillHint(
+    ability: AbilityType,
+    proficiencyLevel: ProficiencyLevel,
+    bonuses: DnDCustomSkill['bonuses'],
+    effectsBonus: number,
+  ): string {
+    const mods = sheetAbilityMods.value;
+
+    const parts = [
+      `${ABILITY_LABELS[ability]} ${formatSignedNumber(mods[ability] ?? 0)}`,
+    ];
+
+    const proficiencyPart = getProficiencyContribution(
+      sheetProficiencyBonus.value,
+      proficiencyLevel,
+    );
+
+    if (proficiencyPart !== 0) {
+      parts.push(
+        `${SHEET_TILE_LABELS.proficiency} ${formatSignedNumber(proficiencyPart)}`,
+      );
+    }
+
+    for (const bonus of bonuses) {
+      const label = bonus.label.trim() || CUSTOM_BONUS_LABELS.unnamed;
+
+      parts.push(
+        `${label} ${formatSignedNumber(
+          getCustomBonusValue(bonusContext.value, bonus),
+        )}`,
+      );
+    }
+
+    if (effectsBonus !== 0) {
+      parts.push(
+        `${SKILL_SETTINGS_LABELS.effects} ${formatSignedNumber(effectsBonus)}`,
+      );
+    }
+
+    return parts.join(' · ');
+  }
+
+  /**
+   * Список навыков листа: навыки правил и свои одним списком по алфавиту —
+   * свой навык ищут по названию наравне с остальными.
+   */
+  const skillRows = computed<SkillRow[]>(() => {
+    const settings = props.actor.system.skillSettings;
+    const proficiencies = props.actor.system.proficiencies.skills;
+    const mods = sheetAbilityMods.value;
+    const activeFlags = resolvedStats.value?.activeFlags ?? new Set<string>();
+
+    /**
+     * Влияния на бросок: теми же эффектами, что считают лист, чтобы значок
+     * не расходился с броском.
+     *
+     * @param ability - характеристика расчёта навыка
+     * @param skill - навык правил; нет — свой навык
+     * @returns влияния на навык
+     */
+    const influencesOf = (
+      ability: AbilityType,
+      skill?: SkillType,
+    ): SkillEffectInfluence[] =>
+      listSkillEffectInfluences({
+        effects: combinedEffects.value,
+        skill,
+        ability,
+        activeFlags,
+      });
+
+    const ruleRows = SKILLS_LIST.map<SkillRow>((skill) => {
+      const setting = getSkillSetting(settings, skill.key);
+      const ability = getSkillSettingAbility(setting, skill.key);
+      const rawLevel = proficiencies[skill.key];
+
+      const proficiencyLevel: ProficiencyLevel = isProficiencyLevel(rawLevel)
+        ? rawLevel
+        : 'none';
+
+      // Итог берётся из разрешённых статов: там уже учтены активные эффекты.
+      // Запасной расчёт нужен, пока статы не сошлись, — иначе строка мигает
+      // нулём
+      const fallbackModifier =
+        mods[ability]
+        + getProficiencyContribution(
+          sheetProficiencyBonus.value,
+          proficiencyLevel,
+        )
+        + getCustomBonusesValue(bonusContext.value, setting.bonuses);
+
+      const modifier =
+        resolvedStats.value?.skills[skill.key] ?? fallbackModifier;
+
+      return {
+        id: skill.key,
+        key: skill.key,
+        label: skill.label,
+        ability,
+        proficiencyLevel,
+        modifier,
+        isCustom: false,
+        valueHint: isChangedSkill(setting, skill.key)
+          ? buildSkillHint(
+              ability,
+              proficiencyLevel,
+              setting.bonuses,
+              modifier - fallbackModifier,
+            )
+          : '',
+        influences: influencesOf(ability, skill.key),
+        bonusAbilities: getBonusAbilities(setting.bonuses),
+      };
+    });
+
+    const customRows = (settings?.custom ?? []).map<SkillRow>((skill) => ({
+      id: skill.id,
+      label: skill.name,
+      ability: skill.ability,
+      proficiencyLevel: skill.proficiency,
+      modifier: getCustomSkillValue(bonusContext.value, skill),
+      isCustom: true,
+      // Свой навык активные эффекты не задевают: ключа под него в системе нет
+      valueHint: buildSkillHint(
+        skill.ability,
+        skill.proficiency,
+        skill.bonuses,
+        0,
+      ),
+      influences: influencesOf(skill.ability),
+      bonusAbilities: getBonusAbilities(skill.bonuses),
+    }));
+
+    return [...ruleRows, ...customRows].sort((left, right) =>
+      left.label.localeCompare(right.label, 'ru'),
+    );
+  });
+
+  /**
+   * Группы списка: с группировкой — по характеристикам, иначе одним списком.
+   * Здесь же строки получают подсветку наведённой характеристики.
+   */
+  const skillGroups = computed(() => {
+    const highlightedAbility = props.highlightedAbility ?? null;
+
+    const groups = getSkillRowGroups(
+      skillRows.value,
+      props.actor.system.skillSettings?.groupByAbility ?? false,
+    );
+
+    return groups.map((group) => ({
+      key: group.key,
+      title: group.title,
+
+      // С группировкой характеристику называет разделитель, поэтому в строках
+      // она не повторяется — иначе под «Ловкостью» каждая строка твердила бы
+      // «ЛОВ»
+      hideAbility: group.ability !== null,
+
+      titleClass: `${SKILL_GROUP_LABEL_CLASS} ${
+        group.ability !== null && group.ability === highlightedAbility
+          ? 'text-primary'
+          : 'text-muted'
+      }`,
+
+      rows: group.rows.map((row) => {
+        // Характеристика строки, а не правило навыка: в настройке её можно
+        // подменить, и подсвечивается то, от чего навык считается на самом деле
+        const isMainAbility = row.ability === highlightedAbility;
+
+        return {
+          ...row,
+          isMainAbility,
+
+          // Свой бонус от другой характеристики тоже связывает её с навыком:
+          // строка подсвечивается, но сокращение остаётся приглушённым —
+          // навык всё-таки не её
+          isHighlighted:
+            isMainAbility
+            || (highlightedAbility !== null
+              && row.bonusAbilities.includes(highlightedAbility)),
+        };
+      }),
+    }));
+  });
 
   /**
    * Переключает уровень владения навыком по кругу:
    * none → half → proficient → expertise → none
    *
-   * @param skill - Ключ навыка
+   * @param row - строка списка навыков
    */
-  function cycleSkillProficiency(skill: SkillType) {
+  function cycleSkillProficiency(row: SkillRow) {
     if (!props.isEditMode) {
       return;
     }
 
-    const currentLevel =
-      props.actor.system.proficiencies.skills[skill] ?? 'none';
+    const nextLevel = SKILL_PROFICIENCY_NEXT[row.proficiencyLevel];
 
-    const currentIndex = LEVEL_ORDER.indexOf(currentLevel);
-    const nextLevel = LEVEL_ORDER[(currentIndex + 1) % LEVEL_ORDER.length];
+    // Владение своим навыком лежит в самой его записи: ключа под такой навык
+    // в списке владений нет
+    if (row.key === undefined) {
+      const settings = props.actor.system.skillSettings;
+
+      if (!settings) {
+        return;
+      }
+
+      emit('update:actor', {
+        system: {
+          ...props.actor.system,
+          skillSettings: {
+            ...settings,
+            custom: settings.custom.map((skill) =>
+              skill.id === row.id
+                ? { ...skill, proficiency: nextLevel }
+                : skill,
+            ),
+          },
+        },
+      });
+
+      return;
+    }
 
     const updatedSkills = { ...props.actor.system.proficiencies.skills };
 
     if (nextLevel === 'none') {
-      delete updatedSkills[skill];
+      delete updatedSkills[row.key];
     } else {
-      updatedSkills[skill] = nextLevel;
+      updatedSkills[row.key] = nextLevel;
     }
 
     emit('update:actor', {
@@ -267,42 +647,67 @@
   }
 
   /**
-   * Обработчик броска навыка
-   * @param modifier - модификатор навыка
-   * @param label - название навыка
-   * @param key - ключ навыка
+   * Поля, чей итог задан активным эффектом целиком. Окно настройки берёт
+   * отсюда навыки под перезаписью: их число задаёт эффект, а не расчёт.
    */
-  function handleSkillRoll(modifier: number, label: string, key?: SkillType) {
-    let initialRollMode: AttackRollMode = 'normal';
+  const overriddenSkillKeys = computed(
+    () => resolvedStats.value?.overriddenKeys ?? new Set<string>(),
+  );
 
-    if (key) {
-      const ability = getSkillAbility(key);
-      const flags = resolvedStats.value?.activeFlags ?? new Set();
+  const isSkillSettingsOpen = ref(false);
 
-      const hasAdvantage =
-        flags.has('abilityCheck.advantage')
-        || flags.has(`abilityCheck.advantage.${ability}`);
+  /** Открывает окно настройки навыков */
+  function openSkillSettings(): void {
+    isSkillSettingsOpen.value = true;
+  }
 
-      const hasDisadvantage =
-        flags.has('abilityCheck.disadvantage')
-        || flags.has(`abilityCheck.disadvantage.${ability}`)
-        // Помеха конкретного навыка (напр. Скрытность от брони)
-        || (key === 'stealth' && flags.has('skill.stealth.disadvantage'));
+  /**
+   * Применяет настройку навыков: владения и поправки расчёта приходят из окна
+   * вместе — их правят там одной таблицей.
+   *
+   * @param payload - настройка из окна
+   * @param payload.skills - уровни владения навыками правил
+   * @param payload.settings - поправки расчёта и свои навыки
+   */
+  function onSkillSettingsApply(payload: {
+    skills: Partial<Record<SkillType, ProficiencyLevel>>;
+    settings: DnDSkillSettings;
+  }) {
+    emit('update:actor', {
+      system: {
+        ...props.actor.system,
+        skillSettings: payload.settings,
+        proficiencies: {
+          ...props.actor.system.proficiencies,
+          skills: payload.skills,
+        },
+      },
+    });
+  }
 
-      if (hasAdvantage && !hasDisadvantage) {
-        initialRollMode = 'advantage';
-      }
-
-      if (!hasAdvantage && hasDisadvantage) {
-        initialRollMode = 'disadvantage';
-      }
-    }
+  /**
+   * Бросок проверки навыка строки. Строкой целиком, а не числами из неё:
+   * характеристика расчёта нужна для флагов преимущества, и брать её из ключа
+   * навыка нельзя — Атлетику переводят на Телосложение прямо в настройке.
+   *
+   * @param row - строка списка навыков
+   */
+  function handleSkillRoll(row: SkillRow) {
+    const initialRollMode: AttackRollMode = resolveAbilityCheckRollMode({
+      flags: resolvedStats.value?.activeFlags ?? new Set(),
+      ability: row.ability,
+      skill: row.key,
+    });
 
     openDiceRoll({
-      modifier,
-      title: `Проверка: ${label}`,
-      rollLabel: `Проверка ${label}`,
-      rollButtonText: 'Бросить проверку',
+      modifier: row.modifier,
+      evaluateBonusRollFormulas: buildRollBonusEvaluator(
+        () => props.actor,
+        getSkillCheckBonusKeys(row.key),
+      ),
+      title: `${ABILITY_CHECK_ROLL_LABELS.titlePrefix}${row.label}`,
+      rollLabel: `${ABILITY_CHECK_ROLL_LABELS.rollPrefix}${row.label}`,
+      rollButtonText: ABILITY_CHECK_ROLL_LABELS.button,
       initialRollMode,
     });
   }
@@ -311,25 +716,35 @@
 <template>
   <div
     v-bind="$attrs"
-    class="flex h-full flex-col gap-3"
+    :class="layoutClasses.panel"
   >
     <!-- Ходьба + Инициатива -->
-    <div class="grid grid-cols-2 gap-3">
+    <div :class="layoutClasses.tiles">
       <!-- Ходьба -->
-      <UTooltip
-        :delay-duration="300"
-        :ui="{ content: 'h-auto' }"
+      <FieldsetLabel
+        :label="displayMovement.label"
+        center
+        class="h-12 bg-default/20 transition-colors"
+        :class="editableTileClass"
+        @click.left.exact.prevent="isEditMode && openMovement()"
       >
-        <FieldsetLabel
-          :label="displayMovement.label"
-          center
-          class="h-12 bg-default/20 transition-colors"
-          :class="[
-            isEditMode
-              ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-              : 'border-muted',
-          ]"
-          @click.left.exact.prevent="isEditMode && openMovement()"
+        <!-- Шестерёнка ведёт в то же окно, что и клик по плитке: значок
+          называет настройку, а не прячет её за догадкой -->
+        <template
+          v-if="isEditMode"
+          #actions
+        >
+          <SheetSettingsGear
+            :label="MOVEMENT_SETTINGS_LABELS.open"
+            @open="openMovement"
+          />
+        </template>
+
+        <!-- Подсказка на содержимом, а не на всей плитке: вложенная в неё
+          подсказка шестерёнки показалась бы вместе с этой -->
+        <UTooltip
+          :delay-duration="300"
+          :ui="{ content: 'h-auto' }"
         >
           <div class="flex items-center justify-center px-2 pb-2">
             <div class="flex items-baseline gap-1">
@@ -342,40 +757,49 @@
               }}</span>
             </div>
           </div>
-        </FieldsetLabel>
 
-        <template #content>
-          <div class="flex flex-col gap-1">
-            <div
-              v-for="item in movementList"
-              :key="item.type"
-              class="flex items-center gap-2"
-            >
-              <span class="tabular-nums opacity-70"
-                >{{ item.value }}
-                {{
-                  DISTANCE_UNIT_SHORT[actor.system.movement.units ?? 'ft']
-                }}</span
+          <template #content>
+            <div class="flex flex-col gap-1">
+              <div
+                v-for="item in movementList"
+                :key="item.type"
+                class="flex items-center gap-2"
               >
+                <span class="tabular-nums opacity-70"
+                  >{{ item.value }}
+                  {{
+                    DISTANCE_UNIT_SHORT[actor.system.movement.units ?? 'ft']
+                  }}</span
+                >
 
-              <span>{{ item.label }}</span>
+                <span>{{ item.label }}</span>
+              </div>
             </div>
-          </div>
-        </template>
-      </UTooltip>
+          </template>
+        </UTooltip>
+      </FieldsetLabel>
 
       <!-- Инициатива -->
-      <UTooltip :delay-duration="300">
-        <FieldsetLabel
-          label="Инициатива"
-          center
-          class="h-12 bg-default/20 transition-colors"
-          :class="
-            props.isEditMode
-              ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-              : 'cursor-pointer border-muted hover:border-primary-500/50'
-          "
-          @click.left.exact.prevent="handleInitiativeClick"
+      <FieldsetLabel
+        :label="SHEET_TILE_LABELS.initiative"
+        center
+        class="h-12 bg-default/20 transition-colors"
+        :class="initiativeTileClass"
+        @click.left.exact.prevent="handleInitiativeClick"
+      >
+        <template
+          v-if="isEditMode"
+          #actions
+        >
+          <SheetSettingsGear
+            :label="INITIATIVE_SETTINGS_LABELS.open"
+            @open="openInitiativeSettings"
+          />
+        </template>
+
+        <UTooltip
+          :text="initiativeTooltip"
+          :delay-duration="300"
         >
           <div class="flex items-center justify-center px-2 pb-2">
             <div
@@ -385,42 +809,76 @@
               {{ formattedInitiative }}
             </div>
           </div>
-        </FieldsetLabel>
-
-        <template #content>
-          <span>{{ initiativeTooltip }}</span>
-        </template>
-      </UTooltip>
+        </UTooltip>
+      </FieldsetLabel>
     </div>
 
-    <!-- Счётчики классовых ресурсов -->
-    <ClassCounters
-      :actor="actor"
-      :counter-definitions="counterDefinitions"
-      :is-edit-mode="isEditMode"
-      @update:actor="emit('update:actor', $event)"
-    />
+    <!-- Счётчики классовых ресурсов. Обёртка несёт место блока в сетке узкого
+      листа: у самого блока корней два (рамка и окно настройки), и класс до
+      рамки не дошёл бы -->
+    <div :class="layoutClasses.counters">
+      <ClassCounters
+        :actor="actor"
+        :counter-definitions="counterDefinitions"
+        :is-edit-mode="isEditMode"
+        @update:actor="emit('update:actor', $event)"
+      />
+    </div>
 
     <!-- Навыки -->
     <FieldsetLabel
-      label="Навыки"
-      class="flex flex-col overflow-hidden border-muted"
+      :label="GRANT_SECTION_LABELS.skills"
+      class="flex flex-col overflow-hidden transition-colors"
+      :class="[blockClass, layoutClasses.skills]"
     >
+      <!-- Шестерёнка ведёт в настройку расчёта: значок в самом списке ставит
+        только владение, а характеристику навыка, свои бонусы и свои навыки
+        правят в окне. Вне правки листа её нет — настраивать там нечего -->
+      <template
+        v-if="isEditMode"
+        #actions
+      >
+        <SheetSettingsGear
+          :label="SKILL_SETTINGS_LABELS.open"
+          @open="openSkillSettings"
+        />
+      </template>
+
       <div class="custom-scrollbar flex-1 overflow-y-auto p-1.5">
         <div class="flex flex-col">
-          <SkillItem
-            v-for="skill in skills"
-            :key="skill.key"
-            :label="skill.label"
-            :skill-key="skill.key"
-            :proficiency-level="
-              actor.system.proficiencies.skills[skill.key] ?? 'none'
-            "
-            :modifier="resolvedStats?.skills[skill.key] ?? 0"
-            :is-edit-mode="isEditMode"
-            @cycle-proficiency="cycleSkillProficiency(skill.key)"
-            @roll="handleSkillRoll"
-          />
+          <template
+            v-for="group in skillGroups"
+            :key="group.key"
+          >
+            <!-- Разделитель группы: подпись слева, линия до края строки. Без
+              группировки группа одна и подписи у неё нет -->
+            <USeparator
+              v-if="group.title"
+              :label="group.title"
+              position="start"
+              class="px-2 pt-2 first:pt-0"
+              :ui="{ label: group.titleClass }"
+            />
+
+            <SkillItem
+              v-for="row in group.rows"
+              :key="row.id"
+              :label="row.label"
+              :skill-key="row.key"
+              :ability="row.ability"
+              :proficiency-level="row.proficiencyLevel"
+              :modifier="row.modifier"
+              :is-custom="row.isCustom"
+              :value-hint="row.valueHint"
+              :influences="row.influences"
+              :hide-ability="group.hideAbility"
+              :is-highlighted="row.isHighlighted"
+              :is-ability-highlighted="row.isMainAbility"
+              :is-edit-mode="isEditMode"
+              @cycle-proficiency="cycleSkillProficiency(row)"
+              @roll="handleSkillRoll(row)"
+            />
+          </template>
         </div>
       </div>
     </FieldsetLabel>
@@ -432,15 +890,20 @@
     :modifier="diceRollConfig.modifier"
     :title="diceRollConfig.title"
     :roll-label="diceRollConfig.rollLabel"
+    :actor-name="actor.name"
     :roll-button-text="diceRollConfig.rollButtonText"
     :initial-roll-mode="diceRollConfig.initialRollMode"
+    :evaluate-bonus-roll-formulas="diceRollConfig.evaluateBonusRollFormulas"
   />
 
   <!-- Модалка движения -->
   <MovementModal
     v-model:open="isMovementOpen"
     :movement="actor.system.movement"
+    :bonuses="actor.system.movementBonuses"
+    :context="bonusContext"
     :active-effects="combinedEffects"
+    :resolved-movement="resolvedMovement"
     @apply="onMovementApply"
   />
 
@@ -457,22 +920,22 @@
       wisdom: actor.system.abilities.wisdom,
       charisma: actor.system.abilities.charisma,
     }"
+    :bonuses="actor.system.initiativeBonuses"
+    :context="bonusContext"
     @apply="onInitiativeApply"
+  />
+
+  <!-- Модалка настройки навыков -->
+  <SkillSettingsModal
+    v-model:open="isSkillSettingsOpen"
+    :proficiencies="actor.system.proficiencies.skills"
+    :settings="actor.system.skillSettings"
+    :ability-mods="sheetAbilityMods"
+    :proficiency-bonus="sheetProficiencyBonus"
+    :skills="resolvedStats?.skills ?? {}"
+    :overridden-keys="overriddenSkillKeys"
+    @apply="onSkillSettingsApply"
   />
 </template>
 
-<style scoped>
-  .custom-scrollbar::-webkit-scrollbar {
-    width: 4px;
-  }
-  .custom-scrollbar::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .custom-scrollbar::-webkit-scrollbar-thumb {
-    background-color: rgb(75 85 99 / 0.5);
-    border-radius: 20px;
-  }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background-color: rgb(107 114 128 / 0.6);
-  }
-</style>
+<!-- Полоса прокрутки описана один раз в system.css: здесь ширина по умолчанию -->

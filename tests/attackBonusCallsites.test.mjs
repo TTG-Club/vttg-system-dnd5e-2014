@@ -1,0 +1,1279 @@
+import assert from 'node:assert/strict';
+
+import { it } from 'vitest';
+
+import { loadEngineBundle } from './helpers/engineBundle.mjs';
+import { loadHandler } from './helpers/sourceHandler.mjs';
+
+const engine = await loadEngineBundle(
+  "export * from './src/engine/attackUtils.ts'; export * from './src/engine/attackChatBlocks.ts'; export * from './src/engine/effectPipeline.ts'; export * from './src/engine/consts.ts'; export * from './src/engine/formulaParser.ts'; export * from './src/engine/resolvedFormulaContext.ts'; export * from './src/engine/spellCastPlan.ts'; export * from './src/engine/hitPoints.ts'; export { isSaveAbility } from './src/engine/spellUtils.ts'; export { creatureActionHasSave, resolveCreatureActionAttackBonus } from './src/engine/creatureUtils.ts';",
+);
+
+const macroPath = 'src/client/macros/dnd5eMacros.ts';
+
+const creatureSpellPath = 'src/client/composables/creatureSpellCast.ts';
+
+const creatureActionPath = 'src/client/composables/creatureActionRoll.ts';
+
+/** Настоящая сборка наборов урона действия: без вариантов «или» набор один */
+const buildCreatureRollVariants = await loadHandler(
+  'src/client/composables/creatureDamageChoice.ts',
+  'buildCreatureRollVariants',
+  {
+    requestDamageTypeChoice: () => undefined,
+    applySourceDamageTypeChoices: (source) => source,
+    getDamagePartsPrimaryType: () => undefined,
+    announceCreatureDamageVariant: () => {},
+  },
+);
+
+const resolverPath = 'src/client/composables/useSpellResolution.ts';
+const normalContext = { hasAdvantage: false, hasDisadvantage: false };
+
+/** Окраска карточки броска атаки: ею выделяется и промах */
+const ATTACK_CARD_OPTIONS = { tone: 'damage' };
+
+/** Изолирует вычисление формул: тестируется выбор ключа и актуального носителя обработчиком. */
+function buildRollBonusEvaluator(getEntity, key) {
+  return () => getEntity()?.bonuses?.[key] ?? [];
+}
+
+/** Различающиеся бонусы выявляют смешивание spell с melee/ranged. */
+function createEntity() {
+  return {
+    id: 'caster',
+    entityType: 'actor',
+    system: {},
+    bonuses: {
+      'attack.melee': ['1d4'],
+      'attack.ranged': ['1d6'],
+      'attack.spell': ['1d8'],
+      'save.wisdom': ['1d10'],
+    },
+  };
+}
+
+/** Незатронутые части урона служат границей проверяемого обработчика. */
+function createRollSetup() {
+  return {
+    baseParts: [{ formula: '1d6', target: 'selected', isHealing: false }],
+    pseudoSpell: {},
+  };
+}
+
+/** Порты подготовки броска без настоящего окна и записи урона. */
+function createPorts(current) {
+  const rollConfig = { value: null };
+
+  const ports = {
+    buildRollBonusEvaluator,
+    buildCreatureRollVariants,
+    props: { entity: current.value, actor: current.value, isEditMode: false },
+    // Запретов трат хода у существа нет, трата хода не пишется
+    blockOf: () => null,
+    spendSectionTurn: () => {},
+    isCreatureAttackAction: () => true,
+    // Удар оружием персонажа тоже не под запретом: идёт действием «Атака»;
+    // трата хода не пишется
+    runWithWeaponAttackCost: (_entity, _weaponName, _refuse, proceed) =>
+      proceed('action'),
+    refuseBlockedMacro: (reason) => reason !== null,
+    refuseWeaponAttack: () => {},
+    recordEntityActionSpend: () => {},
+    warnOpportunityAttack: () => {},
+    isEntityOwnTurn: () => true,
+    toast: { add: () => {} },
+    rollConfig,
+    isRollModalOpen: { value: false },
+    getCreatureEntity: () => current.value,
+    useWorldEntities: () => ({ findCurrentDndEntity: () => current.value }),
+    listAmbientEffects: () => [],
+    collectEffectsWithAuras: () => [],
+    isSaveAbility: engine.isSaveAbility,
+    getAttackFlagCategory: engine.getAttackFlagCategory,
+    resolveWeaponSaveDc: engine.resolveWeaponSaveDc,
+    collectActiveEffects: () => [],
+    resolveActorStats: () => ({ activeFlags: new Set() }),
+    resolvedStats: { value: { activeFlags: new Set() } },
+    combinedEffects: { value: [] },
+    targetStore: { getTargetActor: () => null },
+    useTargetStore: () => ({
+      getTargetFlags: () => new Set(),
+      getTargetActor: () => null,
+    }),
+    useModalManager: () => ({
+      openModal: (_name, props) => {
+        rollConfig.value = props;
+      },
+    }),
+    useBonusDamageParts: () => ({
+      buildCreatureRollSetup: createRollSetup,
+      buildCreatureSpellRollSetup: createRollSetup,
+      buildWeaponRollSetup: createRollSetup,
+      buildTargetHpContext: () => undefined,
+      buildTargetTypeContext: () => undefined,
+    }),
+    buildWeaponRollSetup: createRollSetup,
+    buildCreatureRollSetup: createRollSetup,
+    buildCreatureSpellRollSetup: createRollSetup,
+    buildTargetHpContext: () => undefined,
+    getAttackBonusKey: engine.getAttackBonusKey,
+    getDamageBonusKey: engine.getDamageBonusKey,
+    calculateWeaponAttackModifier: () => 5,
+    getWeaponPrimaryDamageType: () => undefined,
+    // Порог крита по цели — тот же, что у листа
+    resolveTargetedCritThreshold: (_attacker, threshold) => threshold,
+    resolveTargetedAttackRoll: () => ({
+      mode: 'normal',
+      reasons: { advantage: [], disadvantage: [] },
+    }),
+    prepareAmmunitionShot: (_entity, weapon) => ({ weapon }),
+    spendShotAmmunition: () => {},
+    isDndSceneEntity: () => true,
+    creatureActionHasSave: engine.creatureActionHasSave,
+    resolveCreatureActionAttackBonus: engine.resolveCreatureActionAttackBonus,
+    getDamagePartsPrimaryType: () => undefined,
+    getSpellAttackType: (spell) => spell.deliveryType,
+    // Общий разбор заклинания существа: существо из мира, вид каста — план
+    readCreature: () => current.value,
+    resolveSpellCastPlan: engine.resolveSpellCastPlan,
+    isTargetAtFullHp: () => undefined,
+    resolveEntityCreatureType: () => undefined,
+    calculateCreatureSpellBlockNumbers: () => ({ attackBonus: 5, saveDC: 13 }),
+    getCreatureSpellBlockAbility: () => 'wisdom',
+    getCreatureSpellMod: () => 2,
+    getCreatureSpellRollButtonText: () => 'roll',
+    generateId: (prefix) => `${prefix}_test`,
+    SPELL_CAST_KEY_PREFIX: 'cast',
+    SPELL_ATTACK_KEY: 'attack.spell',
+    PAGE_UNLOAD_EVENT: 'beforeunload',
+    resolveCreatureSpellSaveDC: (_spell, blockSaveDC) => blockSaveDC,
+    completeSpellCast: () => {},
+    beginSpellCast: () => {},
+    spellIsHealing: () => false,
+    CREATURE_ACTIONS_BLOCK_LABELS: { attackRollPrefix: 'Attack ' },
+    ACTOR_SPELLS_TAB_LABELS: { attackRoll: 'Roll attack' },
+    ACTOR_EQUIPMENT_TAB_LABELS: { attackRollPrefix: 'Attack ' },
+    CREATURE_ACTION_MENU_LABELS: { attack: 'attack' },
+    SPELL_DAMAGE_ROLL_BUTTON: 'roll',
+  };
+
+  return ports;
+}
+
+/** Удар оружием: вкладка снаряжения и горячая панель — один путь */
+const weaponAttackPath = 'src/client/composables/weaponAttackRoll.ts';
+
+/**
+ * Вход удара для теста: атакующий — сущность мира.
+ *
+ * @param {{ value: object }} current - сущность мира
+ * @param {object} overrides - подмены порта
+ * @returns {object} порт удара
+ */
+function createWeaponPort(current, overrides = {}) {
+  return {
+    readAttacker: () => current.value,
+    spendAmmunition: () => {},
+    refuse: () => {},
+    ...overrides,
+  };
+}
+
+/**
+ * Настоящий общий удар оружием на портах теста.
+ *
+ * @param {object} ports - окружение
+ * @param {object} port - вход удара
+ * @returns {Promise<Function>} удар оружием
+ */
+async function loadWeaponAttack(ports, port) {
+  ports.openWeaponAttackRoll = await loadHandler(
+    weaponAttackPath,
+    'openWeaponAttackRoll',
+    ports,
+  );
+
+  const start = await loadHandler(weaponAttackPath, 'startWeaponAttack', ports);
+
+  return (weapon) => start(weapon, port);
+}
+
+for (const rangeType of ['melee', 'ranged']) {
+  it(`actual weapon attack forwards only ${rangeType} attack dice and keeps the source reactive`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+    const handler = await loadWeaponAttack(ports, createWeaponPort(current));
+
+    const weapon = {
+      name: 'Weapon',
+      rangeType,
+      damageParts: [{ formula: '1d6' }],
+    };
+
+    handler(weapon);
+
+    assert.deepEqual(
+      ports.rollConfig.value.evaluateBonusRollFormulas(normalContext),
+      current.value.bonuses[`attack.${rangeType}`],
+    );
+
+    current.value = { ...current.value, bonuses: {} };
+
+    assert.deepEqual(
+      ports.rollConfig.value.evaluateBonusRollFormulas(normalContext),
+      [],
+    );
+
+    handler({ ...weapon, saveType: 'dexterity' });
+    assert.equal(ports.rollConfig.value.evaluateBonusRollFormulas, undefined);
+  });
+}
+
+for (const kind of ['melee', 'ranged']) {
+  it(`actual weapon attack rolls a thrown weapon as the chosen ${kind} attack`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+    const asked = [];
+
+    // Вопрос «Удар / Бросок» отвечен: дальше бросок идёт выбранным видом
+    ports.runWeaponAttackChoices = (weapon, attackerId, proceed) => {
+      asked.push(attackerId);
+      proceed({ ...weapon, rangeType: kind });
+    };
+
+    const handler = await loadWeaponAttack(ports, createWeaponPort(current));
+
+    handler({
+      name: 'Javelin',
+      rangeType: 'melee',
+      weaponProperties: ['thrown'],
+      range: { normal: 30, long: 120 },
+      damageParts: [{ formula: '1d6' }],
+    });
+
+    assert.deepEqual(asked, ['caster'], 'вопрос задан от владельца оружия');
+
+    assert.deepEqual(
+      ports.rollConfig.value.evaluateBonusRollFormulas(normalContext),
+      current.value.bonuses[`attack.${kind}`],
+    );
+
+    assert.equal(ports.rollConfig.value.incomingAttackType, kind);
+  });
+}
+
+it('actual weapon attack shoots the ammunition and spends it when the roll goes', async () => {
+  const current = { value: createEntity() };
+  const ports = createPorts(current);
+  const committed = [];
+
+  const weapon = {
+    name: 'Longbow',
+    rangeType: 'ranged',
+    damageParts: [{ formula: '1d8' }],
+  };
+
+  let shot = {
+    weapon: { ...weapon, magicBonus: 1 },
+    ammunition: { id: 'arrows' },
+  };
+
+  ports.prepareAmmunitionShot = () => shot;
+
+  ports.buildWeaponRollSetup = (options) => ({
+    ...createRollSetup(),
+    pseudoSpell: { magicBonus: options.weapon.magicBonus },
+  });
+
+  // Вход тратит боеприпас своей записью: лист — сохранением листа, панель —
+  // записью листа сущности мира
+  const handler = await loadWeaponAttack(
+    ports,
+    createWeaponPort(current, {
+      spendAmmunition: (id) => committed.push(['quiver', `spent:${id}`]),
+    }),
+  );
+
+  handler(weapon);
+
+  assert.deepEqual(committed, [], 'открытие окна боеприпас не тратит');
+  assert.equal(ports.rollConfig.value.beforeRoll(), true);
+  assert.deepEqual(committed, [['quiver', 'spent:arrows']]);
+
+  shot = { weapon };
+  handler(weapon);
+
+  // Бросок пошёл — трата хода пишется всегда, а боеприпаса без учёта нет
+  assert.equal(ports.rollConfig.value.beforeRoll(), true);
+
+  assert.deepEqual(
+    committed,
+    [['quiver', 'spent:arrows']],
+    'учёта нет — тратить нечего',
+  );
+
+  shot = null;
+  ports.rollConfig.value = 'untouched';
+  handler(weapon);
+
+  assert.equal(
+    ports.rollConfig.value,
+    'untouched',
+    'без стрел окно не открывается',
+  );
+});
+
+// Лист существа и горячая панель совершают действие одним путём
+for (const entry of [[creatureActionPath, 'openCreatureActionRoll', false]]) {
+  it(`actual ${entry[1]} uses current creature effects and disables attack dice for saving-throw actions`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+    const handler = await loadHandler(entry[0], entry[1], ports);
+    const creature = current.value;
+
+    for (const rangeType of ['melee', 'ranged']) {
+      const action = {
+        name: 'Action',
+        attackBonus: 5,
+        rangeType,
+        damageParts: [{ formula: '1d6' }],
+      };
+
+      handler(
+        ...(entry[2]
+          ? [creature, action, false, undefined]
+          : [action, creature, false, undefined]),
+      );
+
+      assert.deepEqual(
+        ports.rollConfig.value.evaluateBonusRollFormulas(normalContext),
+        creature.bonuses[`attack.${rangeType}`],
+      );
+
+      current.value = undefined;
+
+      assert.deepEqual(
+        ports.rollConfig.value.evaluateBonusRollFormulas(normalContext),
+        [],
+      );
+
+      current.value = creature;
+
+      const saveAction = { ...action, saveType: 'dexterity' };
+
+      handler(
+        ...(entry[2]
+          ? [creature, saveAction, false, undefined]
+          : [saveAction, creature, false, undefined]),
+      );
+
+      assert.equal(ports.rollConfig.value.evaluateBonusRollFormulas, undefined);
+    }
+  });
+
+  it(`actual ${entry[1]} rolls to hit with +0 when the attack bonus is missing, and not at all on auto-hit`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+    const handler = await loadHandler(entry[0], entry[1], ports);
+    const creature = current.value;
+
+    // Призванное существо: бонус «равен модификатору заклинателя» в данные
+    // не попал — бросок попадания всё равно идёт, с +0
+    const rend = {
+      name: 'Rend',
+      rangeType: 'melee',
+      damageParts: [{ formula: '1d8+3' }],
+    };
+
+    handler(rend, creature, false, undefined);
+
+    assert.equal(ports.rollConfig.value.attackModifier, 0);
+
+    handler({ ...rend, autoHit: true }, creature, false, undefined);
+
+    assert.equal(ports.rollConfig.value.attackModifier, undefined);
+  });
+}
+
+// Лист существа и горячая панель кастуют одним разбором существа
+for (const entry of [[creatureSpellPath, 'openCreatureSpellRoll', false]]) {
+  it(`actual ${entry[1]} applies only attack.spell and follows effect changes`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+    const handler = await loadHandler(entry[0], entry[1], ports);
+    const creature = current.value;
+
+    const spell = {
+      name: 'Spell',
+      deliveryType: 'ranged',
+      damageParts: [{ formula: '1d6' }],
+    };
+
+    handler(
+      ...(entry[2]
+        ? [creature, spell, undefined, undefined]
+        : [spell, creature, undefined, undefined]),
+    );
+
+    assert.deepEqual(
+      ports.rollConfig.value.evaluateBonusRollFormulas(normalContext),
+      ['1d8'],
+    );
+
+    current.value = { ...creature, bonuses: {} };
+
+    assert.deepEqual(
+      ports.rollConfig.value.evaluateBonusRollFormulas(normalContext),
+      [],
+    );
+
+    const saveSpell = { ...spell, saveType: 'wisdom' };
+
+    handler(
+      ...(entry[2]
+        ? [creature, saveSpell, undefined, undefined]
+        : [saveSpell, creature, undefined, undefined]),
+    );
+
+    assert.equal(ports.rollConfig.value.evaluateBonusRollFormulas, undefined);
+  });
+}
+
+/** Режим, который отдаёт общий хелпер: по виду атаки */
+const ROLL_MODE_BY_CATEGORY = {
+  melee: 'advantage',
+  ranged: 'disadvantage',
+  spell: 'advantage',
+};
+
+for (const entry of [
+  [
+    weaponAttackPath,
+    'openWeaponAttackRoll',
+    (weapon, attacker) => [
+      weapon,
+      attacker,
+      { attackerId: attacker.id, readAttacker: () => attacker },
+      { isDisadvantage: false, beforeRoll: () => true },
+    ],
+  ],
+  [
+    creatureActionPath,
+    'openCreatureActionRoll',
+    (action, creature) => [action, creature, false, undefined],
+  ],
+]) {
+  it(`actual ${entry[1]} takes the roll mode of the shared attack helper`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+    const categories = [];
+
+    ports.resolveTargetedAttackRoll = (_attacker, category) => {
+      categories.push(category);
+
+      return {
+        mode: ROLL_MODE_BY_CATEGORY[category],
+        reasons: { advantage: [], disadvantage: [category] },
+      };
+    };
+
+    const handler = await loadHandler(entry[0], entry[1], ports);
+
+    for (const rangeType of ['melee', 'ranged']) {
+      const source = {
+        name: 'Source',
+        attackBonus: 5,
+        rangeType,
+        damageParts: [{ formula: '1d6' }],
+      };
+
+      handler(...entry[2](source, current.value));
+
+      assert.equal(
+        ports.rollConfig.value.initialRollMode,
+        ROLL_MODE_BY_CATEGORY[rangeType],
+      );
+
+      assert.deepEqual(ports.rollConfig.value.rollModeReasons.disadvantage, [
+        rangeType,
+      ]);
+    }
+
+    assert.deepEqual(categories, ['melee', 'ranged']);
+  });
+}
+
+// Лист существа и горячая панель кастуют одним разбором существа
+for (const entry of [[creatureSpellPath, 'openCreatureSpellRoll', false]]) {
+  it(`actual ${entry[1]} takes the spell roll mode of the shared attack helper`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+
+    ports.resolveTargetedAttackRoll = (_attacker, category) => ({
+      mode: ROLL_MODE_BY_CATEGORY[category],
+      reasons: { advantage: [], disadvantage: [] },
+    });
+
+    const handler = await loadHandler(entry[0], entry[1], ports);
+
+    const spell = {
+      name: 'Spell',
+      deliveryType: 'ranged',
+      damageParts: [{ formula: '1d6' }],
+    };
+
+    handler(
+      ...(entry[2]
+        ? [current.value, spell, undefined, undefined]
+        : [spell, current.value, undefined, undefined]),
+    );
+
+    assert.equal(
+      ports.rollConfig.value.initialRollMode,
+      ROLL_MODE_BY_CATEGORY.spell,
+    );
+  });
+}
+
+for (const relativePath of [
+  'src/client/ui/actor/ActorLeftPanel.vue',
+  'src/client/ui/creature/CreatureSheet.vue',
+]) {
+  it(`actual manual save in ${relativePath} uses save ability and current effects`, async () => {
+    const current = { value: createEntity() };
+    const ports = createPorts(current);
+
+    let config;
+
+    Object.assign(ports, {
+      localCreature: current,
+      isEditMode: { value: false },
+      openDiceRoll: (next) => {
+        config = next;
+      },
+      calculateSavingThrow: () => 3,
+      resolveSavingThrowRollMode: () => 'normal',
+      SAVING_THROW_ROLL_LABELS: {
+        titlePrefix: 'Save ',
+        rollPrefix: 'Save ',
+        button: 'roll',
+      },
+    });
+
+    const handler = await loadHandler(
+      relativePath,
+      'handleSavingThrowClick',
+      ports,
+    );
+
+    handler({ key: 'wisdom', label: 'Wisdom' });
+    assert.deepEqual(config.evaluateBonusRollFormulas(normalContext), ['1d10']);
+    current.value = { ...current.value, bonuses: {} };
+    ports.props.actor = current.value;
+    assert.deepEqual(config.evaluateBonusRollFormulas(normalContext), []);
+  });
+}
+
+it('macro source lookup reads a replaced entity and returns no stale source after removal', async () => {
+  let current = createEntity();
+
+  const lookup = await loadHandler(
+    'src/client/composables/useWorldEntities.ts',
+    'findCurrentDndEntity',
+    {
+      findCurrentWorldEntity: (entityId) =>
+        current?.id === entityId ? current : undefined,
+      isDndSceneEntity: (entity) => entity.entityType === 'actor',
+    },
+  );
+
+  const original = current;
+
+  assert.equal(lookup('caster'), original);
+  current = { ...original, bonuses: {} };
+  assert.equal(lookup('caster'), current);
+  current = undefined;
+  assert.equal(lookup('caster'), undefined);
+});
+
+it('actual projectile callback of the shared cast flow preserves the captured bonus formulas', async () => {
+  let forwarded;
+  let finishedCasts = 0;
+
+  const entity = createEntity();
+
+  // Лист и горячая панель зовут один обработчик общего разбора каста
+  const handler = await loadHandler(
+    'src/client/composables/spellCastFlow.ts',
+    'settleSpellProjectileAttack',
+    {
+      markSpellCastApplied: (session) => {
+        session.state.applied = true;
+      },
+      withFlatDamageBonusPart: (parts) => parts,
+      spellIsHealing: () => false,
+      useChatStore: () => ({ getSocket: () => ({}) }),
+      useWorldEntities: () => ({ getCurrentWorldEntities: () => [entity] }),
+      useWorldStore: () => ({ currentScene: { tokens: [] } }),
+      targetEffectsSourceOf: () => ({ casterId: entity.id, spellSaveDC: 13 }),
+      useSpellResolution: () => ({
+        resolveSpellDamage: (_context, options) => {
+          forwarded = options.projectileAttack;
+        },
+      }),
+      finishSpellCast: () => {
+        finishedCasts += 1;
+
+        return Promise.resolve();
+      },
+      // Разбор целей ждёт доведения каста; здесь — сразу
+      afterSpellCast: (_completion, proceed) => proceed(),
+    },
+  );
+
+  const session = {
+    port: { casterId: entity.id },
+    plan: { attackType: 'ranged' },
+    resolvedDamageFormula: '1d6',
+    flatSpellDamageBonus: 0,
+    evaluateSpellBonusParts: undefined,
+    state: { spell: { name: 'Ray' }, attackLanded: false, applied: false },
+  };
+
+  const formulas = new Map([['target', Object.freeze(['1d4'])]]);
+
+  handler(session, {
+    attackModifier: 5,
+    rollMode: 'advantage',
+    bonusDiceFormulasByTarget: formulas,
+  });
+
+  assert.equal(forwarded.bonusDiceFormulasByTarget, formulas);
+  assert.equal(forwarded.rollMode, 'advantage');
+
+  // Серия снарядов доводит каст: конец прежней концентрации и эффекты на
+  // заклинателе раньше оставались без неё
+  assert.equal(finishedCasts, 1);
+  assert.equal(session.state.applied, true);
+});
+
+it('actual projectile series rolls attack bonus per beam and preserves natural critical rules under advantage', async () => {
+  const first = { id: 'first', name: 'First', armorClass: 17 };
+  const second = { id: 'second', name: 'Second', armorClass: 8 };
+
+  const projectileStore = {
+    isActive: true,
+    assignedTargets: new Map([
+      ['one', 2],
+      ['two', 1],
+    ]),
+    assignedProjectilesCount: 3,
+    stopTargeting() {
+      this.isActive = false;
+    },
+  };
+
+  const attacks = [
+    { values: [2, 20], dropped: [0], bonus: 1 },
+    { values: [16, 3], dropped: [1], bonus: 4 },
+    { values: [1, 1], dropped: [1], bonus: 4 },
+  ];
+
+  const rolledFormulas = [];
+  const chatRolls = [];
+  const chatOptions = [];
+  const applied = [];
+
+  const diceStore = {
+    parseAndRoll(formula) {
+      rolledFormulas.push(formula);
+
+      if (formula.includes('20')) {
+        const sample = attacks.shift();
+
+        const kept = sample.values.find(
+          (_value, index) => !sample.dropped.includes(index),
+        );
+
+        return {
+          formula,
+          total: kept + 5 + sample.bonus,
+          details: '',
+          dice: [
+            { sides: 20, values: sample.values, dropped: sample.dropped },
+            { sides: 4, values: [sample.bonus], dropped: [] },
+          ],
+        };
+      }
+
+      return {
+        formula,
+        total: formula.startsWith('2') ? 9 : 5,
+        dice: [],
+        details: '',
+      };
+    },
+    animateRoll() {},
+  };
+
+  const handler = await loadHandler(
+    resolverPath,
+    'resolveProjectileAttackSeries',
+    {
+      ...engine,
+      useProjectileStore: () => projectileStore,
+      useDiceRollerStore: () => diceStore,
+      isDndSceneEntity: () => true,
+      resolveActorStats: (entity) => ({
+        armorClass: entity.armorClass,
+        activeFlags: new Set(),
+      }),
+      evaluateDefensiveACBonus: () => 0,
+      collectActiveEffects: () => [],
+      buildCombatChatOptions: () => ATTACK_CARD_OPTIONS,
+      SPELL_SUMMARY_LABELS: { projectile: 'Снаряд' },
+      chatStore: {
+        sendMessage: (_formula, _kind, roll, _cardData, options) => {
+          chatRolls.push(roll);
+          chatOptions.push(options);
+        },
+      },
+      resolveEntityCurrentHp: () => 100,
+      processTarget: (entity, context) => {
+        applied.push({ entityId: entity.id, damage: context.damageTotal });
+
+        return { actorName: entity.name, damageApplied: context.damageTotal };
+      },
+      sendAoeSummary() {},
+      SPELL_NO_TARGETS_LABELS: { noTarget: 'none' },
+    },
+  );
+
+  handler(
+    { spell: { name: 'Rays' }, actors: [first, second] },
+    {
+      attack: {
+        attackModifier: 5,
+        rollMode: 'advantage',
+        attackType: 'ranged',
+        bonusDiceFormulasByTarget: new Map([
+          ['one', ['1d4']],
+          ['two', ['1d4']],
+        ]),
+      },
+      resolvedDamageFormula: '1d6',
+      scene: {
+        tokens: [
+          { id: 'one', actorId: 'first' },
+          { id: 'two', actorId: 'second' },
+        ],
+      },
+    },
+  );
+
+  assert.equal(
+    rolledFormulas.filter((formula) => formula.includes('1d4')).length,
+    3,
+  );
+
+  assert.deepEqual(
+    rolledFormulas.filter((formula) => !formula.includes('20')),
+    ['2d6', '1d6'],
+  );
+
+  assert.deepEqual(applied, [{ entityId: 'first', damage: 14 }]);
+  assert.equal(chatRolls.length, 3);
+
+  // Каждый бросок атаки выделен — и промах, и попадание
+  assert.deepEqual(chatOptions, [
+    ATTACK_CARD_OPTIONS,
+    ATTACK_CARD_OPTIONS,
+    ATTACK_CARD_OPTIONS,
+  ]);
+
+  assert.equal(projectileStore.isActive, false);
+});
+
+it('registered weapon macro selects melee/ranged dice from the fresh actor and omits them for save-based weapons', async () => {
+  const current = { value: createEntity() };
+  const ports = createPorts(current);
+
+  let weapon;
+
+  Object.assign(ports, {
+    useChatStore: () => ({ getSocket: () => ({}) }),
+    useTargetStore: () => ports.targetStore,
+    useAuraStore: () => ({ getAmbientEffectsForActor: () => [] }),
+    isDnDActorEntity: () => true,
+    findWeapon: () => ({ actor: current.value, weapon }),
+    isDnDEffect: () => true,
+    combineEffectsWithAmbient: () => [],
+    isTargetAtFullHp: () => undefined,
+    console: { warn: assert.fail, error: assert.fail },
+  });
+
+  // Макрос зовёт общий удар — он тот же, что у вкладки снаряжения
+  ports.spendShotAmmunition = () => {};
+
+  await loadWeaponAttack(ports, undefined);
+
+  ports.startWeaponAttack = await loadHandler(
+    weaponAttackPath,
+    'startWeaponAttack',
+    ports,
+  );
+
+  // Порт удара — та же фабрика мира, что у вкладки снаряжения
+  ports.createWeaponAttackPort = await loadHandler(
+    weaponAttackPath,
+    'createWeaponAttackPort',
+    ports,
+  );
+
+  const handler = await loadHandler(
+    macroPath,
+    'DND_MACRO_TYPES.weaponAttack',
+    ports,
+    true,
+  );
+
+  for (const rangeType of ['melee', 'ranged']) {
+    weapon = { name: 'Weapon', rangeType, damageParts: [{ formula: '1d6' }] };
+
+    handler(
+      { ref: 'weapon' },
+      { actor: current.value, actors: [current.value] },
+    );
+
+    const evaluate = ports.rollConfig.value.evaluateBonusRollFormulas;
+
+    assert.deepEqual(
+      evaluate(normalContext),
+      current.value.bonuses[`attack.${rangeType}`],
+    );
+
+    const prior = current.value;
+
+    current.value = { ...prior, bonuses: {} };
+    assert.deepEqual(evaluate(normalContext), []);
+    current.value = prior;
+    weapon = { ...weapon, saveType: 'dexterity' };
+
+    handler(
+      { ref: 'weapon' },
+      { actor: current.value, actors: [current.value] },
+    );
+
+    assert.equal(ports.rollConfig.value.evaluateBonusRollFormulas, undefined);
+  }
+});
+
+it('projectile attack bonuses follow each assigned target instead of the unrelated selected token', async () => {
+  const caster = structuredClone(engine.DEFAULT_ACTOR);
+
+  const effects = {
+    value: [
+      {
+        id: 'injured-bonus',
+        name: 'Injured bonus',
+        disabled: false,
+        changes: [
+          {
+            key: 'attack.spell',
+            mode: 'add',
+            value: '1d4',
+            priority: 20,
+            condition: 'target.hp.value < target.hp.max',
+          },
+        ],
+        flags: [],
+      },
+    ],
+  };
+
+  const first = {
+    ...structuredClone(engine.DEFAULT_ACTOR),
+    id: 'first',
+    name: 'Injured',
+    armorClass: 10,
+  };
+
+  const second = {
+    ...structuredClone(engine.DEFAULT_ACTOR),
+    id: 'second',
+    name: 'Full',
+    armorClass: 10,
+  };
+
+  first.system.hitPoints = { ...first.system.hitPoints, current: 5, max: 10 };
+
+  second.system.hitPoints = {
+    ...second.system.hitPoints,
+    current: 10,
+    max: 10,
+  };
+
+  const selected = { ...structuredClone(second), id: 'unrelated' };
+
+  const scene = {
+    tokens: [
+      { id: 'one', actorId: 'first' },
+      { id: 'two', actorId: 'second' },
+    ],
+  };
+
+  const worldState = { scene, entities: [first, second, selected] };
+
+  const projectileStore = {
+    isActive: true,
+    assignedTargets: new Map([
+      ['one', 1],
+      ['two', 1],
+    ]),
+    assignedProjectilesCount: 2,
+    stopTargeting() {
+      this.isActive = false;
+    },
+  };
+
+  const buildTargetHpContext = await loadHandler(
+    'src/client/composables/useBonusDamageParts.ts',
+    'buildTargetHpContext',
+    {
+      ...engine,
+      targetStore: { getTargetActor: () => selected },
+      findAlliesAdjacentToTarget: () => [],
+      isDndSceneEntity: () => true,
+      isActorEntity: (entity) => entity.entityType === 'actor',
+      isCreatureEntity: (entity) => entity.entityType === 'creature',
+      resolveEntityCreatureType: () => 'humanoid',
+      resolveEntityExtraCreatureTypes: () => [],
+    },
+  );
+
+  const evaluatorPorts = {
+    ...engine,
+    computed: (getter) => ({
+      get value() {
+        return getter();
+      },
+    }),
+    useResolvedStats: () => ({ combinedEffects: effects }),
+    // Контекст формул клиента — итоговые числа листа с аурами карты
+    buildEntityFormulaContext: (entity) =>
+      engine.buildResolvedFormulaContext(entity),
+    useBonusDamageParts: () => ({ buildTargetHpContext }),
+    getAttackFlagCategoryOfKeys: () => undefined,
+    withAdjacentAllies: (target) => target,
+    useProjectileStore: () => projectileStore,
+    useWorldStore: () => ({ currentScene: worldState.scene }),
+    useWorldEntities: () => ({
+      getCurrentWorldEntities: () => worldState.entities,
+    }),
+    isDndSceneEntity: () => true,
+  };
+
+  const buildEvaluator = await loadHandler(
+    'src/client/composables/rollBonusEvaluator.ts',
+    'buildRollBonusEvaluator',
+    evaluatorPorts,
+  );
+
+  const evaluateBonuses = buildEvaluator(() => caster, 'attack.spell');
+
+  const collectBonuses = await loadHandler(
+    'src/client/composables/rollBonusEvaluator.ts',
+    'collectProjectileRollBonuses',
+    evaluatorPorts,
+  );
+
+  assert.deepEqual([...evaluateBonuses(normalContext)], []);
+
+  const bonusesByTarget = collectBonuses(normalContext, evaluateBonuses);
+
+  selected.system.hitPoints.current = 1;
+  assert.deepEqual([...evaluateBonuses(normalContext)], ['1d4']);
+
+  assert.deepEqual(
+    [...evaluateBonuses({ ...normalContext, target: undefined })],
+    [],
+  );
+
+  assert.deepEqual(
+    [...collectBonuses(normalContext, evaluateBonuses).get('two')],
+    [],
+  );
+
+  const recovered = structuredClone(first);
+
+  recovered.system.hitPoints.current = 10;
+  worldState.entities = [recovered, second];
+
+  assert.deepEqual(
+    [...collectBonuses(normalContext, evaluateBonuses).get('one')],
+    [],
+  );
+
+  worldState.entities = [second];
+
+  assert.equal(
+    collectBonuses(normalContext, evaluateBonuses).has('one'),
+    false,
+  );
+
+  projectileStore.isActive = false;
+  assert.equal(collectBonuses(normalContext, evaluateBonuses).size, 0);
+  projectileStore.isActive = true;
+  worldState.scene = null;
+  assert.equal(collectBonuses(normalContext, evaluateBonuses).size, 0);
+  worldState.scene = scene;
+  worldState.entities = [first, second, selected];
+
+  // Снятие эффекта после снимка не отбирает бонус начатой серии атак.
+  effects.value = [];
+
+  const formulas = [];
+
+  const handler = await loadHandler(
+    resolverPath,
+    'resolveProjectileAttackSeries',
+    {
+      ...engine,
+      useProjectileStore: () => projectileStore,
+      useDiceRollerStore: () => ({
+        parseAndRoll(formula) {
+          formulas.push(formula);
+
+          return {
+            formula,
+            total: 6,
+            details: '',
+            dice: [{ sides: 20, values: [1], dropped: [] }],
+          };
+        },
+      }),
+      isDndSceneEntity: () => true,
+      resolveActorStats: (entity) => ({
+        armorClass: entity.armorClass,
+        activeFlags: new Set(),
+      }),
+      collectActiveEffects: () => [],
+      evaluateDefensiveACBonus: () => 0,
+      buildCombatChatOptions: () => ATTACK_CARD_OPTIONS,
+      SPELL_SUMMARY_LABELS: { projectile: 'Снаряд' },
+      chatStore: { sendMessage() {} },
+      resolveEntityCurrentHp: () => 10,
+      sendAoeSummary() {},
+      SPELL_NO_TARGETS_LABELS: { noTarget: 'none' },
+    },
+  );
+
+  handler(
+    { spell: { name: 'Rays' }, actors: [first, second] },
+    {
+      attack: {
+        attackModifier: 5,
+        rollMode: 'normal',
+        attackType: 'ranged',
+        bonusDiceFormulasByTarget: bonusesByTarget,
+      },
+      resolvedDamageFormula: '',
+      scene,
+    },
+  );
+
+  assert.deepEqual(formulas, ['1к20+5+1d4', '1к20+5']);
+});
+
+it('the shared target context reads creature average HP through the combat HP helpers', async () => {
+  const target = structuredClone(engine.DEFAULT_CREATURE);
+
+  target.system.hitPoints = { average: 12 };
+
+  const readContext = await loadHandler(
+    'src/client/composables/useBonusDamageParts.ts',
+    'buildTargetHpContext',
+    {
+      ...engine,
+      isDndSceneEntity: () => true,
+      resolveEntityCreatureType: () => 'humanoid',
+      resolveEntityExtraCreatureTypes: () => [],
+      targetStore: { getTargetActor: () => null },
+    },
+  );
+
+  const identity = { entityId: target.id, adjacentAllies: undefined };
+
+  assert.deepEqual(
+    { ...readContext(target) },
+    {
+      ...identity,
+      currentHp: 12,
+      maxHp: 12,
+      creatureType: 'humanoid',
+      extraCreatureTypes: [],
+      markedBy: [],
+    },
+  );
+
+  target.system.hitPoints.current = 5;
+
+  assert.deepEqual(
+    { ...readContext(target) },
+    {
+      ...identity,
+      currentHp: 5,
+      maxHp: 12,
+      creatureType: 'humanoid',
+      extraCreatureTypes: [],
+      markedBy: [],
+    },
+  );
+
+  assert.equal(readContext(), undefined);
+});
+
+it('the shared target context asks for an adjacent ally only when the attacker is known', async () => {
+  const target = structuredClone(engine.DEFAULT_CREATURE);
+  const asked = [];
+
+  target.id = 'wolf-target';
+  target.system.hitPoints = { average: 12 };
+
+  const readContext = await loadHandler(
+    'src/client/composables/useBonusDamageParts.ts',
+    'buildTargetHpContext',
+    {
+      ...engine,
+      isDndSceneEntity: () => true,
+      resolveEntityCreatureType: () => 'humanoid',
+      resolveEntityExtraCreatureTypes: () => [],
+      targetStore: { getTargetActor: () => target },
+      findAlliesAdjacentToTarget: (attackerId, targetId) => {
+        asked.push([attackerId, targetId]);
+
+        return [{ conditions: [] }];
+      },
+    },
+  );
+
+  assert.equal(readContext().adjacentAllies, undefined);
+
+  assert.deepEqual(readContext(undefined, 'wolf').adjacentAllies, [
+    { conditions: [] },
+  ]);
+
+  assert.deepEqual(asked, [['wolf', 'wolf-target']]);
+});
+
+it('attack roll bonuses add the target defences against this attack', async () => {
+  const attacker = { id: 'attacker' };
+  const defenderCalls = [];
+
+  const buildEvaluator = await loadHandler(
+    'src/client/composables/rollBonusEvaluator.ts',
+    'buildRollBonusEvaluator',
+    {
+      ...engine,
+      computed: (getter) => ({
+        get value() {
+          return getter();
+        },
+      }),
+      useResolvedStats: () => ({ combinedEffects: { value: [] } }),
+      buildCarrierContext: (entity) => ({ entityId: entity.id }),
+      buildEntityFormulaContext: () => ({}),
+      useBonusDamageParts: () => ({
+        buildTargetHpContext: (_entity, attackerId) => ({
+          entityId: 'warded',
+          adjacentAllies: attackerId === 'attacker' ? [] : undefined,
+        }),
+      }),
+      getAttackFlagCategoryOfKeys: (keys) =>
+        keys.includes('attack.melee') ? 'melee' : undefined,
+      collectDefenderRollFormulas: (source, targetId, attackType) => {
+        defenderCalls.push([source.id, targetId, attackType]);
+
+        return ['-1d4'];
+      },
+      withAdjacentAllies: (target) => target,
+    },
+  );
+
+  assert.deepEqual(
+    [...buildEvaluator(() => attacker, 'attack.melee')(normalContext)],
+    ['-1d4'],
+  );
+
+  assert.deepEqual(defenderCalls, [['attacker', 'warded', 'melee']]);
+
+  assert.deepEqual(
+    [...buildEvaluator(() => attacker, 'save.wisdom')(normalContext)],
+    [],
+    'у спасброска защит цели нет',
+  );
+});
+
+it('actual creature action entry checks distance with the chosen attack kind', async () => {
+  const creature = { ...createEntity(), id: 'goblin' };
+  const checked = [];
+  const rolled = [];
+  const messages = [];
+
+  const ports = {
+    readCreature: () => creature,
+    spendCreatureActionTurn: () => {},
+    useTargetStore: () => ({ targetTokenId: 'target' }),
+    useChatStore: () => ({ sendMessage: (text) => messages.push(text) }),
+    CREATURE_ACTIONS_BLOCK_LABELS: {
+      outOfRangePrefix: '⛔ ',
+      outOfRangeMiddle: ': ',
+      outOfRangeSuffix: '',
+    },
+    hasCreatureActionRoll: () => true,
+    // Вопрос о виде отвечен «дальнобойная»
+    runCreatureActionChoices: (action, creatureId, proceed) => {
+      assert.equal(creatureId, 'goblin');
+      proceed({ ...action, rangeType: 'ranged' });
+    },
+    checkCreatureActionRangeOnScene: (action) => {
+      checked.push(action.rangeType);
+
+      return {
+        allowed: true,
+        disadvantage: true,
+        distance: 60,
+        unitLabel: 'ft',
+      };
+    },
+    runWithCreatureDamageChoice: (action, _creature, proceed) =>
+      proceed(action, undefined, () => {}),
+    launchCreatureAction: (_action, _creatureId, proceed) => proceed(undefined),
+    openCreatureActionRoll: (action, _creature, isDisadvantage) =>
+      rolled.push({ rangeType: action.rangeType, isDisadvantage }) > 0,
+  };
+
+  // Лист существа и горячая панель зовут один вход действия
+  const handler = await loadHandler(
+    creatureActionPath,
+    'startCreatureAction',
+    ports,
+  );
+
+  handler(
+    {
+      name: 'Javelin',
+      attackBonus: 4,
+      rangeType: 'meleeOrRanged',
+      reach: 5,
+      range: { normal: 30, long: 120 },
+      damageParts: [{ formula: '1d6+2' }],
+    },
+    { creatureId: 'goblin', section: undefined },
+  );
+
+  assert.deepEqual(checked, ['ranged']);
+  assert.deepEqual(rolled, [{ rangeType: 'ranged', isDisadvantage: true }]);
+  assert.deepEqual(messages, []);
+});

@@ -6,17 +6,24 @@
 
   import type { SpeciesWizardState } from './useSpeciesWizard';
 
+  import { computed } from 'vue';
+
+  import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
   import {
-    CONDITIONS,
     DAMAGE_DEFENSE_KIND_LABELS,
     DAMAGE_TYPE_LABELS,
+    formatSpeciesSizeWithHeight,
+    getConditionEntry,
   } from '@vtt/shared/system/dnd.js';
-  import { computed } from 'vue';
 
   import {
     ABILITY_LABELS,
     CREATURE_SIZE_LABELS,
     CREATURE_TYPE_LABELS,
+    GRANT_FIELD_LABELS,
+    GRANT_SECTION_LABELS,
+    SPECIES_DETAIL_LABELS,
+    WIZARD_OVERVIEW_LABELS,
   } from '../constants';
 
   const props = defineProps<{
@@ -35,22 +42,33 @@
 
   const speedDisplay = computed(() => {
     const spd = props.speciesDefinition.speed;
-    const parts = [`Ходьба ${spd.walk} фт.`];
+
+    const parts = [
+      `${SPECIES_DETAIL_LABELS.speedWalk} ${spd.walk} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+    ];
 
     if (spd.fly) {
-      parts.push(`Полет ${spd.fly} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedFly} ${spd.fly} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     if (spd.swim) {
-      parts.push(`Плавание ${spd.swim} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedSwim} ${spd.swim} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     if (spd.climb) {
-      parts.push(`Лазание ${spd.climb} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedClimb} ${spd.climb} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     if (spd.burrow) {
-      parts.push(`Копание ${spd.burrow} фт.`);
+      parts.push(
+        `${SPECIES_DETAIL_LABELS.speedBurrow} ${spd.burrow} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+      );
     }
 
     return parts.join(', ');
@@ -62,10 +80,17 @@
     return CREATURE_TYPE_LABELS[creatureType] || creatureType;
   });
 
+  // Рост стоит прямо в подписи размера: именно по нему игрок и выбирает между
+  // «средним» и «маленьким», а искать его в описании вида — лишний шаг
   const sizeOptions = computed(() => {
+    const heights = props.speciesDefinition.heights;
+
     return props.speciesDefinition.size.map((sizeValue) => ({
       value: sizeValue,
-      label: CREATURE_SIZE_LABELS[sizeValue] || sizeValue,
+      label: formatSpeciesSizeWithHeight(
+        CREATURE_SIZE_LABELS[sizeValue] || sizeValue,
+        heights?.[sizeValue],
+      ),
     }));
   });
 
@@ -77,13 +102,16 @@
   const infoGrants = computed(() => {
     const grants: { title: string; desc: string }[] = [];
 
-    props.speciesDefinition.grants.forEach((group) => {
+    (props.speciesDefinition.grants ?? []).forEach((group) => {
       if (group.type === 'darkvision') {
-        grants.push({ title: 'Тёмное зрение', desc: `${group.range} фт.` });
+        grants.push({
+          title: SPECIES_DETAIL_LABELS.darkvision,
+          desc: `${group.range} ${SPECIES_DETAIL_LABELS.speedUnit}`,
+        });
       } else if (group.type === 'savingThrowProficiency') {
         if (group.abilities.length > 0) {
           grants.push({
-            title: 'Спасброски',
+            title: GRANT_SECTION_LABELS.savingThrows,
             desc: group.abilities
               .map((ability) => ABILITY_LABELS[ability] ?? ability)
               .join(', '),
@@ -108,13 +136,9 @@
       } else if (group.type === 'conditionImmunity') {
         if (group.conditions.length > 0) {
           grants.push({
-            title: 'Иммунитет к состояниям',
+            title: GRANT_FIELD_LABELS.conditionImmunities,
             desc: group.conditions
-              .map(
-                (key) =>
-                  CONDITIONS.find((condition) => condition.key === key)?.nameRu
-                  ?? key,
-              )
+              .map((key) => getConditionEntry(key)?.nameRu ?? key)
               .join(', '),
           });
         }
@@ -123,28 +147,40 @@
         && (!group.choices || group.choices.count === 0)
       ) {
         if (group.items.length > 0) {
-          grants.push({ title: 'Языки', desc: group.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.languages,
+            desc: group.items.join(', '),
+          });
         }
       } else if (
         group.type === 'weaponProficiency'
         && (!group.choices || group.choices.count === 0)
       ) {
         if (group.items.length > 0) {
-          grants.push({ title: 'Оружие', desc: group.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.weapons,
+            desc: group.items.join(', '),
+          });
         }
       } else if (
         group.type === 'armorProficiency'
         && (!group.choices || group.choices.count === 0)
       ) {
         if (group.items.length > 0) {
-          grants.push({ title: 'Снаряжение', desc: group.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.equipment,
+            desc: group.items.join(', '),
+          });
         }
       } else if (
         group.type === 'toolProficiency'
         && (!group.choices || group.choices.count === 0)
       ) {
         if (group.items.length > 0) {
-          grants.push({ title: 'Инструменты', desc: group.items.join(', ') });
+          grants.push({
+            title: GRANT_SECTION_LABELS.tools,
+            desc: group.items.join(', '),
+          });
         }
       }
     });
@@ -156,27 +192,33 @@
 <template>
   <div class="flex flex-col gap-6 p-1">
     <!-- Описание вида -->
-    <div class="rounded-lg bg-elevated/50 p-4 leading-relaxed text-toned">
-      {{ speciesDefinition.description }}
+    <div
+      class="rounded-lg border border-default/50 bg-elevated/30 p-4 leading-relaxed text-toned"
+    >
+      <ItemDescriptionRenderer :content="speciesDefinition.description" />
     </div>
 
     <!-- Основные характеристики -->
     <div class="grid grid-cols-2 gap-4">
-      <div class="flex flex-col rounded-lg bg-elevated p-3">
+      <div
+        class="flex flex-col rounded-lg border border-default/50 bg-elevated/30 p-3"
+      >
         <span
           class="mb-1 text-[10px] font-semibold tracking-wider text-muted uppercase"
         >
-          Тип существа
+          {{ WIZARD_OVERVIEW_LABELS.creatureType }}
         </span>
 
         <span class="font-medium text-highlighted">{{ displayType }}</span>
       </div>
 
-      <div class="flex flex-col rounded-lg bg-elevated p-3">
+      <div
+        class="flex flex-col rounded-lg border border-default/50 bg-elevated/30 p-3"
+      >
         <span
           class="mb-1 text-[10px] font-semibold tracking-wider text-muted uppercase"
         >
-          Скорость
+          {{ WIZARD_OVERVIEW_LABELS.speed }}
         </span>
 
         <span class="font-medium text-highlighted">{{ speedDisplay }}</span>
@@ -186,12 +228,12 @@
     <!-- Выбор размера (если есть варианты) -->
     <div
       v-if="hasMultipleSizes"
-      class="flex flex-col rounded-lg bg-elevated/50 p-4"
+      class="flex flex-col rounded-lg border border-default/50 bg-elevated/30 p-4"
     >
       <span
         class="mb-3 text-xs font-semibold tracking-wider text-muted uppercase"
       >
-        Выберите размер
+        {{ WIZARD_OVERVIEW_LABELS.sizePrompt }}
       </span>
 
       <div class="flex gap-4">
@@ -208,12 +250,12 @@
 
     <div
       v-else
-      class="flex flex-col rounded-lg bg-elevated p-3"
+      class="flex flex-col rounded-lg border border-default/50 bg-elevated/30 p-3"
     >
       <span
         class="mb-1 text-[10px] font-semibold tracking-wider text-muted uppercase"
       >
-        Размер
+        {{ WIZARD_OVERVIEW_LABELS.size }}
       </span>
 
       <span class="font-medium text-highlighted">{{
@@ -227,17 +269,17 @@
       class="flex flex-col gap-3"
     >
       <span class="text-xs font-semibold tracking-wider text-muted uppercase">
-        Врождённые особенности
+        {{ WIZARD_OVERVIEW_LABELS.innateFeatures }}
       </span>
 
       <div class="grid grid-cols-2 gap-3">
         <div
           v-for="(grant, idx) in infoGrants"
           :key="idx"
-          class="flex flex-col rounded-lg bg-elevated p-3"
+          class="flex flex-col rounded-lg border border-default/50 bg-elevated/30 p-3"
         >
           <span
-            class="mb-1 text-[10px] font-semibold tracking-wider text-primary-400 uppercase"
+            class="mb-1 text-[10px] font-semibold tracking-wider text-primary uppercase"
           >
             {{ grant.title }}
           </span>

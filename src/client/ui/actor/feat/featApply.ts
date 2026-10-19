@@ -11,28 +11,42 @@
 import type { Feature, TypedWebSocketClient } from '@vtt/shared';
 import type {
   ActiveEffect,
-  Actor,
+  ActorCounterState,
+  ActorProficiencies,
+  AppliedFeatMeta,
+  DnDActor,
   FeatData,
+  GrantedSpellSource,
   ResolvedGrantedSpell,
   Spell,
 } from '@vtt/shared/system/dnd.js';
 
-import { pushUnique, removeItems } from '@vtt/shared';
+import type { SpellGrantRequest } from '../../../composables/grantedSpellPacks';
+
+import { generateEntityId } from '@/core/entityUtils';
 import {
   appendGrantedSpells,
+  applyFeatChoiceSelections,
+  applyFeatDataProficiencies,
+  buildFeatCounters,
   buildFeatGrantEffect,
+  cloneActorProficiencies,
+  collectActorFeatChoiceAnswers,
+  collectFeatGrantedClassSpellRequests,
   collectFeatGrantedSpellSources,
+  getTotalLevel,
   isFeatOwnedEffect,
+  normalizeSpellName,
   prepareTransferredFeatEffects,
+  raiseTokenDarkvision,
+  removeFeatChoiceSelections,
+  removeFeatDataProficiencies,
   removeGrantedSpellsByFeatureNames,
+  resolveChosenAbilities,
+  resolveChosenDamageDefenses,
 } from '@vtt/shared/system/dnd.js';
 
-import { loadCompendiumKind } from '@/core/compendiumDataClient';
-import { generateEntityId } from '@/core/entityUtils';
-import { extractSpellEntries } from '@/systems/dnd5e/composables/spellCompendium';
-
-/** Владения актора (структурно — то, что черта правит). */
-type ActorProficiencies = Actor['system']['proficiencies'];
+import { resolveSpellGrantsForActor } from '../../../composables/grantedSpellPacks';
 
 /**
  * Особенность-черта, несущая дары для применения/отката. Базовый `Feature`
@@ -41,9 +55,25 @@ type ActorProficiencies = Actor['system']['proficiencies'];
  * здесь, на стороне клиента. Эти поля переживают сериализацию актора
  * (`normalizeActor` не трогает `features`).
  */
-export interface AppliedFeatFeature extends Feature {
+export interface AppliedFeatFeature extends Feature, AppliedFeatMeta {
   featData?: FeatData;
   activeEffects?: ActiveEffect[];
+  /**
+   * Id эффектов, которые умение класса поставило на лист. По ним строка
+   * особенности находит свой эффект — «Ярость» включается с панели быстрого
+   * доступа. Эффекты лежат в общем списке листа, и без этой ссылки строка о
+   * них не знает.
+   */
+  effectIds?: string[];
+}
+
+/**
+ * Черта компендиума с полями, которых базовый тип умения не знает: категория
+ * нужна пикеру, чтобы сузить пул выбора черты.
+ */
+export interface CompendiumFeat extends AppliedFeatFeature {
+  /** Категория черты подписью записи компендиума («Боевой стиль») */
+  category?: string;
 }
 
 /** Обновления актора, получаемые при применении/откате черты. */
@@ -53,66 +83,17 @@ export interface FeatApplyResult {
   activeEffects: ActiveEffect[];
   proficiencies: ActorProficiencies;
   /**
+   * Счётчики ресурсов актора с учётом ресурсов черты. Задаётся всегда: список
+   * общий с классовыми счётчиками, и вернуть только «свои» нельзя — вызывающий
+   * записывает его целиком.
+   */
+  classCounters: ActorCounterState[];
+  /**
    * Обновлённые настройки токена (поднятое тёмное зрение). Задаётся только если
    * черта повысила тёмное зрение — иначе `undefined` (токен не трогаем, чтобы не
    * затереть его при отсутствии изменений).
    */
-  token?: Actor['token'];
-}
-
-/**
- * Глубокая копия владений (чтобы не мутировать исходный объект актора).
- *
- * Клонируем через JSON, а НЕ `structuredClone`: актор приходит из `ref` листа
- * (`localActor`), поэтому `actor.system.proficiencies` — реактивный Proxy Vue, на
- * котором `structuredClone` бросает `DataCloneError` («could not be cloned»).
- * Владения — чистый JSON (массивы строк + запись строка→строка), так что клон
- * без потерь. Тот же приём используется в `applyFeatDarkvision` ниже.
- */
-function cloneProficiencies(
-  proficiencies: ActorProficiencies,
-): ActorProficiencies {
-  return JSON.parse(JSON.stringify(proficiencies));
-}
-
-/** Применяет владения черты к копии владений актора (in-place). */
-function applyFeatProficiencies(
-  proficiencies: ActorProficiencies,
-  featData: FeatData | null | undefined,
-): void {
-  for (const skill of featData?.skillProficiencies ?? []) {
-    proficiencies.skills[skill] = 'proficient';
-  }
-
-  pushUnique(proficiencies.weapons, featData?.weaponProficiencies ?? []);
-  pushUnique(proficiencies.armor, featData?.armorProficiencies ?? []);
-  pushUnique(proficiencies.tools, featData?.toolProficiencies ?? []);
-  pushUnique(proficiencies.languages, featData?.languages ?? []);
-
-  pushUnique(
-    proficiencies.savingThrows,
-    featData?.savingThrowProficiencies ?? [],
-  );
-}
-
-/** Откатывает владения черты из копии владений актора (in-place). */
-function removeFeatProficiencies(
-  proficiencies: ActorProficiencies,
-  featData: FeatData | null | undefined,
-): void {
-  for (const skill of featData?.skillProficiencies ?? []) {
-    Reflect.deleteProperty(proficiencies.skills, skill);
-  }
-
-  removeItems(proficiencies.weapons, featData?.weaponProficiencies ?? []);
-  removeItems(proficiencies.armor, featData?.armorProficiencies ?? []);
-  removeItems(proficiencies.tools, featData?.toolProficiencies ?? []);
-  removeItems(proficiencies.languages, featData?.languages ?? []);
-
-  removeItems(
-    proficiencies.savingThrows,
-    featData?.savingThrowProficiencies ?? [],
-  );
+  token?: DnDActor['token'];
 }
 
 /**
@@ -120,34 +101,114 @@ function removeFeatProficiencies(
  * черты с их полными данными. Без сокета или связей — пустой список.
  *
  * @param socket - WebSocket-клиент (для загрузки компендиума)
- * @param feat - перетаскиваемая черта (имя + блоб даров)
+ * @param feat - перетаскиваемая черта (имя + блоб даров + ответы игрока)
  * @param feat.name - имя черты (источник при выдаче заклинаний)
  * @param feat.featData - блоб даров черты с выдаваемыми заклинаниями
+ * @param feat.choices - ответы игрока: из них берутся выбранные заклинания
+ * @param feat.packId - пак черты: в нём выдаваемое ищется первым
+ * @param actor - лист персонажа: его уровень решает, что уже открыто. Без него
+ *   уровни доступа не проверяются, а расширенный список не раскрывается вовсе
  */
-export async function resolveFeatGrantedSpells(
+export function resolveFeatGrantedSpells(
   socket: TypedWebSocketClient | null | undefined,
-  feat: { name: string; featData?: FeatData | null },
+  feat: {
+    name: string;
+    featData?: FeatData | null;
+    choices?: Record<string, string[]>;
+    packId?: string;
+  },
+  actor?: DnDActor | null,
 ): Promise<ResolvedGrantedSpell[]> {
-  const sources = collectFeatGrantedSpellSources(feat);
+  return resolveGrantedSpellSources(socket, actor, {
+    sources: withFeatPack(
+      collectFeatGrantedSpellSources(feat, actor),
+      feat.packId,
+    ),
+    classRequests: collectFeatGrantedClassSpellRequests(feat, actor),
+  });
+}
 
-  if (sources.length === 0 || !socket) {
-    return [];
-  }
+/**
+ * Пере-собирает заклинания ВСЕХ черт листа на текущем уровне персонажа.
+ *
+ * Нужен при повышении уровня: у метки дракона заклинания приходят ступенями
+ * («Малое восстановление» — с третьего уровня), и без пересборки они остались бы
+ * недоступными навсегда. Уже выданные заклинания повторно не добавляются —
+ * `appendGrantedSpells` отсеивает их по названию.
+ *
+ * @param socket - WebSocket-клиент (для загрузки компендиума)
+ * @param actor - лист персонажа с уже обновлённым уровнем
+ * @returns заклинания черт, доступные на текущем уровне
+ */
+export function resolveActorFeatSpells(
+  socket: TypedWebSocketClient | null | undefined,
+  actor: DnDActor,
+): Promise<ResolvedGrantedSpell[]> {
+  const features: AppliedFeatFeature[] = actor.features ?? [];
 
-  const entries = await loadCompendiumKind(socket, 'spell');
-  const spells = extractSpellEntries(entries);
+  const withFeatData = features.filter((feature) => feature.featData);
 
-  const resolved: ResolvedGrantedSpell[] = [];
+  const sources = withFeatData.flatMap((feature) =>
+    withFeatPack(
+      collectFeatGrantedSpellSources(feature, actor),
+      feature.packId,
+    ),
+  );
 
-  for (const source of sources) {
-    const spell = spells.find((entry) => entry.id === source.spellId);
+  const classRequests = withFeatData.flatMap((feature) =>
+    collectFeatGrantedClassSpellRequests(feature, actor),
+  );
 
-    if (spell) {
-      resolved.push({ spell, featureName: source.featureName });
-    }
-  }
+  return resolveGrantedSpellSources(socket, actor, {
+    sources,
+    classRequests,
+    isLevelUnlock: true,
+  });
+}
 
-  return resolved;
+/**
+ * Сопоставляет связи «заклинание → черта-источник» с записями компендиума и
+ * мира по правилу «свой пак → единственный другой → выбор игрока → нет».
+ * Своим паком заклинания без названного пака считается пак черты.
+ *
+ * Отдаёт прежнюю форму выдачи черты: имя, подготовка, характеристика. Остальные
+ * поля связи (чем выдано, ключ умения) черта не использует, и лист кладёт её
+ * заклинания как заклинания черты.
+ *
+ * @param socket - WebSocket-клиент (для загрузки компендиума)
+ * @param actor - персонаж, которому выдаются заклинания
+ * @param request - что выдаётся
+ */
+async function resolveGrantedSpellSources(
+  socket: TypedWebSocketClient | null | undefined,
+  actor: DnDActor | null | undefined,
+  request: SpellGrantRequest,
+): Promise<ResolvedGrantedSpell[]> {
+  const resolved = await resolveSpellGrantsForActor(socket, actor, request);
+
+  return resolved.map((granted) => ({
+    spell: granted.spell,
+    featureName: granted.featureName,
+    alwaysPrepared: granted.alwaysPrepared,
+    castingAbility: granted.castingAbility,
+  }));
+}
+
+/**
+ * Связи заклинаний черты с её паком: заклинание без названного пака ищется
+ * сперва там, откуда взята черта.
+ *
+ * @param sources - связи «заклинание → черта»
+ * @param featPackId - пак черты
+ */
+function withFeatPack(
+  sources: GrantedSpellSource[],
+  featPackId: string | undefined,
+): GrantedSpellSource[] {
+  return sources.map((source) => ({
+    ...source,
+    packId: source.packId ?? featPackId,
+  }));
 }
 
 /**
@@ -160,7 +221,7 @@ export async function resolveFeatGrantedSpells(
  * @param resolvedSpells - сопоставленные с компендиумом выдаваемые заклинания
  */
 export function applyFeatToActor(
-  actor: Actor,
+  actor: DnDActor,
   droppedFeat: AppliedFeatFeature,
   resolvedSpells: ResolvedGrantedSpell[],
 ): FeatApplyResult {
@@ -169,14 +230,24 @@ export function applyFeatToActor(
 
   // Конструируем особенность явно (без полей GameItem-обёртки), сохраняя дары
   // для последующего редактирования/отката на акторе.
+  // Уровень взятия фиксируется навсегда: прибавка к хитам у «Крепкого» и
+  // подобных зависит от него, и на следующем повышении она не должна поехать
+  const acquisitionLevel =
+    droppedFeat.acquisitionLevel ?? getTotalLevel(actor.system.classes);
+
   const newFeature: AppliedFeatFeature = {
     id: featureId,
+    acquisitionLevel,
+    ...(droppedFeat.choices ? { choices: droppedFeat.choices } : {}),
+    ...(droppedFeat.packId ? { packId: droppedFeat.packId } : {}),
     name: droppedFeat.name,
     nameEn: droppedFeat.nameEn,
     description: droppedFeat.description,
     featureType: 'feat',
     sourceKey: droppedFeat.sourceKey,
     isSRD: droppedFeat.isSRD,
+    repeatable: droppedFeat.repeatable,
+    repeatableText: droppedFeat.repeatableText,
     ...(featData ? { featData } : {}),
     ...(droppedFeat.activeEffects
       ? { activeEffects: droppedFeat.activeEffects }
@@ -185,21 +256,51 @@ export function applyFeatToActor(
 
   const features = [...actor.features, newFeature];
 
-  const proficiencies = cloneProficiencies(actor.system.proficiencies);
+  const proficiencies = cloneActorProficiencies(actor.system.proficiencies);
 
-  applyFeatProficiencies(proficiencies, featData);
+  applyFeatDataProficiencies(proficiencies, featData);
 
-  const spells = appendGrantedSpells(actor.spells ?? [], resolvedSpells);
+  // Выборы игрока — после безусловных даров: «Знаток» поднимает до компетентности то,
+  // чем персонаж уже владеет, и порядок здесь имеет значение
+  applyFeatChoiceSelections(
+    proficiencies,
+    featData,
+    droppedFeat.choices,
+    actor,
+  );
+
+  const spells = appendGrantedSpells(
+    actor.spells ?? [],
+    resolvedSpells,
+    'feat',
+  );
 
   const transferred = prepareTransferredFeatEffects(
     featureId,
     droppedFeat.activeEffects,
   );
 
+  // Ответы других черт — на случай привязки к чужому выбору: «Мощная метка
+  // дракона» поднимает характеристику, названную заклинательной у самой метки.
+  // Свои ответы поверх: одноимённый ключ всегда про эту черту
+  const answers = {
+    ...collectActorFeatChoiceAnswers(actor),
+    ...(droppedFeat.choices ?? {}),
+  };
+
   const grantEffect = buildFeatGrantEffect(
     featureId,
     newFeature.name,
     featData,
+    {},
+    {
+      acquisitionLevel,
+      walkSpeed: actor.system.movement?.walk,
+      // Защита от урона и повышение характеристик по выбору: сам тип урона и
+      // сама характеристика известны только после того, как игрок выбрал
+      chosenDamageDefenses: resolveChosenDamageDefenses(featData, answers),
+      chosenAbilities: resolveChosenAbilities(featData, answers),
+    },
   );
 
   const activeEffects = [
@@ -210,42 +311,25 @@ export function applyFeatToActor(
 
   // Тёмное зрение: поднимаем дальность зрения токена до максимума (как у вида).
   // Не понижаем — у тёмного зрения может быть другой источник (вид/класс).
-  const token = applyFeatDarkvision(actor.token, featData?.darkvision ?? 0);
+  const token = raiseTokenDarkvision(actor.token, featData?.darkvision ?? 0);
 
-  return { features, spells, activeEffects, proficiencies, token };
-}
+  const classCounters = [
+    ...(actor.system.classCounters ?? []),
+    ...buildFeatCounters(
+      { id: featureId, featData, choices: droppedFeat.choices },
+      actor,
+      actor.system.classCounters ?? [],
+    ),
+  ];
 
-/**
- * Возвращает обновлённые настройки токена с поднятым до `darkvision` тёмным
- * зрением, либо `undefined`, если поднимать нечего (черта не даёт тёмного зрения
- * или у токена оно уже не ниже).
- *
- * @param token - текущие настройки токена актора
- * @param darkvision - тёмное зрение черты (футы)
- */
-function applyFeatDarkvision(
-  token: Actor['token'],
-  darkvision: number,
-): Actor['token'] | undefined {
-  if (darkvision <= 0) {
-    return undefined;
-  }
-
-  const next: NonNullable<Actor['token']> = JSON.parse(
-    JSON.stringify(token ?? {}),
-  );
-
-  if (!next.vision) {
-    next.vision = { enabled: true, range: 60, darkvision: 0, angle: 360 };
-  }
-
-  if (darkvision <= next.vision.darkvision) {
-    return undefined;
-  }
-
-  next.vision.darkvision = darkvision;
-
-  return next;
+  return {
+    features,
+    spells,
+    activeEffects,
+    proficiencies,
+    classCounters,
+    token,
+  };
 }
 
 /**
@@ -263,7 +347,7 @@ function applyFeatDarkvision(
  * @param feature - удаляемая особенность-черта (с `featData` для точного отката)
  */
 export function removeFeatFromActor(
-  actor: Actor,
+  actor: DnDActor,
   feature: AppliedFeatFeature,
 ): FeatApplyResult {
   const features = actor.features.filter((entry) => entry.id !== feature.id);
@@ -276,11 +360,21 @@ export function removeFeatFromActor(
     (effect) => !isFeatOwnedEffect(effect, feature.id),
   );
 
-  const proficiencies = cloneProficiencies(actor.system.proficiencies);
+  const proficiencies = cloneActorProficiencies(actor.system.proficiencies);
 
-  removeFeatProficiencies(proficiencies, feature.featData ?? null);
+  removeFeatDataProficiencies(proficiencies, feature.featData ?? null);
 
-  return { features, spells, activeEffects, proficiencies };
+  removeFeatChoiceSelections(
+    proficiencies,
+    feature.featData ?? null,
+    feature.choices,
+  );
+
+  const classCounters = (actor.system.classCounters ?? []).filter(
+    (counter) => counter.featureId !== feature.id,
+  );
+
+  return { features, spells, activeEffects, proficiencies, classCounters };
 }
 
 /**
@@ -297,20 +391,60 @@ export function removeFeatFromActor(
  * @param resolvedSpells - выдаваемые заклинания для повторной выдачи
  */
 export function reapplyFeatToActor(
-  actor: Actor,
+  actor: DnDActor,
   oldFeature: AppliedFeatFeature,
   updatedFeat: AppliedFeatFeature,
   resolvedSpells: ResolvedGrantedSpell[],
 ): FeatApplyResult {
   const removed = removeFeatFromActor(actor, oldFeature);
 
-  const intermediate: Actor = {
+  const intermediate: DnDActor = {
     ...actor,
     features: removed.features,
     spells: removed.spells,
     activeEffects: removed.activeEffects,
-    system: { ...actor.system, proficiencies: removed.proficiencies },
+    system: {
+      ...actor.system,
+      proficiencies: removed.proficiencies,
+      // Счётчики снятой версии уже вычтены: иначе новая версия увидела бы
+      // старый ресурс и второй раз его не завела бы
+      classCounters: removed.classCounters,
+    },
   };
 
-  return applyFeatToActor(intermediate, updatedFeat, resolvedSpells);
+  // Уровень взятия переносим со старой версии: правка черты — не повторное её
+  // получение, и прибавка к хитам от этого меняться не должна
+  const applied = applyFeatToActor(
+    intermediate,
+    {
+      ...updatedFeat,
+      acquisitionLevel:
+        updatedFeat.acquisitionLevel ?? oldFeature.acquisitionLevel,
+      // Сделанные выборы переносим: правка черты — не повторное её получение, и
+      // переспрашивать игрока незачем
+      choices: updatedFeat.choices ?? oldFeature.choices,
+      packId: updatedFeat.packId ?? oldFeature.packId,
+    },
+    resolvedSpells,
+  );
+
+  // Отметку подготовки у заклинаний, оставшихся за чертой, переносим: снятие и
+  // повторная выдача ставят её заново по данным черты, и пересмотр выборов на
+  // новом уровне молча снимал подготовку, сделанную игроком. Запись с отметкой,
+  // взятой у выдачи, не в счёт: её подготовку вернуло снятие — такой, какой она
+  // была до отметки
+  const preparedNames = new Set(
+    (actor.spells ?? [])
+      .filter((spell) => spell.prepared && !spell.borrowedPreparation)
+      .map((spell) => normalizeSpellName(spell.name)),
+  );
+
+  return {
+    ...applied,
+    spells: applied.spells.map((spell) =>
+      !spell.prepared && preparedNames.has(normalizeSpellName(spell.name))
+        ? { ...spell, prepared: true }
+        : spell,
+    ),
+  };
 }

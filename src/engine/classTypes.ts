@@ -1,5 +1,5 @@
 /**
- * Типы данных системы классов D&D 5e (PHB 2014)
+ * Типы данных системы классов D&D 5e (PHB 2024)
  *
  * Содержит определения классов (SRD), подклассов,
  * записи классов на акторе и вспомогательные утилиты.
@@ -9,7 +9,14 @@ import type {
   AbilityType,
   ArmorCategory,
   SkillType,
+  SourceDefinition,
 } from '@vtt/shared';
+
+import type { ActiveEffect } from './activeEffectTypes.js';
+import type { FeatData, FeatGrantedClassSpells } from './featTypes.js';
+import type { StartingEquipmentOption } from './startingEquipment.js';
+
+import { isRecord } from '@vtt/shared';
 
 // ── Литеральные типы ─────────────────────────────────────────
 
@@ -31,8 +38,33 @@ export type ClassKey =
 /** Тип заклинателя */
 export type CasterType = 'full' | 'half' | 'third' | 'pact' | 'none';
 
+/**
+ * Как читать список основных характеристик класса: «Сила И Телосложение» или
+ * «Сила ИЛИ Ловкость». Разделитель приходит из источника отдельным значением —
+ * вывести его из самого списка нельзя.
+ */
+export type AbilityDelimiter = 'and' | 'or';
+
 /** Тип кости хитов */
 export type HitDie = 6 | 8 | 10 | 12;
+
+/** Кости хитов в порядке показа (селекторы окон хитов актёра и существа) */
+export const HIT_DIE_OPTIONS: readonly HitDie[] = [6, 8, 10, 12];
+
+/** Множество допустимых костей хитов для быстрой проверки */
+const HIT_DIE_SET: ReadonlySet<number> = new Set(HIT_DIE_OPTIONS);
+
+/**
+ * Проверяет, является ли число костью хитов (`HitDie`).
+ * Значение приходит из селектора окна и из записей мира, где на его месте
+ * может оказаться любое число.
+ *
+ * @param value - произвольное число для проверки
+ * @returns `true`, если это кость хитов системы
+ */
+export function isHitDie(value: number): value is HitDie {
+  return HIT_DIE_SET.has(value);
+}
 
 /**
  * Группа костей хитов одного размера без привязки к классу
@@ -50,8 +82,50 @@ export interface ManualHitDieGroup {
 /** Способ определения ХП при повышении уровня */
 export type HitPointMethod = 'roll' | 'average' | 'max' | 'custom';
 
-/** Тип восстановления счётчика классового ресурса */
-export type CounterRecovery = 'short' | 'long';
+/**
+ * Каким отдыхом восстанавливается ресурс.
+ *
+ * Короткий отдых в правилах короче продолжительного, поэтому ресурс, который
+ * вернул короткий, возвращает и продолжительный: `short` и `short-one`
+ * различаются только порцией короткого отдыха — целиком или один заряд
+ * («Второе дыхание» и «Вдохновение барда» правил 2024 года).
+ */
+export type CounterRecovery = 'short' | 'long' | 'short-one';
+
+/** Сколько зарядов возвращает отдых: ничего, все или заданное число */
+export type CounterRecoveryMode = 'none' | 'all' | 'amount';
+
+/** Восстановление счётчика на одном виде отдыха */
+export interface CounterRecoveryRule {
+  mode: CounterRecoveryMode;
+  /** Число возвращаемых зарядов; учитывается только при режиме `amount` */
+  amount: number;
+}
+
+/**
+ * Отдых и первое значение ресурса сверх отката одним словом — общее у счётчика
+ * класса и ресурса записи (черта, вид, умение).
+ *
+ * Одним словом {@link CounterRecovery} не сказать «отдых ничего не возвращает»:
+ * продолжительный отдых у него возвращает всё всегда. Ресурс, который набирают
+ * действием, а не отдыхом («Очки мутации» — от потраченной ячейки), описывается
+ * раздельными правилами с режимом `none` и появляется пустым.
+ */
+export interface CounterDefinitionExtras {
+  /**
+   * Что возвращает короткий отдых. Задано хоть одно из двух правил — отдых
+   * читается по ним (недостающее — «ничего»), а {@link CounterRecovery} не
+   * читается вовсе: так же, как у счётчика на листе и как на сайте.
+   */
+  shortRest?: CounterRecoveryRule;
+  /** Что возвращает продолжительный отдых; см. {@link shortRest} */
+  longRest?: CounterRecoveryRule;
+  /**
+   * Ресурс появляется на листе пустым (0 из максимума), а не полным. Нет или
+   * `false` — как раньше, полным.
+   */
+  startsEmpty?: boolean;
+}
 
 // ── Счётчики классовых ресурсов ──────────────────────────────
 
@@ -62,19 +136,34 @@ export type CounterRecovery = 'short' | 'long';
  * и который восстанавливается после короткого или продолжительного отдыха.
  * Примеры: очки чародейства, кости превосходства, очки духа, ярость.
  */
-export interface ClassCounterDefinition {
+export interface ClassCounterDefinition extends CounterDefinitionExtras {
   /** Уникальный ключ (напр. 'sorcery-points', 'superiority-dice') */
   key: string;
   /** Название на русском */
   name: string;
   /** Краткое название для компактного отображения в интерфейсе */
   shortName?: string;
-  /** Название на английском */
-  nameEn?: string;
   /** Уровень, с которого доступен счётчик */
   startLevel: number;
   /** Тип восстановления */
   recovery: CounterRecovery;
+  /**
+   * Показывать ресурс колонкой таблицы прогрессии.
+   *
+   * Ряд по уровням у ресурса уже задан прогрессией либо формулой, и колонка
+   * собирается из него ({@link withCounterTableColumns}): второй раз те же числа
+   * автор не набирает. Колонка выводится, только если ряд считается от одного
+   * уровня — у максимума по модификатору характеристики его нет.
+   */
+  showInTable?: boolean;
+  /**
+   * Нижняя граница максимума; нет или 0 — границы нет.
+   *
+   * Подпирает расчёт снизу, а не складывается с ним: вдохновение барда равно
+   * модификатору Харизмы, но не меньше одного — с Харизмой +0 бард всё равно
+   * вдохновляет один раз, а с Харизмой +2 вдохновений два, а не три.
+   */
+  min?: number;
   /**
    * Прогрессия максимального значения по уровням.
    * Ключ — уровень (строка "1"–"20"), значение — максимальное количество.
@@ -86,12 +175,21 @@ export interface ClassCounterDefinition {
    * Например: "level" (равно уровню), "level * 5", "chaMod" (мод. Харизмы).
    */
   formula?: string;
-  /** Ключ особенности, к которой привязан счётчик (для авто-добавления) */
-  featureKey?: string;
+
   /** Ключ подкласса, если счётчик от подкласса */
   subclassKey?: string;
-  /** Описание счётчика */
-  description?: string;
+  /**
+   * Ключ умения, у которого ресурс заведён.
+   *
+   * Ресурс умения лежит в счётчиках класса, а не в дарах умения: только здесь
+   * известен уровень КЛАССА, от которого идут ступени и уровень появления — у
+   * дара такого уровня нет, он считался бы от общего уровня персонажа и при
+   * мультиклассе завышал числа. Ключ нужен форме: по нему ресурс возвращается
+   * в своё умение при открытии записи. В паках, выгруженных до появления поля,
+   * его нет — там ресурс умения приезжает обычным счётчиком класса и остаётся
+   * ресурсом записи.
+   */
+  featureKey?: string;
 }
 
 // ── Особенности класса ───────────────────────────────────────
@@ -102,8 +200,113 @@ export interface ClassFeatureChoice {
   key: string;
   /** Название на русском */
   name: string;
+  /** Название на английском — как у самого класса и подкласса */
+  nameEn?: string;
   /** Описание варианта */
   description: string;
+  /**
+   * Короткая подпись рядом с названием («1 круг», «только в доспехе»). Ею
+   * список вариантов читается, не разворачивая каждый.
+   */
+  additional?: string;
+  /**
+   * Требования к варианту текстом («7 уровень, заклинание „Вызов страха“»).
+   *
+   * Текстом, а не разбором: у воззваний колдуна требования пишутся живой
+   * фразой и упоминают заклинания, умения и уровень разом — проверить их
+   * листом всё равно нечем, и игрок читает их глазами.
+   */
+  prerequisite?: string;
+  /**
+   * Вариант не показывается на странице подкласса. Правило показа самого
+   * класса; листу персонажа оно ничего не меняет — вариант спрашивается там,
+   * где заведён.
+   */
+  hideInSubclasses?: boolean;
+  /**
+   * Уровень класса, с которого вариант доступен; нет — доступен сразу.
+   *
+   * Часть вариантов открывается позже самого умения: воззвание «для колдуна
+   * 5 уровня» на первом ещё не предлагают, хотя умение получено на первом.
+   */
+  requiredLevel?: number;
+  /**
+   * Вариант берут повторно: на следующей ступени выбора он снова в списке,
+   * хотя игрок его уже брал. Нет — берут один раз, и взятое из списка уходит.
+   *
+   * Так же выгружает флаг компендиум TTG Club ({@code VttgClass.Choice}):
+   * поле есть только у повторяемого варианта, и потребитель, который его не
+   * читает, ведёт себя как прежде.
+   */
+  repeatable?: boolean;
+  /**
+   * Активные эффекты варианта: то, что он меняет на листе готовой формулой.
+   *
+   * Ложатся на актора, только когда вариант выбран, — в эффектах самого умения
+   * они достались бы игроку вместе с воззванием, которого он не брал. У
+   * справочного списка выбирать нечего: там эффекты и дары каждого открытого
+   * варианта достаются владельцу умения (`collectReferenceOptionGrants`).
+   */
+  activeEffects?: ActiveEffect[];
+  /**
+   * Дары варианта: владения, правки листа, ресурсы, заклинания, расширение
+   * списка и вопросы игроку — той же моделью, что у черты и у самого умения
+   * ({@link ClassFeature.featData}). Набор даров у них общий, и лист применяет
+   * их одним и тем же кодом, откуда бы они ни пришли.
+   *
+   * В отличие от умения, ресурсы и заклинания лежат ЗДЕСЬ, внутри блока: у
+   * умения они выведены своими полями записи ({@link ClassFeature.grantedSpells},
+   * счётчики класса), а дары варианта действуют, только пока он выбран, и в
+   * общих полях класса им места нет. Так же их отдаёт выгрузка TTG Club
+   * ({@code VttgClass.Choice.featData}).
+   */
+  featData?: FeatData;
+}
+
+/**
+ * Настройка выбора из {@link ClassFeature.choices}: сколько вариантов берут и
+ * как это число растёт по уровням класса.
+ *
+ * Поля нет у умения, список вариантов которого справочный
+ * ({@link isReferenceClassFeatureChoices}): мастер уровня из такого списка
+ * ничего не спрашивает. Так же выгружает их компендиум TTG Club
+ * ({@code VttgClass.ChoiceConfig}) и так же читает список сайт.
+ */
+export interface ClassFeatureChoiceConfig {
+  /** Подпись выбора («Таинственные воззвания») */
+  label?: string;
+  /** Сколько вариантов берут на уровне получения умения */
+  count?: number;
+  /**
+   * Сколько вариантов выбрано ВСЕГО к уровню: ключ — уровень класса строкой,
+   * значение — итог, а не прибавка (как у {@link ClassCounterDefinition.progression}).
+   * У колдуна одно воззвание с первого уровня и три со второго — значит, на
+   * втором он выбирает два новых.
+   */
+  progression?: Record<string, number>;
+}
+
+/**
+ * Вариант стартового снаряжения класса.
+ *
+ * Позиции ({@link StartingEquipmentOption.items}) необязательны: без них
+ * вариант только показывается строкой, как было до их появления.
+ */
+export interface ClassStartingEquipmentOption extends StartingEquipmentOption {
+  /** Ключ варианта (напр. 'A', 'B', 'C') */
+  key: string;
+}
+
+/**
+ * Выбор владения навыками, который даёт само умение класса или подкласса.
+ * Отдельно от `ClassDefinition.skillChoices`: те навыки берут при взятии
+ * первого уровня класса, эти — на уровне конкретного умения.
+ */
+export interface ClassFeatureSkillChoice {
+  /** Сколько навыков выбирают */
+  count: number;
+  /** Пул навыков; пустой список — любой навык */
+  from: SkillType[];
 }
 
 /** Особенность класса, получаемая на определённом уровне */
@@ -120,12 +323,36 @@ export interface ClassFeature {
   subclassKey?: string;
   /** Требуется ли выбор варианта (напр. Боевой стиль) */
   choices?: ClassFeatureChoice[];
+  /**
+   * Настройка выбора из {@link choices}: сколько вариантов берут и как число
+   * растёт по уровням. Нет — список справочный: выбирать из него не нужно
+   * ({@link isReferenceClassFeatureChoices}).
+   */
+  choiceConfig?: ClassFeatureChoiceConfig;
+  /**
+   * Умение повышает характеристики: на его уровне мастер класса показывает шаг
+   * «+2 к одной или +1 к двум, либо черта».
+   *
+   * Явный признак вместо угадывания по ключу: до его появления ASI опознавался
+   * по `key.startsWith('asi-')`, и на самописных или переведённых классах шаг
+   * молча пропадал. Эвристика осталась запасным вариантом для записей, где поле
+   * не заполнено, — см. `isAsiFeature` в `classEditorTypes.ts`.
+   */
+  abilityImprovement?: boolean;
+  /**
+   * Умение даёт владение навыками на выбор («Эксперт», умения подклассов).
+   * Мастер класса показывает на его уровне отдельный шаг выбора.
+   */
+  skillChoice?: ClassFeatureSkillChoice;
   /** Если true - особенность не добавляется в финальный лист актора, служит только как инфо в повышении уровня */
   isInformationalOnly?: boolean;
   /**
    * ID заклинаний компендиума, которые умение предоставляет автоматически
    * (напр. «Избранный враг» следопыта даёт «Метку охотника»).
-   * Такие заклинания всегда подготовлены и не тратят лимит ручного выбора.
+   * Готовить ли их, решает отметка «Подготавливать не нужно» в
+   * `featData` (`grantedSpellsAlwaysPrepared` и отметки ссылок): заклинания
+   * домена подготовлены всегда, а заклинания книги некроманта готовят наравне
+   * с остальными.
    */
   grantedSpells?: string[];
   /**
@@ -135,6 +362,35 @@ export interface ClassFeature {
    * («3 уровень: …, 5 уровень: …»). Правила те же, что у `grantedSpells`.
    */
   grantedSpellsByLevel?: Record<string, string[]>;
+  /**
+   * Списки классов, которые умение выдаёт целиком («Использование заклинаний»
+   * чародея: все заклинания доступных кругов). Полем умения, а не блоком даров:
+   * мастер класса спрашивает, класть ли список целиком или выбрать из него
+   * самому, — лист, который так спросить не умеет, этого поля не читает.
+   * Уровень открытия группы — уровень КЛАССА.
+   */
+  grantedClassSpells?: FeatGrantedClassSpells[];
+  /**
+   * Активные эффекты умения: то, что меняет числа листа готовой формулой.
+   *
+   * Переносятся на актора, когда умение получено, — так же, как эффекты
+   * предыстории при её применении. Соседом описания, а не его частью: эффект
+   * живёт на акторе своей записью, и её видно на вкладке эффектов.
+   */
+  activeEffects?: ActiveEffect[];
+  /**
+   * Дары умения: владения, языки, защиты, чувства, выборы игрока, расширение
+   * списка заклинаний.
+   *
+   * Той же моделью, что у черты и предыстории ({@link FeatData}): набор даров у
+   * них общий, лист применяет их одним и тем же кодом, и своя модель для того
+   * же смысла означала бы второй разбор и второе применение.
+   *
+   * Заклинаний и ресурсов здесь не бывает: у умения класса они выведены своими
+   * полями — {@link ClassFeature.grantedSpells} и счётчиками класса, — и повтор
+   * выдал бы то же самое дважды.
+   */
+  featData?: FeatData;
 }
 
 // ── Подкласс ─────────────────────────────────────────────────
@@ -155,8 +411,10 @@ export interface SubclassDefinition {
   features: ClassFeature[];
   /** Дополнительные заклинания (для подклассов заклинателей) */
   bonusSpells?: Array<{ spellLevel: number; spells: string[] }>;
-  /** Ключ источника-книги из sources.json (напр. 'phb', 'dmg') */
+  /** Ключ источника-книги — аббревиатура в нижнем регистре (напр. 'phb', 'dmg') */
   sourceKey?: string;
+  /** Название источника, если его нет ни во встроенном справочнике, ни в паке */
+  source?: SourceDefinition;
   /**
    * Заклинательная конфигурация подкласса.
    * Используется для подклассов с собственной магией (например, Мистический рыцарь, Таинственный стрелок).
@@ -179,21 +437,36 @@ export interface SubclassDefinition {
    * Колонки таблицы прогрессии подкласса.
    * Используется совместно с levelTable.
    */
-  tableColumns?: Array<{
-    key?: string;
-    label: string;
-    children?: Array<{
-      key: string;
-      label: string;
-    }>;
-  }>;
+  tableColumns?: ClassTableColumnDefinition[];
   /** Счётчики подклассовых ресурсов (напр. кости превосходства) */
   counters?: ClassCounterDefinition[];
+  /** Активные эффекты подкласса; переносятся на актора при его выборе. */
+  activeEffects?: ActiveEffect[];
+  /** Дары подкласса той же моделью, что у черты; см. {@link ClassFeature.featData}. */
+  featData?: FeatData;
 }
 
 // ── Определение класса (SRD) ─────────────────────────────────
 
 /** Запись таблицы прогрессии класса (для каждого уровня 1-20) */
+/**
+ * Колонка таблицы прогрессии: ключ значения в строке уровня и подпись.
+ *
+ * Одним типом на класс и подкласс: форма у них общая, а две копии разошлись бы
+ * при первой же правке.
+ */
+export interface ClassTableColumnDefinition {
+  /** Ключ значения в строке {@link ClassLevelEntry} */
+  key?: string;
+  /** Человекочитаемое название колонки */
+  label: string;
+  /** Подколонки для группировки заголовков (Ячейки заклинаний → 1, 2, 3…) */
+  children?: Array<{
+    key: string;
+    label: string;
+  }>;
+}
+
 export interface ClassLevelEntry {
   /** Уровень (1-20) */
   level: number;
@@ -215,16 +488,11 @@ export interface ClassLevelEntry {
 
   /** Динамические колонки (например, cantripsKnown, sneakAttack, kiPoints) */
   [key: string]:
-    | string
-    | number
-    | boolean
-    | string[]
-    | Record<string, number>
-    | undefined;
+    string | number | boolean | string[] | Record<string, number> | undefined;
 }
 
 /**
- * Определение класса D&D 5e (PHB 2014)
+ * Определение класса D&D 5e (PHB 2024)
  *
  * Хранится в SRD JSON-файлах (srd/classes/fighter.json и т.д.).
  * Описывает все характеристики класса, не привязанные к конкретному актору.
@@ -248,20 +516,68 @@ export interface ClassDefinition {
   description?: string;
   /** Иконка для UI (формат: 'tabler:icon-name') */
   icon?: string;
-  /** Ключ источника-книги из sources.json (напр. 'phb', 'dmg') */
+  /** Ключ источника-книги — аббревиатура в нижнем регистре (напр. 'phb', 'dmg') */
   sourceKey?: string;
+  /** Название источника, если его нет ни во встроенном справочнике, ни в паке */
+  source?: SourceDefinition;
   /** Принадлежит ли классу к System Reference Document (SRD) */
   isSRD?: boolean;
+  /**
+   * `false` — запись вне SRD скачана без подписки TTG, и источник вырезал её
+   * эффекты (остальное на месте). У полных записей поля нет.
+   */
+  automation?: boolean;
+
+  /**
+   * Ключ родительского класса: запись — не самостоятельный класс, а его
+   * подкласс, заведённый отдельной записью (как подвид у вида: `parentKey`
+   * в `speciesTypes.ts`). Разбор такой записи — в `classLineage.ts`.
+   *
+   * Так на сайте TTG Club и устроены подклассы: `CharacterClass.parentUrl`.
+   * В компендиум подклассы приезжают свёрнутыми в {@link subclasses} родителя,
+   * поэтому поле заполняется только у записей, созданных в самом мире.
+   */
+  parentClassKey?: string;
+
+  /**
+   * Пак родительского класса. Один ключ родителя есть сразу в нескольких
+   * компендиумах (DEV и ПРОД, свой пак), и без пака подкласс липнул бы к
+   * первому попавшемуся. Пусто — родитель из любого пака (хоумбрю-подклассы,
+   * записанные до появления поля).
+   */
+  parentClassPackId?: string;
 
   // --- Базовая механика ---
   /** Кость хитов (d6/d8/d10/d12) */
   hitDie: HitDie;
 
+  /**
+   * Основные характеристики класса («Сила», «Харизма»). Определяют, что
+   * повышать в первую очередь, и требования мультиклассирования.
+   */
+  primaryAbilities?: AbilityType[];
+
+  /**
+   * Как читать список {@link primaryAbilities}, когда характеристик больше
+   * одной. Пусто — характеристика одна либо в источнике не указано.
+   */
+  primaryAbilitiesDelimiter?: AbilityDelimiter;
+
   // --- Владения ---
   /** Владения: доспехи */
   armorProficiencies: ArmorCategory[];
+  /**
+   * Уточнение владения доспехами свободным текстом («только щиты»). Категориями
+   * выразимо не всё, и на сайте у поля есть такая же приписка.
+   *
+   * Лист его показывает, но владением не выдаёт: разобрать произвольный текст в
+   * категорию нельзя, и угаданное владение было бы хуже показанного.
+   */
+  armorProficienciesCustom?: string;
   /** Владения: оружие (ключи baseType или 'simple'/'martial') */
   weaponProficiencies: string[];
+  /** Уточнение владения оружием свободным текстом; см. {@link armorProficienciesCustom} */
+  weaponProficienciesCustom?: string;
   /** Владения: инструменты */
   toolProficiencies?: string[];
   /** Владения: спасброски */
@@ -275,25 +591,10 @@ export interface ClassDefinition {
   };
 
   /** Начальное снаряжение. Массив вариантов выбора (А, Б, В). */
-  startingEquipment?: Array<{
-    /** Ключ варианта (напр. 'A', 'B', 'C') */
-    key: string;
-    /** Человекочитаемое описание списка предметов в этом варианте */
-    description: string;
-  }>;
+  startingEquipment?: ClassStartingEquipmentOption[];
 
   /** Настраиваемые дополнительные колонки для таблицы уровней (например: Скрытая атака, Второе дыхание) */
-  tableColumns?: Array<{
-    /** Ключ значения в массиве levelTable */
-    key?: string;
-    /** Человекочитаемое название колонки */
-    label: string;
-    /** Подколонки для группировки заголовков (например: Ячейки заклинаний -> 1, 2, 3...) */
-    children?: Array<{
-      key: string;
-      label: string;
-    }>;
-  }>;
+  tableColumns?: ClassTableColumnDefinition[];
 
   // --- Заклинательная способность ---
   /** Конфигурация заклинаний (null = нет заклинаний) */
@@ -333,6 +634,22 @@ export interface ClassDefinition {
    * хелпером {@link getMulticlassProficiencies}.
    */
   multiclassProficiencies?: MulticlassProficiencies;
+
+  /**
+   * Активные эффекты самого класса. Переносятся на актора при взятии первого
+   * уровня в классе и снимаются вместе с ним.
+   *
+   * Нужны тому, что даёт класс целиком и не привязано к одному умению, — а
+   * заодно держат класс в одном ряду с видом, предысторией, чертой и предметом:
+   * лист применяет эффект одинаково, откуда бы тот ни пришёл.
+   */
+  activeEffects?: ActiveEffect[];
+
+  /**
+   * Дары самого класса той же моделью, что у черты. Применяются при взятии
+   * первого уровня в классе; см. {@link ClassFeature.featData}.
+   */
+  featData?: FeatData;
 }
 
 // ── Класс на акторе ──────────────────────────────────────────
@@ -356,6 +673,13 @@ export interface HitPointGain {
 export interface ActorClassEntry {
   /** Ключ класса (из ClassDefinition.key) */
   classKey: string;
+  /**
+   * Компендиум, из которого взята запись класса (id пака). Ключ у копий одной
+   * записи в разных паках один и тот же, и без пака при повышении уровня класс
+   * брался бы из «первого попавшегося» пака, а не из выбранного. Пусто — запись
+   * сохранена до появления поля: ищется по одному ключу, как раньше.
+   */
+  packId?: string;
   /** Название класса (для отображения, если SRD недоступен) */
   className: string;
   /** Уровень в этом классе */
@@ -370,8 +694,31 @@ export interface ActorClassEntry {
   hitPointsGained: HitPointGain[];
   /** Выбранные навыки при получении класса */
   chosenSkills: SkillType[];
-  /** Выбранные варианты особенностей (featureKey → choiceKey) */
-  featureChoices: Record<string, string>;
+  /**
+   * Ключи инструментов, выданных классом при его получении. В определении
+   * класса инструменты записаны текстом, а на лист уходят ключи словаря,
+   * разобранные мастером, — без этой записи при удалении класса не узнать,
+   * какие инструменты его. У записей, сделанных до появления поля, его нет:
+   * их инструменты при удалении класса остаются на листе.
+   */
+  grantedTools?: string[];
+  /**
+   * Выбранные варианты умений: ключ умения → ключи взятых вариантов.
+   *
+   * Список, а не один ключ: из выбираемого списка берут столько вариантов,
+   * сколько назначено настройкой выбора, и число растёт по уровням — у колдуна
+   * к 18 уровню десять воззваний. Записи, сделанные до этого, хранят один ключ
+   * строкой; читать их полагается через {@link toFeatureChoiceKeys}.
+   */
+  featureChoices: Record<string, string[]>;
+  /**
+   * Ответы игрока на выборы самого класса, подкласса и их умений
+   * (`featData.choices`): ключ выбора → значения. «Гримуар монстров» — два типа
+   * существ под ключом `monster-manual`. По ним эффекты умений читают выбор
+   * токеном `@choice.<ключ>` (`effectChoiceBinding.ts`). У записей, сделанных
+   * до появления поля, его нет — выбор надо сделать заново.
+   */
+  choiceAnswers?: Record<string, string[]>;
   /** Характеристика заклинателя (копия из ClassDefinition.spellcasting.ability) */
   spellcastingAbility?: AbilityType;
   /** Тип заклинателя (копия из ClassDefinition.spellcasting.type) */
@@ -379,6 +726,317 @@ export interface ActorClassEntry {
 }
 
 // ── Утилиты ──────────────────────────────────────────────────
+
+/**
+ * Опознаёт ASI по ключу умения — запасной вариант для записей без флага
+ * {@link ClassFeature.abilityImprovement}: старые паки компендиума и классы,
+ * созданные до появления поля.
+ *
+ * @param featureKey - ключ умения
+ */
+export function isAsiFeatureKey(featureKey: string): boolean {
+  return featureKey.startsWith('asi-') || featureKey === 'epic-boon';
+}
+
+/**
+ * Повышает ли умение характеристики. Явный флаг важнее эвристики по ключу:
+ * на самописных и переведённых классах ключ произвольный, и шаг повышения по
+ * нему не находился.
+ *
+ * @param feature - умение класса или подкласса
+ */
+export function isAsiFeature(feature: ClassFeature): boolean {
+  return feature.abilityImprovement ?? isAsiFeatureKey(feature.key);
+}
+
+/** Ключ ступени роста умения: `<ключ умения>-<уровень>`. */
+const SCALING_FEATURE_KEY_PATTERN = /^(.+)-(\d+)$/;
+
+/**
+ * Ключ ступени роста умения. Вид ключа задан выгрузкой компендиума TTG Club
+ * (`VttgClassMapper.appendScaling`); формат и его разбор
+ * ({@link findScalingParentFeature}) живут рядом, чтобы не разойтись.
+ *
+ * @param featureKey - ключ самого умения
+ * @param level - уровень ступени
+ * @returns ключ отдельной записи ступени
+ */
+export function scalingFeatureKey(featureKey: string, level: number): string {
+  return `${featureKey}-${level}`;
+}
+
+/**
+ * Умение, ступенью роста которого является запись.
+ *
+ * Компендиум TTG Club разворачивает «рост по уровням» в отдельные умения с
+ * ключом `<ключ умения>-<уровень>`, оставляя им только название с описанием:
+ * флаги и механика живут у родителя. Без него ступень читается пустой строкой
+ * — а «Улучшение характеристик» на 8 уровне барда именно такая ступень.
+ *
+ * @param feature - умение записи
+ * @param features - все умения класса (с подклассами)
+ * @returns умение-родитель; `undefined` — запись не ступень
+ */
+export function findScalingParentFeature(
+  feature: ClassFeature,
+  features: ReadonlyArray<ClassFeature>,
+): ClassFeature | undefined {
+  const match = SCALING_FEATURE_KEY_PATTERN.exec(feature.key);
+
+  if (!match) {
+    return undefined;
+  }
+
+  const [, parentKey, levelText] = match;
+
+  // Уровень ключа обязан совпасть с уровнем записи: иначе умение с числом в
+  // собственном ключе («weapon-mastery-2») сочли бы ступенью чужого роста
+  if (Number(levelText) !== feature.level) {
+    return undefined;
+  }
+
+  const parent = features.find((entry) => entry.key === parentKey);
+
+  return parent === feature ? undefined : parent;
+}
+
+/**
+ * Повышает ли умение характеристики — с оглядкой на рост по уровням.
+ *
+ * Ступени роста приезжают из компендиума без флага родителя, и по одному
+ * умению их не отличить от обычной строки: бард на 8, 12 и 16 уровнях получал
+ * запись «Улучшение характеристик» и ни прибавки, ни черты.
+ *
+ * @param feature - умение класса или подкласса
+ * @param features - все умения класса (с подклассами)
+ * @returns `true` — на уровне этого умения игрок повышает характеристики
+ */
+export function isAsiFeatureInClass(
+  feature: ClassFeature,
+  features: ReadonlyArray<ClassFeature>,
+): boolean {
+  if (isAsiFeature(feature)) {
+    return true;
+  }
+
+  const parent = findScalingParentFeature(feature, features);
+
+  return parent ? isAsiFeature(parent) : false;
+}
+
+/**
+ * Варианты умения, открытые на уровне класса.
+ *
+ * Вариант с уровнем доступа выше спрашивать рано: у колдуна воззвания «для
+ * колдуна 5 уровня» лежат в том же списке, что и остальные, и на первом уровне
+ * игрок выбрал бы то, чего ещё не заслужил.
+ *
+ * @param feature - умение класса или подкласса
+ * @param classLevel - уровень класса, который берут сейчас
+ * @returns варианты уровня; `undefined` — у умения списка нет
+ */
+export function openClassFeatureChoices(
+  feature: Pick<ClassFeature, 'choices'>,
+  classLevel: number,
+): ClassFeatureChoice[] | undefined {
+  if (!feature.choices) {
+    return undefined;
+  }
+
+  return feature.choices.filter(
+    (choice) => !choice.requiredLevel || choice.requiredLevel <= classLevel,
+  );
+}
+
+/**
+ * Справочный ли список вариантов умения: варианты есть, а настройки выбора нет.
+ *
+ * Из справочного списка игрок ничего не берёт насовсем: «Мутирующая форма»
+ * друида круга мутации перечисляет 18 мутаций, и друид каждый раз получает
+ * любые из них за очки. Спрашивать «выберите одну» у такого списка — значит
+ * выдумать выбор, которого в правилах нет. Признак тот же, что у сайта и у
+ * выгрузки TTG Club: выбираемый список несёт настройку, справочный — нет.
+ *
+ * @param feature - умение класса или подкласса
+ * @returns `true` — варианты есть и из них не выбирают
+ */
+export function isReferenceClassFeatureChoices(
+  feature: Pick<ClassFeature, 'choices' | 'choiceConfig'>,
+): boolean {
+  return Boolean(feature.choices?.length) && !feature.choiceConfig;
+}
+
+/**
+ * Сколько вариантов умения выбрано ВСЕГО к уровню класса.
+ *
+ * Ступени {@link ClassFeatureChoiceConfig.progression} называют итог к своему
+ * уровню, а не прибавку: у колдуна одно воззвание с первого уровня и три со
+ * второго. Без настройки выбора список справочный
+ * ({@link isReferenceClassFeatureChoices}) и не спрашивает ничего: до 0.8.192
+ * такой список спрашивал один вариант, и мастер уровня требовал выбрать одну
+ * мутацию из списка, из которого по правилам не выбирают.
+ *
+ * @param feature - умение класса или подкласса
+ * @param classLevel - уровень класса
+ * @returns сколько вариантов выбрано всего; ноль — умения ещё нет либо список
+ *   справочный
+ */
+export function classFeatureChoiceTotalAt(
+  feature: ClassFeature,
+  classLevel: number,
+): number {
+  if (classLevel < feature.level || !feature.choices?.length) {
+    return 0;
+  }
+
+  const config = feature.choiceConfig;
+
+  if (!config) {
+    return 0;
+  }
+
+  let total = config.count ?? 1;
+  let reachedLevel = feature.level;
+
+  for (const [levelKey, count] of Object.entries(config.progression ?? {})) {
+    const level = Number(levelKey);
+
+    if (!Number.isFinite(level) || level > classLevel || level < reachedLevel) {
+      continue;
+    }
+
+    reachedLevel = level;
+    total = count;
+  }
+
+  return total;
+}
+
+/**
+ * Сколько НОВЫХ вариантов умения берут на этом уровне класса.
+ *
+ * Разница со ступенью прошлого уровня: у колдуна на втором уровне воззваний
+ * становится три при одном на первом — значит, спрашивают два новых.
+ *
+ * @param feature - умение класса или подкласса
+ * @param classLevel - уровень класса, который берут сейчас
+ * @returns сколько вариантов спросить; ноль — на этом уровне не спрашивают
+ */
+export function newClassFeatureChoicesAt(
+  feature: ClassFeature,
+  classLevel: number,
+): number {
+  return Math.max(
+    0,
+    classFeatureChoiceTotalAt(feature, classLevel)
+      - classFeatureChoiceTotalAt(feature, classLevel - 1),
+  );
+}
+
+/**
+ * Сколько вариантов берут из списка, строкой: «1» либо «1–10».
+ *
+ * Число выбранного растёт по уровням, и говорить о списке одним числом нельзя:
+ * у колдуна одно воззвание на первом уровне и десять к восемнадцатому. Формат
+ * общий у карточки класса и у формы — иначе один и тот же список читался бы в
+ * них по-разному.
+ *
+ * @param count - сколько берут на уровне самого умения
+ * @param totals - итоги ступеней роста (сколько выбрано ВСЕГО к их уровню)
+ * @returns подпись количества
+ */
+export function formatChoiceCountRange(
+  count: number | undefined,
+  totals: ReadonlyArray<number>,
+): string {
+  const start = count ?? totals[0] ?? 1;
+  const total = Math.max(start, ...totals);
+
+  return total > start ? `${start}–${total}` : `${start}`;
+}
+
+/**
+ * Ключи выбранных вариантов умения из записи класса на листе.
+ *
+ * Записи, сделанные до появления выбора нескольких вариантов, хранят один ключ
+ * строкой: их читают так же, иначе взятое раньше воззвание предложили бы снова.
+ *
+ * @param value - значение из `ActorClassEntry.featureChoices`
+ * @returns ключи выбранных вариантов
+ */
+export function toFeatureChoiceKeys(value: unknown): string[] {
+  if (typeof value === 'string') {
+    return [value];
+  }
+
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((key) => typeof key === 'string');
+}
+
+/**
+ * Проверяет, что значение — определение класса. Хватает дискриминанта: он и
+ * отличает запись класса от любой другой записи компендиума или предмета мира.
+ *
+ * @param value - произвольное значение (запись компендиума, предмет мира)
+ * @returns `true`, если значение является определением класса
+ */
+export function isClassDefinition(value: unknown): value is ClassDefinition {
+  return isRecord(value) && value.type === 'class';
+}
+
+/**
+ * Умения класса и всех его подклассов одним списком — по ним ищут умение по
+ * ключу из строки таблицы уровней.
+ *
+ * @param classDefinition - определение класса
+ */
+export function getAllClassFeatures(
+  classDefinition: ClassDefinition,
+): ClassFeature[] {
+  return [
+    ...classDefinition.features,
+    ...(classDefinition.subclasses ?? []).flatMap(
+      (subclass) => subclass.features,
+    ),
+  ];
+}
+
+/**
+ * Даёт ли класс повышение характеристик на этом уровне.
+ *
+ * Ключи строки таблицы уровней резолвятся в сами умения: флаг живёт на умении,
+ * а в таблице лежит только его ключ. Ключ, которому умения не нашлось, всё ещё
+ * проверяется эвристикой — в старых паках таблица ссылается на «asi-4» без
+ * отдельной записи умения.
+ *
+ * @param classDefinition - определение класса
+ * @param level - уровень класса
+ */
+export function hasAbilityImprovementAtLevel(
+  classDefinition: ClassDefinition,
+  level: number,
+): boolean {
+  const levelEntry = classDefinition.levelTable.find(
+    (row) => row.level === level,
+  );
+
+  if (!levelEntry) {
+    return false;
+  }
+
+  const features = getAllClassFeatures(classDefinition);
+
+  return levelEntry.featureKeys.some((key) => {
+    const feature = features.find((entry) => entry.key === key);
+
+    return feature
+      ? isAsiFeatureInClass(feature, features)
+      : isAsiFeatureKey(key);
+  });
+}
 
 /**
  * Вычисляет суммарный уровень персонажа из массива классов
@@ -392,6 +1050,30 @@ export function getTotalLevel(classes?: ActorClassEntry[]): number {
   }
 
   return classes.reduce((sum, entry) => sum + entry.level, 0);
+}
+
+/**
+ * Уровни персонажа по классам — «ключ класса → уровень в нём».
+ *
+ * Соседом {@link getTotalLevel}: суммарный уровень и уровни по классам читают
+ * одну и ту же запись, и собирать вторую карту где-то ещё значило бы завести
+ * второй ответ на тот же вопрос. Нужна везде, где формула считает по СВОЕМУ
+ * классу (токен `@classLevel`): контекст формул листа и подстановка в эффекты
+ * умений.
+ *
+ * @param classes - классы актора (может быть undefined/пустым)
+ * @returns карта уровней по ключам классов; пустая — классов нет
+ */
+export function getClassLevels(
+  classes?: ActorClassEntry[],
+): Map<string, number> {
+  const levels = new Map<string, number>();
+
+  for (const entry of classes ?? []) {
+    levels.set(entry.classKey, entry.level);
+  }
+
+  return levels;
 }
 
 /**
@@ -423,10 +1105,10 @@ export function calculateMaxHP(
   return Math.max(1, baseHP + constitutionMod * totalLevel);
 }
 
-// ── Мультикласс (PHB 2014) ───────────────────────────────────
+// ── Мультикласс (PHB 2024) ───────────────────────────────────
 
 /**
- * Владения, получаемые при мультиклассе (PHB 2014).
+ * Владения, получаемые при мультиклассе (PHB 2024).
  *
  * Когда персонаж берёт первый уровень нового класса (не первый класс),
  * он получает только этот сокращённый набор, а НЕ полные стартовые владения.
@@ -434,15 +1116,19 @@ export function calculateMaxHP(
 export interface MulticlassProficiencies {
   /** Владения доспехами */
   armor: ArmorCategory[];
+  /** Уточнение владения доспехами свободным текстом («только щиты») */
+  armorCustom?: string;
   /** Владения оружием (категории 'simple'/'martial' или конкретные ключи) */
   weapons: string[];
+  /** Уточнение владения оружием свободным текстом */
+  weaponsCustom?: string;
   /** Владения инструментами */
   tools: string[];
   /** Количество навыков, которые можно выбрать из списка класса */
   skillChoices: number;
 }
 
-/** Таблица мультиклассовых владений (PHB 2014, глава «Мультиклассирование») */
+/** Таблица мультиклассовых владений (PHB 2024, глава «Мультикласс») */
 export const MULTICLASS_PROFICIENCIES: Record<
   ClassKey,
   MulticlassProficiencies
@@ -524,23 +1210,112 @@ export function getMulticlassProficiencies(
   )?.[1];
 }
 
-/** Опции классов для UI-селектов (мультиселект владельцев заклинания) */
-export const CLASS_KEY_OPTIONS: { value: ClassKey; label: string }[] = [
-  { value: 'barbarian', label: 'Варвар' },
-  { value: 'bard', label: 'Бард' },
-  { value: 'cleric', label: 'Жрец' },
-  { value: 'druid', label: 'Друид' },
-  { value: 'fighter', label: 'Воин' },
-  { value: 'monk', label: 'Монах' },
-  { value: 'paladin', label: 'Паладин' },
-  { value: 'ranger', label: 'Следопыт' },
-  { value: 'rogue', label: 'Плут' },
-  { value: 'sorcerer', label: 'Чародей' },
-  { value: 'warlock', label: 'Колдун' },
-  { value: 'wizard', label: 'Волшебник' },
+/** Локализованные названия классов */
+export const CLASS_KEY_LABELS: Record<ClassKey, string> = {
+  barbarian: 'Варвар',
+  bard: 'Бард',
+  cleric: 'Жрец',
+  druid: 'Друид',
+  fighter: 'Воин',
+  monk: 'Монах',
+  paladin: 'Паладин',
+  ranger: 'Следопыт',
+  rogue: 'Плут',
+  sorcerer: 'Чародей',
+  warlock: 'Колдун',
+  wizard: 'Волшебник',
+};
+
+/** Ключи классов в порядке показа */
+export const CLASS_KEYS: readonly ClassKey[] = [
+  'barbarian',
+  'bard',
+  'cleric',
+  'druid',
+  'fighter',
+  'monk',
+  'paladin',
+  'ranger',
+  'rogue',
+  'sorcerer',
+  'warlock',
+  'wizard',
 ];
 
-/** Локализованные названия классов (производные от CLASS_KEY_OPTIONS) */
-export const CLASS_KEY_LABELS: Record<ClassKey, string> = Object.fromEntries(
-  CLASS_KEY_OPTIONS.map((option) => [option.value, option.label]),
-) as Record<ClassKey, string>;
+/** Опции классов для UI-селектов (мультиселект владельцев заклинания) */
+export const CLASS_KEY_OPTIONS: { value: ClassKey; label: string }[] =
+  CLASS_KEYS.map((value) => ({ value, label: CLASS_KEY_LABELS[value] }));
+
+/**
+ * Канонический ключ класса из ответа игрока или слага страницы: `wizard-phb` → `wizard`.
+ * Слаг сайта несёт суффикс источника, а заклинание помечено голым ключом.
+ *
+ * @param value - ключ, ответ игрока или слаг страницы класса
+ * @returns канонический ключ; `null` — такого класса в правилах нет
+ */
+export function classKeyFromUrl(value: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  return (
+    CLASS_KEYS.find(
+      (key) => normalized === key || normalized.startsWith(`${key}-`),
+    ) ?? null
+  );
+}
+
+/**
+ * Канонический ключ класса для сверки с записями компендиума.
+ *
+ * У класса, созданного или скопированного в мире, ключ свой
+ * (`warlock_1788179011727_flkgrq0`), а заклинания компендиума помечены голым
+ * ключом правил (`warlock`) — по своему ключу не нашлось бы ни одного, и список
+ * выбора заклинаний оставался бы пустым. Каноническим ключ становится по слагу,
+ * родительскому классу либо названию — русскому или английскому.
+ *
+ * `null` — класс самописный, канонического соответствия у него нет. Тогда пул
+ * не сужается вовсе: показать весь справочник лучше, чем пустой список.
+ *
+ * @param definition - определение класса (нужны ключ, родитель и названия)
+ * @returns канонический ключ класса; `null` — соответствия нет
+ */
+export function canonicalClassKey(
+  definition: Pick<
+    ClassDefinition,
+    'key' | 'name' | 'nameEn' | 'parentClassKey'
+  >,
+): string | null {
+  return (
+    classKeyFromUrl(definition.key)
+    ?? classKeyFromUrl(definition.parentClassKey)
+    ?? classKeyFromUrl(definition.nameEn)
+    ?? classKeyByName(definition.name)
+  );
+}
+
+/**
+ * Ключ класса по его названию: «Волшебник» → `wizard`.
+ *
+ * Нужен там, где класс назван словом, а не ключом: предыстория выдаёт черту
+ * «Посвящённый в магию (Волшебник)», и класс её списка приезжает только в этой
+ * скобке. Сверка нестрогая по регистру и пробелам — подписи в паках приходят с
+ * разным оформлением.
+ *
+ * @param name - название класса
+ * @returns ключ класса; `null` — такого класса в правилах нет
+ */
+export function classKeyByName(name: string | undefined): ClassKey | null {
+  const normalized = name?.trim().toLowerCase();
+
+  if (!normalized) {
+    return null;
+  }
+
+  return (
+    CLASS_KEYS.find((key) => CLASS_KEY_LABELS[key].toLowerCase() === normalized)
+    ?? null
+  );
+}

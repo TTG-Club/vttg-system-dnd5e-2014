@@ -1,15 +1,13 @@
 /**
- * Константы системы заклинаний D&D 5e (PHB 2014)
+ * Константы системы заклинаний D&D 5.5e (PHB 2024)
  *
  * Содержит локализованные лейблы школ магии, времени сотворения,
  * длительности, форм областей и утилиты маппинга.
  */
 
 import type {
-  MeasurementTemplateType,
   SpellAreaShape,
   SpellCastingTimeUnit,
-  SpellDeliveryType,
   SpellDurationUnit,
   SpellSaveType,
   SpellSchool,
@@ -18,82 +16,143 @@ import type {
 
 // ── Школы магии ──────────────────────────────────────────────
 
-/** Школы магии для UI-селектов */
-export const SPELL_SCHOOL_OPTIONS = [
-  { value: 'abjuration' as const, label: 'Ограждение' },
-  { value: 'conjuration' as const, label: 'Вызов' },
-  { value: 'divination' as const, label: 'Прорицание' },
-  { value: 'enchantment' as const, label: 'Очарование' },
-  { value: 'evocation' as const, label: 'Воплощение' },
-  { value: 'illusion' as const, label: 'Иллюзия' },
-  { value: 'necromancy' as const, label: 'Некромантия' },
-  { value: 'transmutation' as const, label: 'Преобразование' },
-] as const;
+/** Локализованные названия школ магии */
+export const SPELL_SCHOOL_LABELS: Record<SpellSchool, string> = {
+  abjuration: 'Ограждение',
+  conjuration: 'Вызов',
+  divination: 'Прорицание',
+  enchantment: 'Очарование',
+  evocation: 'Воплощение',
+  illusion: 'Иллюзия',
+  necromancy: 'Некромантия',
+  transmutation: 'Преобразование',
+};
 
-/** Локализованные названия школ магии (производные от SPELL_SCHOOL_OPTIONS) */
-export const SPELL_SCHOOL_LABELS: Record<SpellSchool, string> =
-  Object.fromEntries(
-    SPELL_SCHOOL_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellSchool, string>;
+/** Школы магии в порядке показа */
+export const SPELL_SCHOOL_KEYS: readonly SpellSchool[] = [
+  'abjuration',
+  'conjuration',
+  'divination',
+  'enchantment',
+  'evocation',
+  'illusion',
+  'necromancy',
+  'transmutation',
+];
+
+/** Школы магии для UI-селектов */
+export const SPELL_SCHOOL_OPTIONS: ReadonlyArray<{
+  value: SpellSchool;
+  label: string;
+}> = SPELL_SCHOOL_KEYS.map((value) => ({
+  value,
+  label: SPELL_SCHOOL_LABELS[value],
+}));
 
 // ── Время сотворения ─────────────────────────────────────────
 
-/** Единицы времени сотворения для UI-селектов */
-export const CASTING_TIME_OPTIONS = [
-  { value: 'action' as const, label: 'Действие' },
-  { value: 'bonus-action' as const, label: 'Бонусное действие' },
-  {
-    value: 'bonus-action-after-hit' as const,
-    label:
-      'Бонусное действие, которое вы совершаете сразу после попадания по существу рукопашным оружием или безоружным ударом.',
-  },
-  { value: 'reaction' as const, label: 'Реакция' },
-  { value: 'minute' as const, label: 'Минута' },
-  { value: 'hour' as const, label: 'Час' },
-] as const;
+/** Локализованные названия единиц времени сотворения */
+export const CASTING_TIME_LABELS: Record<SpellCastingTimeUnit, string> = {
+  'action': 'Действие',
+  'bonus-action': 'Бонусное действие',
+  'bonus-action-after-hit':
+    'Бонусное действие, которое вы совершаете сразу после попадания по существу рукопашным оружием или безоружным ударом.',
+  'reaction': 'Реакция',
+  'minute': 'Минута',
+  'hour': 'Час',
+};
 
-/** Локализованные названия единиц времени сотворения (производные от CASTING_TIME_OPTIONS) */
-export const CASTING_TIME_LABELS: Record<SpellCastingTimeUnit, string> =
-  Object.fromEntries(
-    CASTING_TIME_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellCastingTimeUnit, string>;
+/** Единицы времени сотворения в порядке показа */
+const CASTING_TIME_KEYS: readonly SpellCastingTimeUnit[] = [
+  'action',
+  'bonus-action',
+  'bonus-action-after-hit',
+  'reaction',
+  'minute',
+  'hour',
+];
+
+/**
+ * «Ритуал» в фильтре времени накладывания у выбора заклинания черты.
+ *
+ * Не единица времени, а признак самого заклинания ({@link Spell.ritual}): «Ритуальный
+ * заклинатель» берёт только ритуалы. Ключ живёт рядом с единицами времени, потому что
+ * стоит в том же поле фильтра и разбирается вместе с ними.
+ */
+export const RITUAL_CASTING_TIME = 'ritual';
+
+/** Единицы времени сотворения для UI-селектов */
+export const CASTING_TIME_OPTIONS: ReadonlyArray<{
+  value: SpellCastingTimeUnit;
+  label: string;
+}> = CASTING_TIME_KEYS.map((value) => ({
+  value,
+  label: CASTING_TIME_LABELS[value],
+}));
 
 // ── Длительность ─────────────────────────────────────────────
 
-/** Единицы длительности для UI-селектов */
-export const DURATION_UNIT_OPTIONS = [
-  { value: 'instantaneous' as const, label: 'Мгновенное' },
-  { value: 'round' as const, label: 'Раунд' },
-  { value: 'minute' as const, label: 'Минута' },
-  { value: 'hour' as const, label: 'Час' },
-  { value: 'day' as const, label: 'День' },
-  { value: 'special' as const, label: 'Особая' },
-  { value: 'until-dispelled' as const, label: 'Пока не рассеется' },
-] as const;
+/** Локализованные названия единиц длительности */
+export const DURATION_UNIT_LABELS: Record<SpellDurationUnit, string> = {
+  'instantaneous': 'Мгновенное',
+  'round': 'Раунд',
+  'minute': 'Минута',
+  'hour': 'Час',
+  'day': 'День',
+  'special': 'Особая',
+  'until-dispelled': 'Пока не рассеется',
+};
 
-/** Локализованные названия единиц длительности (производные от DURATION_UNIT_OPTIONS) */
-export const DURATION_UNIT_LABELS: Record<SpellDurationUnit, string> =
-  Object.fromEntries(
-    DURATION_UNIT_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellDurationUnit, string>;
+/** Единицы длительности в порядке показа */
+const DURATION_UNIT_KEYS: readonly SpellDurationUnit[] = [
+  'instantaneous',
+  'round',
+  'minute',
+  'hour',
+  'day',
+  'special',
+  'until-dispelled',
+];
+
+/** Единицы длительности для UI-селектов */
+export const DURATION_UNIT_OPTIONS: ReadonlyArray<{
+  value: SpellDurationUnit;
+  label: string;
+}> = DURATION_UNIT_KEYS.map((value) => ({
+  value,
+  label: DURATION_UNIT_LABELS[value],
+}));
 
 // ── Тип цели ─────────────────────────────────────────────────
 
-/** Типы целей для UI-селектов */
-export const TARGET_TYPE_OPTIONS = [
-  { value: 'creature' as const, label: 'Существо' },
-  { value: 'object' as const, label: 'Предмет' },
-  { value: 'point' as const, label: 'Точка' },
-  { value: 'self' as const, label: 'На себя' },
-  { value: 'area' as const, label: 'Область' },
-  { value: 'none' as const, label: 'Нет цели' },
-] as const;
+/** Локализованные названия типов целей */
+export const TARGET_TYPE_LABELS: Record<SpellTargetType, string> = {
+  creature: 'Существо',
+  object: 'Предмет',
+  point: 'Точка',
+  self: 'На себя',
+  area: 'Область',
+  none: 'Нет цели',
+};
 
-/** Локализованные названия типов целей (производные от TARGET_TYPE_OPTIONS) */
-export const TARGET_TYPE_LABELS: Record<SpellTargetType, string> =
-  Object.fromEntries(
-    TARGET_TYPE_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellTargetType, string>;
+/** Типы целей в порядке показа */
+const TARGET_TYPE_KEYS: readonly SpellTargetType[] = [
+  'creature',
+  'object',
+  'point',
+  'self',
+  'area',
+  'none',
+];
+
+/** Типы целей для UI-селектов */
+export const TARGET_TYPE_OPTIONS: ReadonlyArray<{
+  value: SpellTargetType;
+  label: string;
+}> = TARGET_TYPE_KEYS.map((value) => ({
+  value,
+  label: TARGET_TYPE_LABELS[value],
+}));
 
 // ── Распределение снарядов по целям ──────────────────────────
 
@@ -122,20 +181,32 @@ export const PROJECTILE_DISTRIBUTION_OPTIONS = [
 
 // ── Форма области ────────────────────────────────────────────
 
-/** Формы областей для UI-селектов */
-export const AREA_SHAPE_OPTIONS = [
-  { value: 'cone' as const, label: 'Конус' },
-  { value: 'circle' as const, label: 'Сфера' },
-  { value: 'ray' as const, label: 'Линия' },
-  { value: 'rect' as const, label: 'Куб' },
-  { value: 'cylinder' as const, label: 'Цилиндр' },
-] as const;
+/** Локализованные названия форм областей */
+export const AREA_SHAPE_LABELS: Record<SpellAreaShape, string> = {
+  cone: 'Конус',
+  circle: 'Сфера',
+  ray: 'Линия',
+  rect: 'Куб',
+  cylinder: 'Цилиндр',
+};
 
-/** Локализованные названия форм областей (производные от AREA_SHAPE_OPTIONS) */
-export const AREA_SHAPE_LABELS: Record<SpellAreaShape, string> =
-  Object.fromEntries(
-    AREA_SHAPE_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellAreaShape, string>;
+/** Формы областей в порядке показа */
+const AREA_SHAPE_KEYS: readonly SpellAreaShape[] = [
+  'cone',
+  'circle',
+  'ray',
+  'rect',
+  'cylinder',
+];
+
+/** Формы областей для UI-селектов */
+export const AREA_SHAPE_OPTIONS: ReadonlyArray<{
+  value: SpellAreaShape;
+  label: string;
+}> = AREA_SHAPE_KEYS.map((value) => ({
+  value,
+  label: AREA_SHAPE_LABELS[value],
+}));
 
 /** Формы области, размер которых задаётся радиусом (круг, цилиндр) */
 const RADIUS_AREA_SHAPES: ReadonlySet<SpellAreaShape> = new Set([
@@ -188,22 +259,36 @@ export function areaShapeUsesHeight(shape: SpellAreaShape): boolean {
 
 // ── Спасбросок ───────────────────────────────────────────────
 
-/** Типы спасбросков для UI-селектов */
-export const SAVE_TYPE_OPTIONS = [
-  { value: 'none' as const, label: 'Нет' },
-  { value: 'strength' as const, label: 'Сила' },
-  { value: 'dexterity' as const, label: 'Ловкость' },
-  { value: 'constitution' as const, label: 'Телосложение' },
-  { value: 'intelligence' as const, label: 'Интеллект' },
-  { value: 'wisdom' as const, label: 'Мудрость' },
-  { value: 'charisma' as const, label: 'Харизма' },
-] as const;
+/** Локализованные названия типов спасбросков */
+export const SAVE_TYPE_LABELS: Record<SpellSaveType, string> = {
+  none: 'Нет',
+  strength: 'Сила',
+  dexterity: 'Ловкость',
+  constitution: 'Телосложение',
+  intelligence: 'Интеллект',
+  wisdom: 'Мудрость',
+  charisma: 'Харизма',
+};
 
-/** Локализованные названия типов спасбросков (производные от SAVE_TYPE_OPTIONS) */
-export const SAVE_TYPE_LABELS: Record<SpellSaveType, string> =
-  Object.fromEntries(
-    SAVE_TYPE_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellSaveType, string>;
+/** Типы спасбросков в порядке показа */
+const SAVE_TYPE_KEYS: readonly SpellSaveType[] = [
+  'none',
+  'strength',
+  'dexterity',
+  'constitution',
+  'intelligence',
+  'wisdom',
+  'charisma',
+];
+
+/** Типы спасбросков для UI-селектов */
+export const SAVE_TYPE_OPTIONS: ReadonlyArray<{
+  value: SpellSaveType;
+  label: string;
+}> = SAVE_TYPE_KEYS.map((value) => ({
+  value,
+  label: SAVE_TYPE_LABELS[value],
+}));
 
 // ── Тип совершения ───────────────────────────────────────────
 
@@ -217,13 +302,13 @@ export const DELIVERY_TYPE_OPTIONS = [
   { value: 'none' as const, label: 'Нет' },
 ] as const;
 
-/** Локализованные названия типов совершения (производные от DELIVERY_TYPE_OPTIONS) */
-export const DELIVERY_TYPE_LABELS: Record<SpellDeliveryType, string> =
-  Object.fromEntries(
-    DELIVERY_TYPE_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellDeliveryType, string>;
-
 // ── Круги заклинаний ─────────────────────────────────────────
+
+/**
+ * Круг заговора. Заговоры не занимают ячеек и не требуют подготовки — проверка
+ * «это заговор» встречается всюду, где считаются ячейки и подготовка.
+ */
+export const CANTRIP_SPELL_LEVEL = 0;
 
 /** Круги заклинаний для UI-селектов */
 export const SPELL_LEVEL_OPTIONS = [
@@ -253,19 +338,6 @@ export const SAVE_EFFECT_OPTIONS = [
 
 // ── Маппинг форм на шаблоны ─────────────────────────────────
 
-/**
- * Возвращает тип MeasurementTemplate для формы области заклинания.
- * Поскольку SpellAreaShape === MeasurementTemplateType, это identity-функция.
- *
- * @param shape - форма области заклинания
- * @returns тип шаблона измерения
- */
-export function getSpellTemplateType(
-  shape: SpellAreaShape,
-): MeasurementTemplateType {
-  return shape;
-}
-
 /** Цвета шаблонов по типу урона заклинания */
 export const SPELL_DAMAGE_TEMPLATE_COLORS: Record<string, number> = {
   fire: 0xff4400,
@@ -285,3 +357,17 @@ export const SPELL_DAMAGE_TEMPLATE_COLORS: Record<string, number> = {
 
 /** Цвет шаблона по умолчанию (если тип урона неизвестен) */
 export const SPELL_TEMPLATE_DEFAULT_COLOR = 0x6644ff;
+
+/**
+ * Цвет шаблона области по типу урона; для неизвестного или отсутствующего
+ * типа — {@link SPELL_TEMPLATE_DEFAULT_COLOR}.
+ *
+ * @param damageType - ключ типа урона
+ * @returns цвет шаблона (0xRRGGBB)
+ */
+export function getDamageTemplateColor(damageType: string | undefined): number {
+  return (
+    SPELL_DAMAGE_TEMPLATE_COLORS[damageType ?? '']
+    ?? SPELL_TEMPLATE_DEFAULT_COLOR
+  );
+}

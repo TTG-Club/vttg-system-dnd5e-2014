@@ -1,24 +1,32 @@
 /**
- * Таблицы ячеек заклинаний D&D 5e (PHB 2014)
+ * Таблицы ячеек заклинаний D&D 5e (PHB 2024)
  *
  * Каждая таблица: уровень класса → массив ячеек [1-9 круг].
  * Индекс массива: 0 = 1-й круг, 8 = 9-й круг.
  */
 
 import type { ActorClassEntry, CasterType } from './classTypes.js';
+import type { DnDCustomBonusContext } from './customBonuses.js';
+import type { DnDActor } from './dndEntities.js';
+import type { DnDSpellSlotSettings } from './types.js';
 
-/**
- * Минимальная структура данных актора, необходимая для расчёта ячеек заклинаний.
- *
- * Используется вместо `any` для типобезопасных утилит spell slot.
- */
-export interface SpellSlotActorData {
-  system?: {
-    classes?: ActorClassEntry[];
-    spellSlotsUsed?: number[];
-    pactSlotsUsed?: number;
-  };
-}
+import { isRecord } from '@vtt/shared';
+
+import {
+  getActorAbilityModifiers,
+  getActorProficiencyBonus,
+} from './calculations.js';
+import {
+  getCustomBonusesValue,
+  parseCustomBonuses,
+  toStoredCustomBonus,
+} from './customBonuses.js';
+
+/** Наименьший круг ячейки заклинания */
+export const MIN_SPELL_SLOT_LEVEL = 1;
+
+/** Наибольший круг ячейки заклинания */
+export const MAX_SPELL_SLOT_LEVEL = 9;
 
 /** Количество ячеек заклинаний по кругам (индекс 0 = 1-й круг) */
 export type SpellSlotArray = [
@@ -35,8 +43,46 @@ export type SpellSlotArray = [
 
 // ── Полный заклинатель (Волшебник, Жрец, Друид, Бард, Колдун-Чародей) ──
 
-/** Таблица ячеек для полного заклинателя (PHB 2014) */
+/** Таблица ячеек для полного заклинателя (PHB 2024) */
 export const FULL_CASTER_SLOTS: Record<number, SpellSlotArray> = {
+  1: [2, 0, 0, 0, 0, 0, 0, 0, 0],
+  2: [3, 0, 0, 0, 0, 0, 0, 0, 0],
+  3: [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  4: [4, 3, 0, 0, 0, 0, 0, 0, 0],
+  5: [4, 3, 2, 0, 0, 0, 0, 0, 0],
+  6: [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  7: [4, 3, 3, 1, 0, 0, 0, 0, 0],
+  8: [4, 3, 3, 2, 0, 0, 0, 0, 0],
+  9: [4, 3, 3, 3, 1, 0, 0, 0, 0],
+  10: [4, 3, 3, 3, 2, 0, 0, 0, 0],
+  11: [4, 3, 3, 3, 2, 1, 0, 0, 0],
+  12: [4, 3, 3, 3, 2, 1, 0, 0, 0],
+  13: [4, 3, 3, 3, 2, 1, 1, 0, 0],
+  14: [4, 3, 3, 3, 2, 1, 1, 0, 0],
+  15: [4, 3, 3, 3, 2, 1, 1, 1, 0],
+  16: [4, 3, 3, 3, 2, 1, 1, 1, 0],
+  17: [4, 3, 3, 3, 2, 1, 1, 1, 1],
+  18: [4, 3, 3, 3, 3, 1, 1, 1, 1],
+  19: [4, 3, 3, 3, 3, 2, 1, 1, 1],
+  20: [4, 3, 3, 3, 3, 2, 2, 1, 1],
+};
+
+// ── Мультиклассовый заклинатель ──
+
+/**
+ * Таблица ячеек мультиклассового заклинателя (PHB 2024).
+ *
+ * У мультикласса ячейки не складываются по классам, а сводятся в ОДИН общий
+ * запас: по классам считается уровень заклинателя
+ * ({@link getMulticlassCasterLevel}), и уже он даёт строку этой таблицы. Так
+ * волшебник 3 / жрец 3 колдует не как два третьеуровневых заклинателя, а как
+ * один шестого — с ячейками 3 круга.
+ *
+ * Числа совпадают с таблицей полного заклинателя, но таблица отдельная: в книге
+ * это разные таблицы с разным смыслом, и правка одной не должна молча менять
+ * другую.
+ */
+export const MULTICLASS_CASTER_SLOTS: Record<number, SpellSlotArray> = {
   1: [2, 0, 0, 0, 0, 0, 0, 0, 0],
   2: [3, 0, 0, 0, 0, 0, 0, 0, 0],
   3: [4, 2, 0, 0, 0, 0, 0, 0, 0],
@@ -61,9 +107,15 @@ export const FULL_CASTER_SLOTS: Record<number, SpellSlotArray> = {
 
 // ── Половинный заклинатель (Паладин, Рейнджер) ──
 
-/** Таблица ячеек для половинного заклинателя (PHB 2014) */
+/**
+ * Таблица ячеек для половинного заклинателя (PHB 2024).
+ *
+ * С первого уровня, а не со второго: в редакции 2024 паладин и следопыт
+ * получают «Использование заклинаний» сразу — их таблицы дают на 1 уровне две
+ * ячейки 1 круга и два подготовленных заклинания.
+ */
 export const HALF_CASTER_SLOTS: Record<number, SpellSlotArray> = {
-  1: [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  1: [2, 0, 0, 0, 0, 0, 0, 0, 0],
   2: [2, 0, 0, 0, 0, 0, 0, 0, 0],
   3: [3, 0, 0, 0, 0, 0, 0, 0, 0],
   4: [3, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -87,7 +139,7 @@ export const HALF_CASTER_SLOTS: Record<number, SpellSlotArray> = {
 
 // ── Третичный заклинатель (Мистический ловкач, Волшебный рыцарь) ──
 
-/** Таблица ячеек для третичного заклинателя (PHB 2014) */
+/** Таблица ячеек для третичного заклинателя (PHB 2024) */
 export const THIRD_CASTER_SLOTS: Record<number, SpellSlotArray> = {
   1: [0, 0, 0, 0, 0, 0, 0, 0, 0],
   2: [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -140,16 +192,61 @@ export const PACT_SLOTS: Record<number, { count: number; level: number }> = {
 /** Пустой массив ячеек (нет заклинаний) */
 const EMPTY_SLOTS: SpellSlotArray = [0, 0, 0, 0, 0, 0, 0, 0, 0];
 
+/**
+ * Свежая копия набора ячеек. Копия обязательна: строки таблиц — общие
+ * константы, и правка ячеек одного листа разошлась бы по всем остальным.
+ *
+ * Копируется поэлементно, а не спредом: спред отдаёт `number[]` без длины,
+ * и набор из девяти кругов пришлось бы объявлять приведением типа.
+ *
+ * @param slots - строка таблицы ячеек
+ * @returns независимая копия набора ячеек
+ */
+function copySlots(slots: SpellSlotArray): SpellSlotArray {
+  return [
+    slots[0],
+    slots[1],
+    slots[2],
+    slots[3],
+    slots[4],
+    slots[5],
+    slots[6],
+    slots[7],
+    slots[8],
+  ];
+}
+
 // ── Маппинг тип заклинателя → таблица ──
 
-/** Коэффициент для расчёта caster level при мультиклассе */
-const CASTER_LEVEL_MULTIPLIER: Record<CasterType, number> = {
-  full: 1,
-  half: 0.5,
-  third: 1 / 3,
-  pact: 0,
-  none: 0,
-};
+/**
+ * Вклад класса в уровень заклинателя мультикласса (правила D&D 2024).
+ *
+ * Округление у половинных и треть-заклинателей РАЗНОЕ, и это не описка: так
+ * ложатся таблицы прогрессии 2024. Паладин 5 идёт за заклинателя 3 (его
+ * собственная таблица даёт 4/2 ячейки — ровно строка 3 общей таблицы), а
+ * мистический ловкач 5 — за заклинателя 1.
+ *
+ * Колдун в счёт не идёт: его Магия договора существует отдельно от общих ячеек.
+ *
+ * @param casterType - тип заклинателя класса
+ * @param level - уровень в этом классе
+ * @returns вклад в уровень заклинателя мультикласса
+ */
+function getCasterLevelContribution(
+  casterType: CasterType,
+  level: number,
+): number {
+  switch (casterType) {
+    case 'full':
+      return level;
+    case 'half':
+      return Math.ceil(level / 2);
+    case 'third':
+      return Math.floor(level / 3);
+    default:
+      return 0;
+  }
+}
 
 /**
  * Получает таблицу ячеек по типу заклинателя
@@ -187,20 +284,20 @@ export function getSpellSlots(
   const table = getSlotTable(casterType);
 
   if (!table) {
-    return [...EMPTY_SLOTS] as SpellSlotArray;
+    return copySlots(EMPTY_SLOTS);
   }
 
   const clampedLevel = Math.max(1, Math.min(20, classLevel));
 
-  return [...(table[clampedLevel] ?? EMPTY_SLOTS)] as SpellSlotArray;
+  return copySlots(table[clampedLevel] ?? EMPTY_SLOTS);
 }
 
 /**
- * Вычисляет caster level для мультикласса
+ * Вычисляет caster level для мультикласса (правила D&D 2024).
  *
- * Full = ×1, Half = ×0.5 (округление вниз), Third = ×1/3 (округление вниз).
- * Pact magic не участвует в мультиклассовом расчёте.
- *
+ * Полный заклинатель отдаёт весь свой уровень, половинный — половину с
+ * округлением ВВЕРХ, треть-заклинатель — треть с округлением ВНИЗ. Магия
+ * договора колдуна в счёт не идёт: её ячейки считаются отдельно.
  *
  * @param classes - массив классов актора
  * @param casterTypeMap - карта определений классов (key → CasterType)
@@ -214,19 +311,22 @@ export function getMulticlassCasterLevel(
 
   for (const entry of classes) {
     const casterType = casterTypeMap.get(entry.classKey) ?? 'none';
-    const multiplier = CASTER_LEVEL_MULTIPLIER[casterType];
 
-    casterLevel += Math.floor(entry.level * multiplier);
+    casterLevel += getCasterLevelContribution(casterType, entry.level);
   }
 
   return casterLevel;
 }
 
 /**
- * Вычисляет итоговые ячейки заклинаний для персонажа
+ * Вычисляет итоговые ячейки заклинаний для персонажа.
  *
- * Для одноклассового — берёт таблицу класса напрямую.
- * Для мультикласса — складывает caster levels и использует таблицу полного заклинателя.
+ * Один класс — своя таблица класса. Мультикласс — ОДИН общий запас: ячейки
+ * классов не складываются построчно, вместо этого по классам считается уровень
+ * заклинателя и по нему берётся строка {@link MULTICLASS_CASTER_SLOTS}.
+ *
+ * Ячейки договора колдуна сюда не входят — они считаются отдельно
+ * ({@link PACT_SLOTS}) и восстанавливаются коротким отдыхом.
  *
  * @param classes - массив классов актора
  * @param casterTypeMap - карта classKey → CasterType
@@ -237,7 +337,7 @@ export function computeSpellSlots(
   casterTypeMap: Map<string, CasterType>,
 ): SpellSlotArray {
   if (classes.length === 0) {
-    return [...EMPTY_SLOTS] as SpellSlotArray;
+    return copySlots(EMPTY_SLOTS);
   }
 
   // Одноклассовый — используем таблицу конкретного типа
@@ -247,23 +347,213 @@ export function computeSpellSlots(
     return getSpellSlots(casterType, classes[0].level);
   }
 
-  // Мультикласс — caster level через общую таблицу полного заклинателя
+  // Мультикласс — один общий запас по таблице мультиклассового заклинателя
   const casterLevel = getMulticlassCasterLevel(classes, casterTypeMap);
 
   if (casterLevel === 0) {
-    return [...EMPTY_SLOTS] as SpellSlotArray;
+    return copySlots(EMPTY_SLOTS);
   }
 
-  return [...(FULL_CASTER_SLOTS[casterLevel] ?? EMPTY_SLOTS)] as SpellSlotArray;
+  return copySlots(MULTICLASS_CASTER_SLOTS[casterLevel] ?? EMPTY_SLOTS);
+}
+
+/**
+ * Карта «ключ класса → тип заклинателя» для расчёта ячеек. Класс без типа в
+ * карту не попадает — таблицы считают его незаклинателем.
+ *
+ * @param classes - классы листа
+ * @returns карта типов заклинателя по ключу класса
+ */
+export function buildCasterTypeMap(
+  classes: readonly ActorClassEntry[],
+): Map<string, CasterType> {
+  const casterTypeMap = new Map<string, CasterType>();
+
+  for (const entry of classes) {
+    if (entry.casterType) {
+      casterTypeMap.set(entry.classKey, entry.casterType);
+    }
+  }
+
+  return casterTypeMap;
+}
+
+/**
+ * Разбирает свои бонусы к ячейкам из записи актёра. Список всегда из девяти
+ * кругов: мир мог прийти импортом руками, и короткий список сдвинул бы круги.
+ *
+ * @param value - поле `spellSlotSettings`; нет — бонусов нет
+ * @returns бонусы по девяти кругам
+ */
+export function parseSpellSlotSettings(value: unknown): DnDSpellSlotSettings {
+  const stored =
+    isRecord(value) && Array.isArray(value.levels) ? value.levels : [];
+
+  return {
+    levels: Array.from({ length: MAX_SPELL_SLOT_LEVEL }, (_unused, index) =>
+      parseCustomBonuses(stored[index]),
+    ),
+  };
+}
+
+/**
+ * Выправляет бонусы перед записью в актёра: числа приходят из полей окна.
+ *
+ * @param settings - бонусы из окна
+ * @returns бонусы с числами в допустимых границах
+ */
+export function toStoredSpellSlotSettings(
+  settings: DnDSpellSlotSettings,
+): DnDSpellSlotSettings {
+  return {
+    levels: settings.levels.map((bonuses) => bonuses.map(toStoredCustomBonus)),
+  };
+}
+
+/**
+ * Числа листа, от которых считаются свои бонусы к ячейкам, — по записи листа.
+ * Вкладка передаёт свои числа с учётом эффектов; здесь запасной путь для
+ * проверок, у которых итоговых статов под рукой нет.
+ *
+ * @param actor - лист персонажа
+ * @returns модификаторы характеристик и бонус мастерства
+ */
+function getSpellSlotBonusContext(actor: DnDActor): DnDCustomBonusContext {
+  return {
+    abilityMods: getActorAbilityModifiers(actor),
+    proficiencyBonus: getActorProficiencyBonus(actor),
+  };
+}
+
+/**
+ * Накладывает свои бонусы на ячейки классов. Итог круга не опускается ниже
+ * нуля: отрицательный бонус убирает ячейки класса, но не больше, чем есть.
+ *
+ * @param classSlots - ячейки по таблицам классов
+ * @param settings - бонусы листа как есть в записи
+ * @param context - числа листа, от которых считаются бонусы
+ * @returns ячейки с бонусами
+ */
+export function applySpellSlotSettings(
+  classSlots: SpellSlotArray,
+  settings: unknown,
+  context: DnDCustomBonusContext,
+): SpellSlotArray {
+  const { levels } = parseSpellSlotSettings(settings);
+  const slots = copySlots(classSlots);
+
+  levels.forEach((bonuses, index) => {
+    slots[index] = Math.max(
+      0,
+      slots[index] + getCustomBonusesValue(context, bonuses),
+    );
+  });
+
+  return slots;
+}
+
+/**
+ * Ячейки листа: таблицы классов и свои бонусы поверх. Этим числом живут
+ * пузырьки вкладки, выбор круга при касте и проверка «ячейка есть».
+ *
+ * @param actor - лист персонажа
+ * @param context - числа листа для бонусов; нет — считаются по записи листа
+ * @returns итоговые ячейки [1-9 круг]
+ */
+export function computeActorSpellSlots(
+  actor: DnDActor,
+  context?: DnDCustomBonusContext,
+): SpellSlotArray {
+  const classes = actor.system?.classes ?? [];
+
+  return applySpellSlotSettings(
+    computeSpellSlots(classes, buildCasterTypeMap(classes)),
+    actor.system?.spellSlotSettings,
+    context ?? getSpellSlotBonusContext(actor),
+  );
+}
+
+/**
+ * Проверяет, осталась ли у персонажа ячейка выбранного круга и вида. Ячейка
+ * договора подходит только своему кругу; обычная считается по таблице классов.
+ *
+ * @param actor - лист персонажа с классами и расходом ячеек
+ * @param castLevel - круг ячейки (1–9)
+ * @param isPactSlot - тратится ячейка договора колдуна
+ * @param context - числа листа для своих бонусов к ячейкам; нет — по записи
+ * @returns true — ячейка есть
+ */
+export function hasAvailableSpellSlot(
+  actor: DnDActor,
+  castLevel: number,
+  isPactSlot: boolean,
+  context?: DnDCustomBonusContext,
+): boolean {
+  const classes = actor.system?.classes ?? [];
+
+  if (isPactSlot) {
+    const pactInfo = getPactSlotInfo(classes);
+
+    return (
+      castLevel === pactInfo.level
+      && (actor.system?.pactSlotsUsed ?? 0) < pactInfo.max
+    );
+  }
+
+  const maxSlots = computeActorSpellSlots(actor, context);
+  const slotIndex = castLevel - 1;
+
+  return (
+    (actor.system?.spellSlotsUsed?.[slotIndex] ?? 0)
+    < (maxSlots[slotIndex] ?? 0)
+  );
+}
+
+/**
+ * Наибольший круг, который персонаж способен наложить.
+ *
+ * Ячейки договора колдуна учитываются наравне с обычными: заклинание шестого круга
+ * колдун 11 уровня накладывает, пусть и своей ячейкой.
+ *
+ * @param actor - лист персонажа
+ * @param context - числа листа для своих бонусов к ячейкам; нет — по записи
+ * @returns наибольший доступный круг; 0 — ячеек нет, доступны только заговоры
+ */
+export function getMaxSpellSlotLevel(
+  actor: DnDActor,
+  context?: DnDCustomBonusContext,
+): number {
+  const classes = actor.system?.classes ?? [];
+  const slots = computeActorSpellSlots(actor, context);
+
+  let maxLevel = 0;
+
+  slots.forEach((count, index) => {
+    if (count > 0) {
+      maxLevel = index + 1;
+    }
+  });
+
+  const pactClass = classes.find((entry) => entry.casterType === 'pact');
+  const pactInfo = pactClass ? PACT_SLOTS[pactClass.level] : undefined;
+
+  return pactInfo && pactInfo.level > maxLevel ? pactInfo.level : maxLevel;
 }
 
 /**
  * Получает список доступных кругов заклинаний для актора, начиная с `minLevel`.
+ *
+ * @param actor - лист персонажа
+ * @param minLevel - наименьший круг заклинания
+ * @param maxAvailableLevel - наибольший круг для листа без ячеек
+ * @param context - числа листа для своих бонусов к ячейкам; нет — по записи
+ * @returns доступные круги по возрастанию
  */
 export function getAvailableSpellLevels(
-  actor: SpellSlotActorData,
+  actor: DnDActor,
   minLevel: number,
   maxAvailableLevel: number = 9,
+  context?: DnDCustomBonusContext,
 ): number[] {
   if (minLevel <= 0) {
     return [0];
@@ -295,16 +585,7 @@ export function getAvailableSpellLevels(
   }
 
   // 2. Проверяем обычные ячейки
-  const typeMap = new Map<string, CasterType>();
-  const classes = actor.system?.classes ?? [];
-
-  for (const entry of classes) {
-    if (entry.casterType) {
-      typeMap.set(entry.classKey, entry.casterType);
-    }
-  }
-
-  const maxSlots = computeSpellSlots(classes, typeMap);
+  const maxSlots = computeActorSpellSlots(actor, context);
   const usedSlots = actor.system?.spellSlotsUsed ?? [0, 0, 0, 0, 0, 0, 0, 0, 0];
 
   for (let i = 0; i < 9; i++) {
@@ -318,7 +599,7 @@ export function getAvailableSpellLevels(
   // Если у актора вообще нет ячеек - считаем, что это NPC / Врождённый каст,
   // разрешаем каст на любом доступном круге.
   if (!hasAnyMaxSlots) {
-    const levels: number[] = [];
+    const levels = [];
 
     for (let i = minLevel; i <= maxAvailableLevel; i++) {
       levels.push(i);
@@ -337,68 +618,6 @@ export function getAvailableSpellLevels(
   }
 
   return Array.from(availableLevels).sort((left, right) => left - right);
-}
-
-/**
- * Проверяет, есть ли у актора свободные ячейки заклинаний для указанного уровня.
- * В случае если актор имеет `maxSlots` = 0 (например NPC с врожденным кастом), вернёт `true`,
- * чтобы не блокировать каст заклинаний.
- *
- * @param actor Структура данных актора для получения классов и `spellSlotsUsed`.
- * @param minLevel Минимальный требуемый круг заклинания
- * @returns boolean `true`, если можно произнести заклинание (есть ячейки или они не нужны)
- */
-export function hasAvailableSpellSlot(
-  actor: SpellSlotActorData,
-  minLevel: number,
-): boolean {
-  if (minLevel <= 0) {
-    return true;
-  }
-
-  return getAvailableSpellLevels(actor, minLevel).length > 0;
-}
-
-/**
- * Возвращает максимальный круг ячеек заклинаний, доступный актеру.
- * @param actor Структура данных актора
- * @returns number 0-9 (максимальный круг)
- */
-export function getMaxAvailableSpellLevel(actor: SpellSlotActorData): number {
-  let maxLvl = 0;
-
-  // 1. Проверяем Pact Slots
-  const pactClass = (actor.system?.classes ?? []).find(
-    (entry) => entry.casterType === 'pact',
-  );
-
-  if (pactClass) {
-    const pactInfo = PACT_SLOTS[pactClass.level];
-
-    if (pactInfo && pactInfo.level > maxLvl) {
-      maxLvl = pactInfo.level;
-    }
-  }
-
-  // 2. Проверяем обычные ячейки
-  const typeMap = new Map<string, CasterType>();
-  const classes = actor.system?.classes ?? [];
-
-  for (const entry of classes) {
-    if (entry.casterType) {
-      typeMap.set(entry.classKey, entry.casterType);
-    }
-  }
-
-  const maxSlots = computeSpellSlots(classes, typeMap);
-
-  maxSlots.forEach((max, i) => {
-    if ((max ?? 0) > 0) {
-      maxLvl = Math.max(maxLvl, i + 1);
-    }
-  });
-
-  return maxLvl;
 }
 
 /**
@@ -425,4 +644,36 @@ export function getPactSlotInfo(
   }
 
   return { max: pactInfo.count, level: pactInfo.level };
+}
+
+/** Сколько кругов ячеек у персонажа: счётчик потраченных — по одному на круг */
+const SPELL_SLOT_LEVEL_COUNT = 9;
+
+/**
+ * Лист заклинателя с одной потраченной ячейкой: обычной выбранного круга или
+ * ячейкой договора. Лист не меняется — возвращается новый.
+ *
+ * @param system - данные листа персонажа
+ * @param castLevel - круг ячейки (1–9)
+ * @param isPactSlot - тратится ячейка договора
+ * @returns данные листа с потраченной ячейкой
+ */
+export function withSpentSpellSlot<
+  System extends Pick<DnDActor['system'], 'spellSlotsUsed' | 'pactSlotsUsed'>,
+>(system: System, castLevel: number, isPactSlot: boolean): System {
+  if (isPactSlot) {
+    return { ...system, pactSlotsUsed: (system.pactSlotsUsed ?? 0) + 1 };
+  }
+
+  const used = Array.from(
+    { length: SPELL_SLOT_LEVEL_COUNT },
+    (_unused, index) => system.spellSlotsUsed?.[index] ?? 0,
+  );
+
+  return {
+    ...system,
+    spellSlotsUsed: used.map((count, index) =>
+      index === castLevel - 1 ? count + 1 : count,
+    ),
+  };
 }

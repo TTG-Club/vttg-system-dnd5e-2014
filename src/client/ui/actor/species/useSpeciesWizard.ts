@@ -1,137 +1,163 @@
-import type { AbilityType, DefensibleDamageType } from '@vtt/shared';
+import type { DefensibleDamageType } from '@vtt/shared';
 import type {
   ActiveEffect,
-  Actor,
   ActorSpeciesEntry,
   ConditionKey,
   CreatureSize,
   DamageDefenseEntry,
   DamageDefenseKind,
-  EffectChange,
+  DnDActor,
   EffectFlagKey,
-  EffectTargetKey,
+  FeatChoice,
   GrantedSpellSource,
   ResolvedGrantedSpell,
   SpeciesDefinition,
+  SpeciesFeatDataSource,
   SpeciesFeature,
+  TakenFeat,
 } from '@vtt/shared/system/dnd.js';
 
-import { typedObjectEntries } from '@vtt/shared';
+import type { CompendiumFeat } from '../feat/featApply';
+
+import { computed, ref, watch } from 'vue';
+
 import {
   appendGrantedSpells,
-  collectSpeciesAbilityIncreases,
+  applyFeatChoiceSelections,
+  applyFeatDataProficiencies,
+  buildFeatGrantEffect,
+  buildTakenFeat,
+  calculateProficiencyBonus,
+  collectSpeciesFeatDataSources,
   collectSpeciesGrantedSpellSources,
+  collectSubspecies,
   computeSpeciesDarkvision,
   computeSpeciesMovement,
-  CONDITIONS,
+  CREATURE_SIZE_TO_TOKEN_SCALE,
   EFFECT_FLAG_LABELS,
+  fromLevelLabel,
+  getConditionEntry,
   getTotalLevel,
+  getVisibleFeatChoices,
+  hasNoFeatChoiceOptions,
+  isFeatPickChoice,
   isSkillType,
-  removeGrantedSpellsByFeatureNames,
-  SPECIES_SIZE_SCALE_MAP,
+  isSpeciesSpellOpen,
+  isTakenFeatAnswered,
+  openFeatChoicesAtLevel,
+  prepareFeatChoices,
+  refreshSpeciesCounters,
+  resolveChosenAbilities,
+  resolveChosenDamageDefenses,
+  resolveFeatChoiceCount,
+  resolveFeatChoicesToAsk,
+  resolveSpeciesVision,
+  speciesSpellOpensAt,
+  withActivationDefaults,
+  withTakenFeatAnswers,
 } from '@vtt/shared/system/dnd.js';
-import { computed, ref, watch } from 'vue';
+
+import { useFeatChoiceWeapons } from '../../../composables/useFeatChoiceWeapons';
+import {
+  SPECIES_GRANT_EFFECT_PRESENTATION,
+  SPECIES_WIZARD_LABELS,
+} from '../constants';
+import { applyFeatToActor } from '../feat/featApply';
+import {
+  isSpeciesProvidedEffect,
+  rollbackSpeciesFeatures,
+  rollbackSpeciesGrantedFeats,
+  rollbackSpeciesGrantedSpells,
+  rollbackSpeciesProficiencies,
+  SPECIES_DEFENSE_EFFECT_PREFIX,
+  SPECIES_GRANT_EFFECT_PREFIX,
+  SPECIES_OWN_EFFECT_PREFIX,
+} from './speciesRollback';
 
 export interface SpeciesWizardState {
   selectedSize: CreatureSize | null;
   grantSelections: Record<number, string[]>;
   featureChoices: Record<string, string>;
+  /** Ключ выбранной записи-подвида; `null` — не выбрана или подвидов нет. */
+  subspeciesKey: string | null;
+  /** Ответы на выборы блоков даров: ключ источника → ответы блока. */
+  featDataChoices: Record<string, Record<string, string[]>>;
   /**
-   * Характеристики, выбранные игроком по каждой группе выбора вида
-   * (`abilityGrant.choice` самого вида и выбранных подвидов) — по индексу
-   * группы в порядке из `collectSpeciesAbilityIncreases`.
+   * Ответы на СОБСТВЕННЫЕ выборы выбранной черты: ключ вопроса о черте
+   * ({@link SpeciesFeatPick.pickKey}) → ответы черты.
+   *
+   * Отдельно от {@link featDataChoices}: там ответы дарам вида, а это ответы
+   * другой записи — самой черты, — и лягут они на неё же, в
+   * `AppliedFeatMeta.choices`. Сложи их в один словарь, ключи бы столкнулись:
+   * у «Одарённого» свой выбор навыка ничем не отличается от выбора навыка вида.
    */
-  abilitySelections: Record<number, AbilityType[]>;
+  featPickAnswers: Record<string, Record<string, string[]>>;
+}
+
+/** Источник блока даров вместе с подготовленными вопросами к игроку. */
+export interface SpeciesFeatDataSourceView extends SpeciesFeatDataSource {
+  /** Вопросы блока в порядке показа (`prepareFeatChoices`). */
+  preparedChoices: FeatChoice[];
 }
 
 /**
- * Префиксы стабильного id активного эффекта-защит, выданного видом. По ним
- * эффект прежнего вида снимается при смене/удалении вида, не задевая эффекты
- * из других источников (предметы/заклинания/состояния). Старый префикс
- * (только-сопротивление) тоже снимаем — для миров, где он успел примениться.
+ * Выбор черты из даров вида вместе с блоком-источником. Спрашивается пикером
+ * компендиума, а не общими полями выбора: пул черт живёт в компендиуме, а не в
+ * справочнике правил, и общие поля показали бы пустой список.
  */
-const SPECIES_DEFENSE_EFFECT_PREFIX = 'species-defenses:';
-const SPECIES_LEGACY_RESISTANCE_EFFECT_PREFIX = 'species-resistance:';
+export interface SpeciesFeatPick {
+  /** Ключ вопроса целиком — под ним лежат ответы самой выбранной черты */
+  pickKey: string;
+  /** Ключ блока даров: в нём и лежит выбранная черта */
+  sourceKey: string;
+  /** Название записи-источника — подпись над пикером */
+  sourceName: string;
+  choice: FeatChoice;
+  /** Выбранная черта компендиума; `null` — ещё не выбрана либо не нашлась */
+  feat: CompendiumFeat | null;
+  /**
+   * Собственные вопросы выбранной черты в порядке показа. Спрашиваются здесь
+   * же: «Одарённый» без ответов лёг бы на лист пустым — ни прибавки к
+   * характеристике, ни навыка.
+   */
+  ownChoices: FeatChoice[];
+}
+
+/** Разделитель составного ключа вопроса о черте: источник и сам выбор. */
+const FEAT_PICK_KEY_SEPARATOR = '::';
 
 /**
- * Префикс id эффекта с повышением характеристик вида. Отдельный от защит:
- * вид может давать одно без другого, и снимать их нужно независимо.
+ * Черта, которую дары вида кладут на лист без выбора, вместе с её собственными
+ * вопросами. Ответы лежат там же, где ответы выбранных черт
+ * ({@link SpeciesWizardState.featPickAnswers}), под своим ключом.
  */
-const SPECIES_ABILITY_EFFECT_PREFIX = 'species-abilities:';
-
-/** Принадлежит ли эффект повышению характеристик, выданному видом. */
-function isSpeciesAbilityEffect(effect: ActiveEffect): boolean {
-  return effect.id.startsWith(SPECIES_ABILITY_EFFECT_PREFIX);
+export interface SpeciesGrantedFeat extends TakenFeat<CompendiumFeat> {
+  /** Название записи-источника — подпись над вопросами */
+  sourceName: string;
 }
 
 /**
- * Собирает эффект с итоговым повышением характеристик вида.
- *
- * @param definition - определение вида (для имени и id-провенанса)
- * @param increases - итоговые прибавки (фиксированные вида и подвидов плюс
- * выбранные игроком)
- * @returns эффект вида или `null`, если повышать нечего
+ * Приставка ключа ответов выданной без выбора черты: с ключом вопроса о черте
+ * ({@link SpeciesFeatPick.pickKey}) он не столкнётся.
  */
-function buildSpeciesAbilityEffect(
-  definition: SpeciesDefinition,
-  increases: Partial<Record<AbilityType, number>>,
-): ActiveEffect | null {
-  const changes: EffectChange[] = [];
-
-  for (const [ability, bonus] of typedObjectEntries<AbilityType, number>(
-    increases,
-  )) {
-    if (!bonus || bonus <= 0) {
-      continue;
-    }
-
-    changes.push({
-      key: `ability.${ability}` satisfies EffectTargetKey,
-      mode: 'add',
-      value: String(bonus),
-      priority: 10,
-    });
-  }
-
-  if (changes.length === 0) {
-    return null;
-  }
-
-  return {
-    id: `${SPECIES_ABILITY_EFFECT_PREFIX}${definition.key}`,
-    name: `Характеристики вида (${definition.name})`,
-    description: `Повышение характеристик от вида «${definition.name}».`,
-    disabled: false,
-    origin: 'feature',
-    originId: definition.key,
-    transfer: false,
-    duration: { type: 'permanent' },
-    changes,
-    flags: [],
-  };
-}
-
-/** Принадлежит ли эффект защитам, выданным видом (текущий или старый префикс). */
-function isSpeciesDefenseEffect(effect: ActiveEffect): boolean {
-  return (
-    effect.id.startsWith(SPECIES_DEFENSE_EFFECT_PREFIX)
-    || effect.id.startsWith(SPECIES_LEGACY_RESISTANCE_EFFECT_PREFIX)
-  );
-}
+const GRANTED_FEAT_KEY_PREFIX = 'grant:';
 
 /**
  * Собирает флаги защит от урона (`resistance.*`/`immunity.*`/`vulnerability.*`)
- * из гранта `damageDefense` основного вида И из защит выбранных подвидов
- * (`SpeciesFeatureChoice.damageDefenses` — как наследие драконорождённых).
- * Дедуп по типу урона: для типа берётся последний заданный вид защиты (один тип
- * = один вид), причём подвид может переопределить защиту основного вида.
+ * из гранта `damageDefense` основного вида, из защит выбранных легаси-вариантов
+ * (`SpeciesFeatureChoice.damageDefenses` — как наследие драконорождённых) и из
+ * легаси-грантов записи-подвида. Дедуп по типу урона: для типа берётся
+ * последний заданный вид защиты (один тип = один вид), причём подвид может
+ * переопределить защиту основного вида.
  *
  * @param definition - определение вида
- * @param chosenSubspecies - выбранные ключи вариантов-подвидов
+ * @param chosenSubspecies - выбранные ключи легаси-вариантов
+ * @param subspecies - выбранная запись-подвид; пусто — не выбрана
  */
 function collectDamageDefenseFlags(
   definition: SpeciesDefinition,
   chosenSubspecies: ReadonlyArray<string>,
+  subspecies?: SpeciesDefinition | null,
 ): EffectFlagKey[] {
   const kindByType = new Map<DefensibleDamageType, DamageDefenseKind>();
 
@@ -141,7 +167,7 @@ function collectDamageDefenseFlags(
     }
   };
 
-  for (const grant of definition.grants) {
+  for (const grant of definition.grants ?? []) {
     if (grant.type === 'damageDefense') {
       addEntries(grant.entries);
     }
@@ -152,6 +178,12 @@ function collectDamageDefenseFlags(
       if (chosenSubspecies.includes(choice.key)) {
         addEntries(choice.damageDefenses);
       }
+    }
+  }
+
+  for (const grant of subspecies?.grants ?? []) {
+    if (grant.type === 'damageDefense') {
+      addEntries(grant.entries);
     }
   }
 
@@ -166,25 +198,32 @@ function collectDamageDefenseFlags(
 
 /**
  * Собирает ключи состояний, к которым вид даёт иммунитет: грант
- * `conditionImmunity` основного вида плюс иммунитеты выбранных подвидов
- * (`SpeciesFeatureChoice.conditionImmunities`). Дедуп по ключу состояния.
+ * `conditionImmunity` основного вида, иммунитеты выбранных легаси-вариантов
+ * (`SpeciesFeatureChoice.conditionImmunities`) и легаси-гранты записи-подвида.
+ * Дедуп по ключу состояния.
  *
  * @param definition - определение вида
- * @param chosenSubspecies - выбранные ключи вариантов-подвидов
+ * @param chosenSubspecies - выбранные ключи легаси-вариантов
+ * @param subspecies - выбранная запись-подвид; пусто — не выбрана
  */
 function collectSpeciesConditionImmunities(
   definition: SpeciesDefinition,
   chosenSubspecies: ReadonlyArray<string>,
+  subspecies?: SpeciesDefinition | null,
 ): ConditionKey[] {
   const conditions = new Set<ConditionKey>();
 
-  for (const grant of definition.grants) {
-    if (grant.type === 'conditionImmunity') {
-      for (const conditionKey of grant.conditions) {
-        conditions.add(conditionKey);
+  const addGrants = (record: SpeciesDefinition): void => {
+    for (const grant of record.grants ?? []) {
+      if (grant.type === 'conditionImmunity') {
+        for (const conditionKey of grant.conditions) {
+          conditions.add(conditionKey);
+        }
       }
     }
-  }
+  };
+
+  addGrants(definition);
 
   for (const feature of definition.features) {
     for (const choice of feature.choices ?? []) {
@@ -196,7 +235,61 @@ function collectSpeciesConditionImmunities(
     }
   }
 
+  if (subspecies) {
+    addGrants(subspecies);
+  }
+
   return [...conditions];
+}
+
+/**
+ * Собирает эффекты, заявленные самим видом и его умениями в компендиуме.
+ *
+ * Умение отдаёт эффекты, только когда оно уже действует: у умения с уровнем это
+ * уровень персонажа, у легаси-варианта — сделанный игроком выбор. Иначе эльф
+ * получал бы «Туманный шаг» пятого уровня на первом. Для записи-подвида функция
+ * вызывается отдельно — подвид и есть `SpeciesDefinition`.
+ *
+ * @param definition - определение вида
+ * @param chosenSubspecies - выбранные ключи легаси-вариантов
+ * @param characterLevel - суммарный уровень персонажа
+ * @returns эффекты вида с id, привязанными к ключу вида
+ */
+function collectSpeciesDeclaredEffects(
+  definition: SpeciesDefinition,
+  chosenSubspecies: ReadonlyArray<string>,
+  characterLevel: number,
+): ActiveEffect[] {
+  const collected: ActiveEffect[] = [...(definition.activeEffects ?? [])];
+
+  const addFeature = (feature: SpeciesFeature): void => {
+    if ((feature.level ?? 1) > characterLevel) {
+      return;
+    }
+
+    collected.push(...(feature.activeEffects ?? []));
+
+    for (const choice of feature.choices ?? []) {
+      if (!chosenSubspecies.includes(choice.key)) {
+        continue;
+      }
+
+      for (const nested of choice.features ?? []) {
+        addFeature(nested);
+      }
+    }
+  };
+
+  for (const feature of definition.features) {
+    addFeature(feature);
+  }
+
+  return collected.map((effect) => ({
+    ...withActivationDefaults(effect),
+    id: `${SPECIES_OWN_EFFECT_PREFIX}${definition.key}:${effect.id}`,
+    origin: 'feature',
+    originId: definition.key,
+  }));
 }
 
 /**
@@ -219,9 +312,7 @@ function buildSpeciesDefenseEffect(
   }
 
   for (const conditionKey of conditionImmunities) {
-    const label =
-      CONDITIONS.find((condition) => condition.key === conditionKey)?.nameRu
-      ?? conditionKey;
+    const label = getConditionEntry(conditionKey)?.nameRu ?? conditionKey;
 
     summaryParts.push(`Иммунитет к состоянию: ${label}`);
   }
@@ -247,42 +338,116 @@ function buildSpeciesDefenseEffect(
 }
 
 /**
- * Удаляет все вхождения указанных элементов из массива (in-place).
+ * Кладёт на лист черты, которые даёт вид, и снимает выданные прежним видом.
  *
- * @param target - массив, из которого удаляются элементы
- * @param itemsToRemove - элементы для удаления
+ * Применяются они ТЕМ ЖЕ кодом, что и черта, перетащенная на лист
+ * (`applyFeatToActor`), — иначе владения, эффекты и ресурсы черты пришлось бы
+ * собирать здесь заново, и два способа выдачи разошлись бы. Прежние снимаются
+ * по метке `grantedBySpeciesKey`: по типу особенности выданную видом черту не
+ * отличить от взятой игроком.
+ *
+ * @param actorWithUpdates - лист с уже собранными обновлениями вида
+ * @param feats - черты, которые кладёт вид, вместе с ответами игрока
+ * @param definition - запись вида: её имя и ключ идут в провенанс черты
+ * @param acquisitionLevel - суммарный уровень персонажа на момент выдачи
+ * @returns лист с обновлёнными чертами; менять было нечего — тот же объект
  */
-function removeItems<T>(target: T[], itemsToRemove: T[]): void {
-  for (const item of itemsToRemove) {
-    const index = target.indexOf(item);
+function applySpeciesGrantedFeats(
+  actorWithUpdates: DnDActor,
+  feats: ReadonlyArray<CompendiumFeat>,
+  definition: SpeciesDefinition,
+  acquisitionLevel: number,
+): DnDActor {
+  let current = rollbackSpeciesGrantedFeats(actorWithUpdates);
 
-    if (index !== -1) {
-      target.splice(index, 1);
-    }
+  for (const feat of feats) {
+    const applied = applyFeatToActor(
+      current,
+      { ...feat, acquisitionLevel },
+      [],
+    );
+
+    // Провенанс вида: по нему смена и удаление вида снимут выданную черту
+    // вместе с её дарами, а лист покажет игроку, что черта не выбрана свободно
+    const features = applied.features.map((feature, index) =>
+      index === applied.features.length - 1
+        ? {
+            ...feature,
+            grantedBy: definition.name,
+            grantedBySpeciesKey: definition.key,
+          }
+        : feature,
+    );
+
+    current = {
+      ...current,
+      features,
+      spells: applied.spells,
+      activeEffects: applied.activeEffects,
+      system: {
+        ...current.system,
+        proficiencies: applied.proficiencies,
+        classCounters: applied.classCounters,
+      },
+      ...(applied.token ? { token: applied.token } : {}),
+    };
   }
+
+  return current;
 }
 
+/**
+ * Состояние мастера вида: размер, дары, выборы особенностей и подвид, а также
+ * применение выбранного на лист.
+ *
+ * @param actor - персонаж, которому вид достанется
+ * @param speciesDef - выбранный вид; `null` — мастеру нечего спрашивать
+ * @param speciesRecords - записи видов мира: из них берутся подвиды
+ * @param compendiumFeats - черты компендиума для выборов и выдачи черты
+ */
 export function useSpeciesWizard(
-  actor: import('vue').Ref<Actor>,
+  actor: import('vue').Ref<DnDActor>,
   speciesDef: import('vue').Ref<SpeciesDefinition | null>,
+  speciesRecords: import('vue').Ref<SpeciesDefinition[]>,
+  /**
+   * Черты компендиума — пул выбора черты в дарах вида и записи выдаваемых черт.
+   * Пусто — пикеру нечего предложить, а выдаваемая черта на лист не ляжет.
+   */
+  compendiumFeats: import('vue').Ref<ReadonlyArray<CompendiumFeat>> = ref<
+    ReadonlyArray<CompendiumFeat>
+  >([]),
+  /** Пак записи вида — ложится на запись актора, см. `ActorSpeciesEntry.packId` */
+  packId: import('vue').Ref<string | undefined> = ref(undefined),
+  /**
+   * Подвид, выбранный до мастера: его отметили в окне выбора, перенесли на лист
+   * или назвали в окне «какой подвид». Шаг подвида открывается уже с ним.
+   */
+  initialSubspeciesKey: import('vue').Ref<string | null> = ref(null),
 ) {
+  /** Виды оружия мира — пул выбора оружия и оружейного приёма */
+  const { weaponOptions } = useFeatChoiceWeapons();
+
   const state = ref<SpeciesWizardState>({
     selectedSize: null,
     grantSelections: {},
     featureChoices: {},
-    abilitySelections: {},
+    subspeciesKey: null,
+    featDataChoices: {},
+    featPickAnswers: {},
   });
 
-  // Инициализация при смене вида
+  // Инициализация при смене вида и подвида, выбранного до мастера
   watch(
-    () => speciesDef.value,
-    (definition) => {
+    [speciesDef, initialSubspeciesKey],
+    ([definition, subspeciesKey]) => {
       if (!definition) {
         state.value = {
           selectedSize: null,
           grantSelections: {},
           featureChoices: {},
-          abilitySelections: {},
+          subspeciesKey: null,
+          featDataChoices: {},
+          featPickAnswers: {},
         };
 
         return;
@@ -291,7 +456,7 @@ export function useSpeciesWizard(
       // 1. Инициализация grantSelections массивами нужной длины или пустыми
       const grantSelections: Record<number, string[]> = {};
 
-      definition.grants.forEach((grant, index) => {
+      (definition.grants ?? []).forEach((grant, index) => {
         if ('count' in grant || ('choices' in grant && grant.choices?.count)) {
           grantSelections[index] = [];
         }
@@ -301,53 +466,229 @@ export function useSpeciesWizard(
         selectedSize: definition.size.length === 1 ? definition.size[0] : null,
         grantSelections,
         featureChoices: {},
-        abilitySelections: {},
+        subspeciesKey,
+        featDataChoices: {},
+        featPickAnswers: {},
       };
     },
     { immediate: true },
   );
 
-  /**
-   * Повышения характеристик вида с учётом уже выбранных подвидов: смена
-   * подвида меняет и набор выборов, поэтому это computed, а не снимок.
-   */
-  const abilityIncreases = computed(() => {
+  /** Записи-подвиды выбранного вида (мир + компендиум), по алфавиту. */
+  const subspeciesOptions = computed<SpeciesDefinition[]>(() => {
     if (!speciesDef.value) {
-      return { fixed: {}, choices: [] };
+      return [];
     }
 
-    return collectSpeciesAbilityIncreases(
+    return collectSubspecies(speciesDef.value.key, speciesRecords.value);
+  });
+
+  /** Выбранная запись-подвид; `null` — не выбрана. */
+  const selectedSubspecies = computed<SpeciesDefinition | null>(
+    () =>
+      subspeciesOptions.value.find(
+        (option) => option.key === state.value.subspeciesKey,
+      ) ?? null,
+  );
+
+  const totalLevel = computed(() => getTotalLevel(actor.value.system.classes));
+
+  /** Бонус мастерства — от него зависит количество у некоторых выборов даров. */
+  const proficiencyBonus = computed(() =>
+    calculateProficiencyBonus(totalLevel.value),
+  );
+
+  /**
+   * Источники блоков даров `featData` (запись, подвид, активные особенности) с
+   * подготовленными вопросами. Вопросы у каждого источника свои — ключи выборов
+   * двух особенностей могут совпадать, и общий список их бы склеил.
+   */
+  const featDataSources = computed<SpeciesFeatDataSourceView[]>(() => {
+    if (!speciesDef.value) {
+      return [];
+    }
+
+    return collectSpeciesFeatDataSources(
       speciesDef.value,
+      totalLevel.value,
       Object.values(state.value.featureChoices),
-    );
+      selectedSubspecies.value,
+    ).map((source) => ({
+      ...source,
+      // Выбор с уровнем открытия выше текущего отложен до повышения уровня
+      preparedChoices: prepareFeatChoices(
+        openFeatChoicesAtLevel(source.featData.choices, totalLevel.value),
+      ),
+    }));
   });
 
   /**
-   * Итоговые прибавки: фиксированные вида и подвидов плюс выбранные игроком.
-   * Выбор одной характеристики в нескольких группах суммируется — правила
-   * этого не запрещают, а мастер решает сам.
+   * Выборы черты в дарах вида: «Универсальность» человека просит черту
+   * происхождения. Отделены от остальных вопросов — их спрашивает пикер
+   * компендиума, а общие поля выбора показали бы пустой список.
    */
-  const resolvedAbilityIncreases = computed(() => {
-    const result: Partial<Record<AbilityType, number>> = {
-      ...abilityIncreases.value.fixed,
-    };
+  const featPickChoices = computed<SpeciesFeatPick[]>(() =>
+    featDataSources.value.flatMap((source) =>
+      source.preparedChoices.filter(isFeatPickChoice).map((choice) => {
+        const featId =
+          state.value.featDataChoices[source.sourceKey]?.[choice.key]?.[0];
 
-    abilityIncreases.value.choices.forEach((choice, index) => {
-      for (const ability of state.value.abilitySelections[index] ?? []) {
-        result[ability] = (result[ability] ?? 0) + choice.amount;
-      }
-    });
+        const feat = featId
+          ? (compendiumFeats.value.find((entry) => entry.id === featId) ?? null)
+          : null;
 
-    return result;
-  });
-
-  /** Все ли группы выбора характеристик заполнены до нужного количества. */
-  const abilityChoicesComplete = computed(() =>
-    abilityIncreases.value.choices.every(
-      (choice, index) =>
-        (state.value.abilitySelections[index] ?? []).length === choice.count,
+        return {
+          pickKey: `${source.sourceKey}${FEAT_PICK_KEY_SEPARATOR}${choice.key}`,
+          sourceKey: source.sourceKey,
+          sourceName: source.sourceName,
+          choice,
+          feat,
+          ownChoices: feat
+            ? prepareFeatChoices(
+                resolveFeatChoicesToAsk(feat.featData, actor.value),
+              )
+            : [],
+        };
+      }),
     ),
   );
+
+  /**
+   * Отвечены ли все вопросы о черте: сама черта выбрана и её собственные выборы
+   * сделаны. Без этого черта легла бы на лист без своих даров.
+   */
+  const areFeatPicksComplete = computed(() =>
+    featPickChoices.value.every((pick) => {
+      if (!pick.feat) {
+        return false;
+      }
+
+      const answers = state.value.featPickAnswers[pick.pickKey];
+
+      return getVisibleFeatChoices(pick.ownChoices, answers).every(
+        (choice) =>
+          hasNoOptions(choice, answers)
+          || (answers?.[choice.key] ?? []).length
+            >= resolveFeatChoiceCount(choice, proficiencyBonus.value),
+      );
+    }),
+  );
+
+  /**
+   * Черты, которые дары вида кладут без выбора, с их собственными вопросами —
+   * теми же, что задаёт окно выбора при перетаскивании черты на лист.
+   * Неизвестные ключи пропускаются: черта могла уехать из компендиума с паком.
+   */
+  const grantedFeats = computed<SpeciesGrantedFeat[]>(() =>
+    featDataSources.value.flatMap((source) =>
+      (source.featData.grantedFeats ?? []).flatMap((grantedRef) => {
+        const feat = compendiumFeats.value.find(
+          (entry) => entry.id === grantedRef.featId,
+        );
+
+        return feat
+          ? [
+              {
+                ...buildTakenFeat(
+                  `${GRANTED_FEAT_KEY_PREFIX}${source.sourceKey}${FEAT_PICK_KEY_SEPARATOR}${feat.id}`,
+                  feat,
+                  actor.value,
+                ),
+                sourceName: source.sourceName,
+              },
+            ]
+          : [];
+      }),
+    ),
+  );
+
+  /** Выданные без выбора черты, которым есть что спросить */
+  const grantedFeatQuestions = computed(() =>
+    grantedFeats.value.filter((granted) => granted.ownChoices.length > 0),
+  );
+
+  /** Отвечены ли собственные вопросы черт, выданных без выбора */
+  const areGrantedFeatsAnswered = computed(() =>
+    grantedFeats.value.every((granted) =>
+      isTakenFeatAnswered(
+        granted,
+        state.value.featPickAnswers,
+        actor.value,
+        { weapons: weaponOptions.value },
+        proficiencyBonus.value,
+      ),
+    ),
+  );
+
+  /**
+   * Нужен ли мастеру каталог черт компендиума: есть ли выбор черты или черта,
+   * выдаваемая дарами без выбора.
+   */
+  const needsCompendiumFeats = computed(
+    () =>
+      featPickChoices.value.length > 0
+      || featDataSources.value.some(
+        (source) => (source.featData.grantedFeats ?? []).length > 0,
+      ),
+  );
+
+  /**
+   * Отвечать на вопрос нечем — пул пуст, и требовать ответа значит запереть шаг.
+   * Правило общее с мастером класса и живёт в движке; здесь к нему подставлены
+   * лист и оружие мира, чтобы оба места ниже спрашивали одинаково.
+   *
+   * @param choice - вопрос блока даров
+   * @param answers - ответы блока: от них зависит пул выбора заклинания
+   */
+  function hasNoOptions(
+    choice: FeatChoice,
+    answers: Record<string, string[]> | undefined,
+  ): boolean {
+    return hasNoFeatChoiceOptions(choice, actor.value, {
+      selections: answers,
+      weapons: weaponOptions.value,
+    });
+  }
+
+  /** Отвечены ли все видимые вопросы всех блоков даров. */
+  const areFeatDataChoicesComplete = computed(() =>
+    featDataSources.value.every((source) => {
+      const answers = state.value.featDataChoices[source.sourceKey];
+
+      return getVisibleFeatChoices(source.preparedChoices, answers).every(
+        (choice) =>
+          hasNoOptions(choice, answers)
+          || (answers?.[choice.key] ?? []).length
+            >= resolveFeatChoiceCount(choice, proficiencyBonus.value),
+      );
+    }),
+  );
+
+  /**
+   * Записи компендиума для черт, которые вид кладёт на лист: выбранные игроком
+   * и выданные дарами без выбора. Неизвестные ключи пропускаются — черта могла
+   * уехать из компендиума вместе с паком.
+   */
+  const chosenCompendiumFeats = computed<CompendiumFeat[]>(() => {
+    const picked = featPickChoices.value.flatMap((pick) =>
+      pick.feat
+        ? [
+            {
+              ...pick.feat,
+              choices: state.value.featPickAnswers[pick.pickKey] ?? {},
+            },
+          ]
+        : [],
+    );
+
+    // Выданная без выбора черта ложится с ответами на свои вопросы: без них
+    // она легла бы на лист пустой — так же, как выбранная
+    const granted = grantedFeats.value.map((grantedFeat) =>
+      withTakenFeatAnswers(grantedFeat, state.value.featPickAnswers),
+    );
+
+    return [...picked, ...granted];
+  });
 
   const steps = computed(() => {
     if (!speciesDef.value) {
@@ -356,8 +697,15 @@ export function useSpeciesWizard(
 
     const result = [{ key: 'overview', title: 'Обзор' }];
 
+    if (subspeciesOptions.value.length > 0) {
+      result.push({
+        key: 'subspecies',
+        title: SPECIES_WIZARD_LABELS.stepSubspecies,
+      });
+    }
+
     // Есть ли гранты с выбором?
-    const hasGrantChoices = speciesDef.value.grants.some((grant) => {
+    const hasGrantChoices = (speciesDef.value.grants ?? []).some((grant) => {
       if (grant.type === 'skillProficiency' && grant.count > 0) {
         return true;
       }
@@ -385,21 +733,11 @@ export function useSpeciesWizard(
       result.push({ key: 'grants', title: 'Владения' });
     }
 
-    const hasFeatures = speciesDef.value.features.some(
-      (feature) =>
-        !feature.isInformationalOnly
-        || (feature.choices && feature.choices.length > 0),
-    );
+    const hasFeatures =
+      speciesDef.value.features.length > 0 || featDataSources.value.length > 0;
 
-    if (hasFeatures || speciesDef.value.features.length > 0) {
+    if (hasFeatures) {
       result.push({ key: 'features', title: 'Особенности' });
-    }
-
-    // Шаг характеристик нужен, только когда есть что выбирать: у большинства
-    // видов прибавки фиксированные и показываются на обзоре. Идёт ПОСЛЕ
-    // особенностей — выбор подвида может добавить свою группу выбора.
-    if (abilityIncreases.value.choices.length > 0) {
-      result.push({ key: 'abilities', title: 'Характеристики' });
     }
 
     return result;
@@ -438,8 +776,12 @@ export function useSpeciesWizard(
       return state.value.selectedSize !== null;
     }
 
+    if (stepKey === 'subspecies') {
+      return state.value.subspeciesKey !== null;
+    }
+
     if (stepKey === 'grants') {
-      return speciesDef.value.grants.every((grant, index) => {
+      return (speciesDef.value.grants ?? []).every((grant, index) => {
         if (grant.type === 'skillProficiency' && grant.count > 0) {
           return state.value.grantSelections[index]?.length === grant.count;
         }
@@ -459,13 +801,16 @@ export function useSpeciesWizard(
         (feature) => feature.choices && feature.choices.length > 0,
       );
 
-      return featuresWithChoices.every(
+      const legacyChoicesAnswered = featuresWithChoices.every(
         (feature) => !!state.value.featureChoices[feature.key],
       );
-    }
 
-    if (stepKey === 'abilities') {
-      return abilityChoicesComplete.value;
+      return (
+        legacyChoicesAnswered
+        && areFeatDataChoicesComplete.value
+        && areFeatPicksComplete.value
+        && areGrantedFeatsAnswered.value
+      );
     }
 
     return true;
@@ -477,38 +822,46 @@ export function useSpeciesWizard(
 
   /**
    * Заклинания, автоматически предоставляемые особенностями вида
-   * (поле `grantedSpells` особенности).
+   * (поле `grantedSpells` особенности) — включая особенности записи-подвида.
+   * Только открытые на текущем уровне: остальные лист выдаст при повышении.
    */
   const grantedSpellSources = computed((): GrantedSpellSource[] => {
     if (!speciesDef.value) {
       return [];
     }
 
-    return collectSpeciesGrantedSpellSources(speciesDef.value);
+    return collectSpeciesGrantedSpellSources(
+      speciesDef.value,
+      selectedSubspecies.value,
+      { characterLevel: totalLevel.value },
+    );
   });
 
   /**
    * Собирает обновления для применения нового вида.
    * Если у актора уже есть вид — откатывает все его бонусы
-   * (владения, features, darkvision, granted-заклинания)
+   * (владения, features, darkvision, granted-заклинания, ресурсы)
    * перед применением нового.
    *
-   * @param previousSpeciesDef - определение предыдущего вида из SRD (для отката фиксированных грантов)
+   * @param previousSpeciesDef - определение предыдущего вида (для отката фиксированных грантов)
    * @param resolvedGrantedSpells - granted-заклинания особенностей вида,
    * сопоставленные с данными компендиума
+   * @param previousSubspeciesDef - определение предыдущего подвида-записи
    */
   function buildUpdates(
     previousSpeciesDef?: SpeciesDefinition | null,
     resolvedGrantedSpells: ResolvedGrantedSpell[] = [],
+    previousSubspeciesDef?: SpeciesDefinition | null,
   ): {
-    systemUpdates: Partial<Actor['system']>;
-    rootUpdates: Partial<Actor>;
+    systemUpdates: Partial<DnDActor['system']>;
+    rootUpdates: Partial<DnDActor>;
   } {
     if (!speciesDef.value || !state.value.selectedSize) {
       return { systemUpdates: {}, rootUpdates: {} };
     }
 
     const definition = speciesDef.value;
+    const subspecies = selectedSubspecies.value;
     const previousSpecies = actor.value.system.species;
 
     const grantChoices: Record<number, string[]> = {};
@@ -519,61 +872,47 @@ export function useSpeciesWizard(
 
     const speciesEntry: ActorSpeciesEntry = {
       speciesKey: definition.key,
+      ...(packId.value ? { packId: packId.value } : {}),
       speciesName: definition.name,
       creatureType: definition.creatureType,
       size: state.value.selectedSize,
       featureChoices: { ...state.value.featureChoices },
       grantChoices,
-      abilityChoices: { ...resolvedAbilityIncreases.value },
     };
 
-    // --- Откат предыдущего вида ---
-    const baseProficiencies: Actor['system']['proficiencies'] = JSON.parse(
-      JSON.stringify(actor.value.system.proficiencies),
-    );
+    if (subspecies) {
+      speciesEntry.subspeciesKey = subspecies.key;
+      speciesEntry.subspeciesName = subspecies.name;
+    }
 
-    if (previousSpecies && previousSpeciesDef) {
-      // Откат грантов предыдущего вида
-      previousSpeciesDef.grants.forEach((grant, grantIndex) => {
-        const previousUserChoices =
-          previousSpecies.grantChoices[grantIndex] || [];
-
-        if (grant.type === 'skillProficiency') {
-          for (const choice of previousUserChoices) {
-            if (isSkillType(choice)) {
-              Reflect.deleteProperty(baseProficiencies.skills, choice);
-            }
-          }
-        } else if (grant.type === 'weaponProficiency') {
-          removeItems(baseProficiencies.weapons, grant.items ?? []);
-          removeItems(baseProficiencies.weapons, previousUserChoices);
-        } else if (grant.type === 'armorProficiency') {
-          removeItems(baseProficiencies.armor, grant.items ?? []);
-          removeItems(baseProficiencies.armor, previousUserChoices);
-        } else if (grant.type === 'toolProficiency') {
-          removeItems(baseProficiencies.tools, grant.items ?? []);
-          removeItems(baseProficiencies.tools, previousUserChoices);
-        } else if (grant.type === 'language') {
-          removeItems(baseProficiencies.languages, grant.items ?? []);
-          removeItems(baseProficiencies.languages, previousUserChoices);
-        } else if (grant.type === 'savingThrowProficiency') {
-          removeItems(baseProficiencies.savingThrows, grant.abilities);
-        }
-      });
+    if (Object.keys(state.value.featDataChoices).length > 0) {
+      speciesEntry.featDataChoices = JSON.parse(
+        JSON.stringify(state.value.featDataChoices),
+      );
     }
 
     // Уровне-зависимые дары: скорость и тёмное зрение считаются от текущего
     // суммарного уровня персонажа и выбранного подвида.
     const chosenSubspecies = Object.values(state.value.featureChoices);
-    const totalLevel = getTotalLevel(actor.value.system.classes);
+    const characterLevel = totalLevel.value;
+
+    // --- Откат предыдущего вида ---
+    const baseProficiencies = rollbackSpeciesProficiencies(
+      actor.value.system.proficiencies,
+      previousSpecies,
+      previousSpeciesDef,
+      previousSubspeciesDef,
+      characterLevel,
+    );
 
     const speciesMovement = computeSpeciesMovement(
       definition,
-      totalLevel,
+      characterLevel,
       chosenSubspecies,
+      subspecies,
     );
 
-    const systemUpdates: Partial<Actor['system']> = {
+    const systemUpdates: Partial<DnDActor['system']> = {
       species: speciesEntry,
       size: state.value.selectedSize,
       movement: {
@@ -584,7 +923,7 @@ export function useSpeciesWizard(
       proficiencies: baseProficiencies,
     };
 
-    const tokenUpdates: Partial<Actor['token']> = JSON.parse(
+    const tokenUpdates: Partial<DnDActor['token']> = JSON.parse(
       JSON.stringify(actor.value.token || {}),
     );
 
@@ -605,8 +944,9 @@ export function useSpeciesWizard(
       const previousSpeciesDarkvision = previousSpeciesDef
         ? computeSpeciesDarkvision(
             previousSpeciesDef,
-            totalLevel,
+            characterLevel,
             Object.values(previousSpecies.featureChoices ?? {}),
+            previousSubspeciesDef,
           )
         : tokenUpdates!.vision!.darkvision;
 
@@ -615,22 +955,32 @@ export function useSpeciesWizard(
       }
     }
 
-    // Итоговое тёмное зрение вида (база + активные на уровне особенности) —
-    // максимум с уже имеющимся (не видовым) значением.
+    // Итоговое тёмное зрение вида (база + подвид + активные на уровне
+    // особенности, включая featData) — максимум с уже имеющимся значением.
     const speciesDarkvision = computeSpeciesDarkvision(
       definition,
-      totalLevel,
+      characterLevel,
       chosenSubspecies,
+      subspecies,
     );
 
     if (speciesDarkvision > tokenUpdates!.vision!.darkvision) {
       tokenUpdates!.vision!.darkvision = speciesDarkvision;
     }
 
-    tokenUpdates!.scale = SPECIES_SIZE_SCALE_MAP[state.value.selectedSize];
+    // Обычное зрение вида — дальность зрения токена днём; не задано — токен
+    // остаётся со своей
+    const speciesVision = resolveSpeciesVision(definition, subspecies);
 
-    // --- Применяем гранты нового вида ---
-    definition.grants.forEach((grant, index) => {
+    if (speciesVision !== undefined) {
+      tokenUpdates!.vision!.range = speciesVision;
+    }
+
+    tokenUpdates!.scale =
+      CREATURE_SIZE_TO_TOKEN_SCALE[state.value.selectedSize];
+
+    // --- Применяем легаси-гранты нового вида ---
+    (definition.grants ?? []).forEach((grant, index) => {
       const userChoices = state.value.grantSelections[index] || [];
 
       if (grant.type === 'skillProficiency') {
@@ -698,7 +1048,19 @@ export function useSpeciesWizard(
       // resistance — пока без поддержки в proficiencies.
     });
 
-    const rootUpdates: Partial<Actor> = {
+    // --- Применяем блоки даров featData: владения без выбора и ответы игрока ---
+    for (const source of featDataSources.value) {
+      applyFeatDataProficiencies(systemUpdates.proficiencies!, source.featData);
+
+      applyFeatChoiceSelections(
+        systemUpdates.proficiencies!,
+        source.featData,
+        state.value.featDataChoices[source.sourceKey],
+        actor.value,
+      );
+    }
+
+    const rootUpdates: Partial<DnDActor> = {
       token: tokenUpdates,
     };
 
@@ -707,9 +1069,7 @@ export function useSpeciesWizard(
 
     // Удаляем features от предыдущего вида
     if (previousSpecies) {
-      newFeatures = newFeatures.filter(
-        (feature) => feature.featureType !== 'species',
-      );
+      newFeatures = rollbackSpeciesFeatures(newFeatures);
     }
 
     /**
@@ -719,17 +1079,18 @@ export function useSpeciesWizard(
      * @param featureName - итоговое название особенности
      * @param description - итоговое описание (Markdown)
      * @param level - уровень появления особенности
+     * @param grantedBy - название записи-источника (вид либо подвид)
      */
     const pushSpeciesFeature = (
       featureName: string,
       description: string,
       level: number,
+      grantedBy: string = definition.name,
     ): void => {
       if (
         newFeatures.some(
           (existing) =>
-            existing.grantedBy === definition.name
-            && existing.name === featureName,
+            existing.grantedBy === grantedBy && existing.name === featureName,
         )
       ) {
         return;
@@ -739,7 +1100,7 @@ export function useSpeciesWizard(
         id: Math.random().toString(36).substring(2, 11),
         name: featureName,
         description,
-        grantedBy: definition.name,
+        grantedBy,
         featureType: 'species',
         level,
       });
@@ -752,7 +1113,8 @@ export function useSpeciesWizard(
     /**
      * Дописывает в описание блок заклинаний особенности: связанные и найденные
      * (или просто именованные) — как выдаваемые; связанные, но не найденные в
-     * компендиуме — как требующие ручного добавления.
+     * компендиуме — как требующие ручного добавления. Заклинание старше уровня
+     * персонажа ещё не выдано — оно идёт с пометкой уровня, а не в «не найдены».
      *
      * @param feature - особенность вида
      * @returns описание с приписанным блоком заклинаний (если есть)
@@ -768,7 +1130,14 @@ export function useSpeciesWizard(
       const missing: string[] = [];
 
       for (const spellRef of refs) {
-        if (spellRef.spellId && !resolvedSpellIds.has(spellRef.spellId)) {
+        if (!isSpeciesSpellOpen(feature, spellRef, characterLevel)) {
+          const opensAt = speciesSpellOpensAt(feature, spellRef);
+
+          granted.push(`${spellRef.name} (${fromLevelLabel(opensAt)})`);
+        } else if (
+          spellRef.spellId
+          && !resolvedSpellIds.has(spellRef.spellId)
+        ) {
           missing.push(spellRef.name);
         } else {
           granted.push(spellRef.name);
@@ -812,7 +1181,7 @@ export function useSpeciesWizard(
         appliedFeatureNames.add(speciesFeature.name);
       }
 
-      // Особенности выбранного подвида — со своими уровнями появления.
+      // Особенности выбранного легаси-варианта — со своими уровнями появления.
       for (const subspeciesFeature of selectedChoice?.features ?? []) {
         if (subspeciesFeature.isInformationalOnly) {
           continue;
@@ -828,6 +1197,24 @@ export function useSpeciesWizard(
       }
     });
 
+    // Особенности записи-подвида — своей записью-источником.
+    if (subspecies) {
+      for (const subspeciesFeature of subspecies.features) {
+        if (subspeciesFeature.isInformationalOnly) {
+          continue;
+        }
+
+        pushSpeciesFeature(
+          subspeciesFeature.name,
+          describeGrantedSpells(subspeciesFeature),
+          subspeciesFeature.level ?? 1,
+          subspecies.name,
+        );
+
+        appliedFeatureNames.add(subspeciesFeature.name);
+      }
+    }
+
     rootUpdates.features = newFeatures;
 
     // --- Granted-заклинания: откатываем от предыдущего вида и добавляем новые ---
@@ -836,22 +1223,10 @@ export function useSpeciesWizard(
     let updatedSpells = [...originalSpells];
 
     if (previousSpecies && previousSpeciesDef) {
-      // Имена особенностей предыдущего вида, включая особенности подвидов.
-      const previousFeatureNames: string[] = [];
-
-      for (const feature of previousSpeciesDef.features) {
-        previousFeatureNames.push(feature.name);
-
-        for (const choice of feature.choices ?? []) {
-          for (const choiceFeature of choice.features ?? []) {
-            previousFeatureNames.push(choiceFeature.name);
-          }
-        }
-      }
-
-      updatedSpells = removeGrantedSpellsByFeatureNames(
+      updatedSpells = rollbackSpeciesGrantedSpells(
         updatedSpells,
-        previousFeatureNames,
+        previousSpeciesDef,
+        previousSubspeciesDef,
       );
     }
 
@@ -860,7 +1235,11 @@ export function useSpeciesWizard(
       appliedFeatureNames.has(resolved.featureName),
     );
 
-    updatedSpells = appendGrantedSpells(updatedSpells, applicableGrantedSpells);
+    updatedSpells = appendGrantedSpells(
+      updatedSpells,
+      applicableGrantedSpells,
+      'species',
+    );
 
     // Сравнение по длине недостаточно: удаление и добавление могут совпасть
     // по количеству, поэтому дополнительно сверяем ссылки поэлементно
@@ -881,40 +1260,78 @@ export function useSpeciesWizard(
     const damageDefenseFlags = collectDamageDefenseFlags(
       definition,
       chosenSubspecies,
+      subspecies,
     );
 
     const speciesConditionImmunities = collectSpeciesConditionImmunities(
       definition,
       chosenSubspecies,
+      subspecies,
     );
 
     const baseEffects = (actor.value.activeEffects ?? []).filter(
-      (effect) =>
-        !isSpeciesDefenseEffect(effect) && !isSpeciesAbilityEffect(effect),
+      (effect) => !isSpeciesProvidedEffect(effect),
     );
 
     const hasDefenses =
       damageDefenseFlags.length > 0 || speciesConditionImmunities.length > 0;
 
-    const updatedEffects = hasDefenses
-      ? [
-          ...baseEffects,
-          buildSpeciesDefenseEffect(
-            definition,
-            damageDefenseFlags,
-            speciesConditionImmunities,
+    // --- Синтетические эффекты блоков даров featData: модификаторы листа,
+    // защиты (включая выбранные игроком), прибавки. Id стабилен по источнику —
+    // по префиксу эффект снимается при смене/удалении вида. ---
+    const grantEffects: ActiveEffect[] = [];
+
+    for (const source of featDataSources.value) {
+      const answers = state.value.featDataChoices[source.sourceKey];
+
+      const grantEffect = buildFeatGrantEffect(
+        source.sourceKey,
+        source.sourceName,
+        source.featData,
+        {
+          originPrefix: SPECIES_GRANT_EFFECT_PREFIX,
+          ...SPECIES_GRANT_EFFECT_PRESENTATION,
+        },
+        {
+          acquisitionLevel: characterLevel,
+          walkSpeed: speciesMovement.walk,
+          chosenDamageDefenses: resolveChosenDamageDefenses(
+            source.featData,
+            answers,
           ),
-        ]
-      : baseEffects;
+          chosenAbilities: resolveChosenAbilities(source.featData, answers),
+        },
+      );
 
-    const abilityEffect = buildSpeciesAbilityEffect(
-      definition,
-      resolvedAbilityIncreases.value,
-    );
-
-    if (abilityEffect) {
-      updatedEffects.push(abilityEffect);
+      if (grantEffect) {
+        grantEffects.push({
+          ...grantEffect,
+          id: `${SPECIES_GRANT_EFFECT_PREFIX}${source.sourceKey}`,
+        });
+      }
     }
+
+    const updatedEffects = [
+      ...baseEffects,
+      ...(hasDefenses
+        ? [
+            buildSpeciesDefenseEffect(
+              definition,
+              damageDefenseFlags,
+              speciesConditionImmunities,
+            ),
+          ]
+        : []),
+      ...collectSpeciesDeclaredEffects(
+        definition,
+        chosenSubspecies,
+        characterLevel,
+      ),
+      ...(subspecies
+        ? collectSpeciesDeclaredEffects(subspecies, [], characterLevel)
+        : []),
+      ...grantEffects,
+    ];
 
     const originalEffects = actor.value.activeEffects ?? [];
 
@@ -926,6 +1343,47 @@ export function useSpeciesWizard(
 
     if (effectsChanged) {
       rootUpdates.activeEffects = updatedEffects;
+    }
+
+    // --- Ресурсы блоков даров featData: «Скороход» лесного эльфа лежит в дарах
+    // записи-подвида. Ресурсы прежнего вида, чьих источников у нового нет,
+    // снимаются; тот же вид повторно сохраняет потраченное. Ступени выше
+    // текущего уровня дают ресурс без зарядов — лист его не показывает, а
+    // пересчёт на повышении уровня поднимет ---
+    systemUpdates.classCounters = refreshSpeciesCounters(
+      {
+        ...actor.value,
+        ...rootUpdates,
+        system: { ...actor.value.system, ...systemUpdates },
+      },
+      actor.value.system.classCounters,
+      featDataSources.value,
+      state.value.featDataChoices,
+    );
+
+    // --- Черты, которые даёт вид: выбранные игроком и выданные дарами без
+    // выбора. Считаются от листа с уже собранными обновлениями — чтобы владения
+    // и эффекты черты легли на итог вида ---
+    const withSpeciesUpdates: DnDActor = {
+      ...actor.value,
+      ...rootUpdates,
+      system: { ...actor.value.system, ...systemUpdates },
+    };
+
+    const withFeats = applySpeciesGrantedFeats(
+      withSpeciesUpdates,
+      chosenCompendiumFeats.value,
+      definition,
+      characterLevel,
+    );
+
+    if (withFeats !== withSpeciesUpdates) {
+      rootUpdates.features = withFeats.features;
+      rootUpdates.spells = withFeats.spells;
+      rootUpdates.activeEffects = withFeats.activeEffects;
+      rootUpdates.token = withFeats.token;
+      systemUpdates.proficiencies = withFeats.system.proficiencies;
+      systemUpdates.classCounters = withFeats.system.classCounters;
     }
 
     return { systemUpdates, rootUpdates };
@@ -941,8 +1399,13 @@ export function useSpeciesWizard(
     canProceed,
     isFinalStep,
     grantedSpellSources,
-    abilityIncreases,
-    resolvedAbilityIncreases,
+    subspeciesOptions,
+    selectedSubspecies,
+    featDataSources,
+    featPickChoices,
+    grantedFeatQuestions,
+    needsCompendiumFeats,
+    proficiencyBonus,
     buildUpdates,
   };
 }

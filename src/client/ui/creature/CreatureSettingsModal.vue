@@ -1,24 +1,19 @@
 <script setup lang="ts">
   import type { LightEmitter, TypedWebSocketClient } from '@vtt/shared';
-  import type { Creature, HpDisplayMode } from '@vtt/shared/system/dnd.js';
+  import type { DnDCreature, HpDisplayMode } from '@vtt/shared/system/dnd.js';
+
+  import type { TokenVisionSettings } from '../actor/tokenVision';
 
   import { useToast } from '@nuxt/ui/composables';
-  import { createDefaultLightEmitter, getServerBaseUrl } from '@vtt/shared';
-  import {
-    CREATURE_CATEGORIES,
-    CREATURE_SIZE_LABELS,
-    getAlignmentLabel,
-  } from '@vtt/shared/system/dnd.js';
   import { computed, onMounted, ref, watch } from 'vue';
 
+  import { requireSocket } from '@/core/entityUtils';
   import {
     DEFAULT_TOKEN_FRAME_URL,
-    TOKEN_DARKVISION_DEFAULT,
     TOKEN_DARKVISION_MIN,
     TOKEN_DARKVISION_STEP,
     TOKEN_SCALE_DEFAULT,
     TOKEN_SIZE_OPTIONS,
-    TOKEN_VISION_RANGE_DEFAULT,
     TOKEN_VISION_RANGE_MIN,
     TOKEN_VISION_RANGE_STEP,
   } from '@/core/tokenConsts';
@@ -28,9 +23,49 @@
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { useImageFallback } from '@/shared_ui/composables';
   import { useWorldStore } from '@/stores/worldStore';
+  import {
+    createDefaultLightEmitter,
+    getServerBaseUrl,
+    isEntityOwner,
+  } from '@vtt/shared';
+  import {
+    CREATURE_CATEGORIES,
+    CREATURE_SIZE_LABELS,
+    getAlignmentLabel,
+    isDndCreature,
+    resolveCreatureHitPointsByRules,
+    resolveCreatureTokenScale,
+    TOKEN_SCALE_TO_CREATURE_SIZE,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { useTokenPreview } from '../../composables/useTokenPreview';
-  import { SCALE_TO_SIZE } from '../../tokenSizeMap';
+  import { saveEntityFields } from '../../composables/useEntityDraftWrite';
+  import { useEntityOwnershipSettings } from '../../composables/useEntityOwnershipSettings';
+  import {
+    TOKEN_TINT_DEFAULT,
+    useTokenPreview,
+  } from '../../composables/useTokenPreview';
+  import {
+    clampVisionAngle,
+    MODAL_BUTTON_LABELS,
+    TOAST_TITLES,
+    TOKEN_IMAGE_ROTATION_DEFAULT,
+    TOKEN_IMAGE_ROTATION_MAX,
+    TOKEN_IMAGE_ROTATION_MIN,
+    TOKEN_IMAGE_ROTATION_STEP,
+    TOKEN_SETTINGS_LABELS,
+    TOKEN_VISION_ANGLE_MAX,
+    TOKEN_VISION_ANGLE_MIN,
+    TOKEN_VISION_ANGLE_PRESETS,
+    TOKEN_VISION_ANGLE_STEP,
+  } from '../actor/constants';
+  import { readTokenVision } from '../actor/tokenVision';
+  import { ENTITY_OWNERSHIP_CONFLICT_TOAST } from '../entity-ownership/constants';
+  import EntityOwnersSelect from '../entity-ownership/EntityOwnersSelect.vue';
+  import {
+    CREATURE_ICON,
+    CREATURE_NO_ALIGNMENT,
+    CREATURE_SETTINGS_LABELS,
+  } from './constants';
   import CreatureDeleteConfirmModal from './CreatureDeleteConfirmModal.vue';
 
   interface Props {
@@ -38,8 +73,9 @@
     zIndex?: number;
     modalId?: string;
     creatureId?: string;
-    creatureData?: Creature;
-    onSave?: (updates: Partial<Creature>) => void;
+    creatureData?: DnDCreature;
+    onSave?: (updates: Partial<DnDCreature>) => void;
+    onPersistedSave?: (updates: Partial<DnDCreature>) => void;
     onDelete?: () => void;
     isAdmin?: boolean;
     users?: Array<{ id: string; username: string; role: string }>;
@@ -88,7 +124,6 @@
 
   const isSaving = ref(false);
   const autoSaves = ref(true);
-  const selectedOwner = ref<string | undefined>(undefined);
   const isPublic = ref(false);
 
   const currentUser = computed(() => {
@@ -101,42 +136,9 @@
     );
   });
 
-  const userOptions = computed(() => {
-    let users: Array<{ id: string; username: string; role: string }> | null =
-      null;
-
-    if (props.users && props.users.length > 0) {
-      users = props.users;
-    } else if (
-      currentWorld.value?.users
-      && currentWorld.value.users.length > 0
-    ) {
-      users = currentWorld.value.users;
-    }
-
-    if (!users) {
-      return [{ value: undefined, label: 'Не назначен' }];
-    }
-
-    const mappedUsers = users.map((user) => ({
-      value: user.id,
-      label: `${user.username} (${user.role === 'admin' ? 'GM' : 'Игрок'})`,
-    }));
-
-    return [{ value: undefined, label: 'Не назначен' }, ...mappedUsers];
-  });
-
-  function getOwnerName(userId?: string) {
-    if (!userId) {
-      return 'Не назначен';
-    }
-
-    const entry = currentWorld.value?.users.find(
-      (worldUser) => worldUser.id === userId,
-    );
-
-    return entry ? entry.username : 'Неизвестный пользователь';
-  }
+  const ownershipUsers = computed(() =>
+    props.users?.length ? props.users : (currentWorld.value?.users ?? []),
+  );
 
   // Настройки токена
   type Disposition = 'friendly' | 'neutral' | 'hostile';
@@ -153,6 +155,8 @@
     disposition: Disposition;
     showName: boolean;
     hpDisplayMode: HpDisplayMode;
+    /** Переключатель «Вращение»: стрелка и поворот при круговом обзоре */
+    facingEnabled: boolean;
   }
 
   const tokenSettings = ref<TokenSettingsLocal>({
@@ -163,20 +167,17 @@
     textureX: 0.5,
     textureY: 0.5,
     rotation: 0,
-    tint: '#ffffff',
+    tint: TOKEN_TINT_DEFAULT,
     disposition: 'hostile',
     showName: false,
     hpDisplayMode: 'text',
+    facingEnabled: false,
   });
 
   const showFrame = ref(true);
 
   // Настройки зрения
-  const visionSettings = ref({
-    enabled: false,
-    range: TOKEN_VISION_RANGE_DEFAULT,
-    darkvision: TOKEN_DARKVISION_DEFAULT,
-  });
+  const visionSettings = ref<TokenVisionSettings>(readTokenVision(undefined));
 
   // Настройки света токена (тот же механизм, что у источников света)
   const lightSettings = ref<LightEmitter>(createDefaultLightEmitter());
@@ -198,6 +199,16 @@
   const isDeleteConfirmOpen = ref(false);
 
   const creature = computed(() => {
+    if (props.creatureId && currentWorld.value) {
+      const foundCreature = currentWorld.value.creatures.find(
+        (entry) => entry.id === props.creatureId,
+      );
+
+      return foundCreature && isDndCreature(foundCreature)
+        ? foundCreature
+        : null;
+    }
+
     return props.creatureData ?? null;
   });
 
@@ -217,12 +228,81 @@
       return false;
     }
 
-    // Существо передано игроку под контроль (ownerId совпадает)
-    return creature.value.ownerId === currentUser.value.id;
+    return isEntityOwner(creature.value, currentUser.value.id);
   });
 
   // Может ли текущий пользователь редактировать токен
   const canEditToken = computed(() => isAdmin.value || isOwner.value);
+
+  /** Подпись угла обзора: полный круг называем словом, а не числом */
+  const visionAngleLabel = computed(() =>
+    visionSettings.value.angle >= TOKEN_VISION_ANGLE_MAX
+      ? TOKEN_SETTINGS_LABELS.visionAngleFull
+      : `${visionSettings.value.angle}°`,
+  );
+
+  /**
+   * Сектор обзора уже полного круга требует направления: стрелка и поворот у
+   * такого токена включены всегда, переключатель лишь показывает это и
+   * заблокирован. Свой выбор при этом не теряется — вернётся вместе с 360°.
+   */
+  const isFacingForced = computed(
+    () => visionSettings.value.angle < TOKEN_VISION_ANGLE_MAX,
+  );
+
+  /** Что показывает переключатель «Вращение»: принуждение сектором либо свой выбор */
+  const isFacingEnabled = computed(
+    () => isFacingForced.value || tokenSettings.value.facingEnabled,
+  );
+
+  /** Подсказка под переключателем — объясняет, почему он заблокирован */
+  const facingEnabledHint = computed(() =>
+    isFacingForced.value
+      ? TOKEN_SETTINGS_LABELS.facingForcedHint
+      : TOKEN_SETTINGS_LABELS.facingEnabledHint,
+  );
+
+  /**
+   * Записывает выбор переключателя «Вращение».
+   *
+   * @param value - включено ли направление взгляда
+   */
+  function setFacingEnabled(value: boolean): void {
+    tokenSettings.value.facingEnabled = value;
+  }
+
+  /**
+   * Обрезает введённый вручную угол обзора по границам.
+   *
+   * Делается по потере фокуса, а не на каждый символ: иначе набор «130»
+   * схлопывался бы в минимум сразу после первой цифры.
+   */
+  function normalizeVisionAngle(): void {
+    visionSettings.value.angle = clampVisionAngle(visionSettings.value.angle);
+  }
+
+  /**
+   * Цвет кнопки-предустановки угла обзора.
+   *
+   * Вынесено из шаблона: в `v-for` computed не принимает аргумент, а тернарники
+   * классов прямо в разметке правилами проекта запрещены.
+   *
+   * @param preset - угол предустановки в градусах
+   * @returns цвет кнопки Nuxt UI
+   */
+  function getVisionAnglePresetColor(preset: number): 'primary' | 'neutral' {
+    return visionSettings.value.angle === preset ? 'primary' : 'neutral';
+  }
+
+  /**
+   * Вариант отрисовки кнопки-предустановки угла обзора.
+   *
+   * @param preset - угол предустановки в градусах
+   * @returns вариант кнопки Nuxt UI
+   */
+  function getVisionAnglePresetVariant(preset: number): 'solid' | 'subtle' {
+    return visionSettings.value.angle === preset ? 'solid' : 'subtle';
+  }
 
   // Превью токена: размер, стиль изображения, перетаскивание и зум
   const {
@@ -236,29 +316,40 @@
   const tabs = [
     {
       key: 'general',
-      label: 'Общее',
+      label: TOKEN_SETTINGS_LABELS.tabGeneral,
       icon: 'tabler:settings-filled',
       slot: 'general',
     },
     {
       key: 'token',
-      label: 'Токен',
+      label: TOKEN_SETTINGS_LABELS.tabToken,
       icon: 'tabler:photo',
       slot: 'token',
     },
     {
       key: 'vision',
-      label: 'Зрение',
+      label: TOKEN_SETTINGS_LABELS.tabVision,
       icon: 'tabler:eye',
       slot: 'vision',
     },
     {
       key: 'light',
-      label: 'Освещение',
+      label: TOKEN_SETTINGS_LABELS.tabLighting,
       icon: 'tabler:bulb',
       slot: 'light',
     },
   ];
+
+  const {
+    selectedOwnerIds,
+    ownersChanged,
+    ensureOwnershipCurrent,
+    ownershipUpdates,
+    resetOwnership,
+  } = useEntityOwnershipSettings(
+    () => creature.value,
+    () => toast.add(ENTITY_OWNERSHIP_CONFLICT_TOAST),
+  );
 
   const hasChanges = computed(() => {
     if (!creature.value) {
@@ -268,8 +359,7 @@
     const tokenChanged =
       tokenSettings.value.imageUrl !== (creature.value.token?.imageUrl || '')
       || tokenSettings.value.frameUrl !== (creature.value.token?.frameUrl || '')
-      || tokenSettings.value.scale
-        !== (creature.value.token?.scale || TOKEN_SCALE_DEFAULT)
+      || tokenSettings.value.scale !== resolveCreatureTokenScale(creature.value)
       || tokenSettings.value.textureScale
         !== (creature.value.token?.textureScale ?? 1)
       || tokenSettings.value.textureX
@@ -277,27 +367,29 @@
       || tokenSettings.value.textureY
         !== (creature.value.token?.textureY ?? 0.5)
       || tokenSettings.value.rotation !== (creature.value.token?.rotation ?? 0)
-      || tokenSettings.value.tint !== (creature.value.token?.tint || '#ffffff')
+      || tokenSettings.value.tint
+        !== (creature.value.token?.tint || TOKEN_TINT_DEFAULT)
       || tokenSettings.value.disposition
         !== (creature.value.token?.disposition || 'hostile')
       || tokenSettings.value.showName
         !== (creature.value.token?.showName ?? false)
       || tokenSettings.value.hpDisplayMode
-        !== (creature.value.token?.hpDisplayMode ?? 'text');
+        !== (creature.value.token?.hpDisplayMode ?? 'text')
+      || tokenSettings.value.facingEnabled
+        !== (creature.value.token?.facingEnabled ?? false);
+
+    const savedVision = readTokenVision(creature.value.token);
 
     const visionChanged =
-      visionSettings.value.enabled
-        !== (creature.value.token?.vision?.enabled || false)
-      || visionSettings.value.range
-        !== (creature.value.token?.vision?.range || TOKEN_VISION_RANGE_DEFAULT)
-      || visionSettings.value.darkvision
-        !== (creature.value.token?.vision?.darkvision
-          || TOKEN_DARKVISION_DEFAULT);
+      visionSettings.value.enabled !== savedVision.enabled
+      || visionSettings.value.range !== savedVision.range
+      || visionSettings.value.darkvision !== savedVision.darkvision
+      || visionSettings.value.angle !== savedVision.angle;
 
     const autoSavesChanged =
       autoSaves.value !== (creature.value.autoSaves ?? true);
 
-    const ownerChanged = selectedOwner.value !== creature.value.ownerId;
+    const ownerChanged = isAdmin.value && ownersChanged.value;
     const publicChanged = isPublic.value !== (creature.value.isPublic || false);
 
     const lightChanged =
@@ -384,15 +476,16 @@
       tokenSettings.value = {
         imageUrl: creature.value.token?.imageUrl || '',
         frameUrl: creature.value.token?.frameUrl || '',
-        scale: creature.value.token?.scale || TOKEN_SCALE_DEFAULT,
+        scale: resolveCreatureTokenScale(creature.value),
         textureScale: creature.value.token?.textureScale ?? 1,
         textureX: creature.value.token?.textureX ?? 0.5,
         textureY: creature.value.token?.textureY ?? 0.5,
         rotation: creature.value.token?.rotation ?? 0,
-        tint: creature.value.token?.tint || '#ffffff',
+        tint: creature.value.token?.tint || TOKEN_TINT_DEFAULT,
         disposition: creature.value.token?.disposition || 'hostile',
         showName: creature.value.token?.showName ?? false,
         hpDisplayMode: creature.value.token?.hpDisplayMode ?? 'text',
+        facingEnabled: creature.value.token?.facingEnabled ?? false,
       };
 
       if (tokenSettings.value.frameUrl) {
@@ -401,26 +494,28 @@
         showFrame.value = false;
       }
 
-      visionSettings.value = {
-        enabled: creature.value.token?.vision?.enabled || false,
-        range:
-          creature.value.token?.vision?.range || TOKEN_VISION_RANGE_DEFAULT,
-        darkvision:
-          creature.value.token?.vision?.darkvision || TOKEN_DARKVISION_DEFAULT,
-      };
+      visionSettings.value = readTokenVision(creature.value.token);
 
       lightSettings.value = creature.value.token?.light
         ? { ...creature.value.token.light }
         : createDefaultLightEmitter();
 
       autoSaves.value = creature.value.autoSaves ?? true;
-      selectedOwner.value = creature.value.ownerId;
+      resetOwnership();
       isPublic.value = creature.value.isPublic || false;
     }
   }
 
-  function saveSettings() {
+  async function saveSettings(): Promise<void> {
     if (!creature.value) {
+      return;
+    }
+
+    if (!canEditToken.value) {
+      return;
+    }
+
+    if (isAdmin.value && !ensureOwnershipCurrent()) {
       return;
     }
 
@@ -440,38 +535,68 @@
         disposition: tokenSettings.value.disposition,
         showName: tokenSettings.value.showName,
         hpDisplayMode: tokenSettings.value.hpDisplayMode,
+        facingEnabled: tokenSettings.value.facingEnabled,
         vision: {
           enabled: visionSettings.value.enabled,
           range: visionSettings.value.range,
           darkvision: visionSettings.value.darkvision,
-          angle: 360,
+          angle: visionSettings.value.angle,
         },
         light: { ...lightSettings.value },
       };
 
-      // Синхронизация размера существа с масштабом токена
+      // Синхронизация размера существа с масштабом токена. Произвольный
+      // масштаб (токен растянут на сцене вручную) в таблицу не попадает —
+      // тогда оставляем размер существа как есть, а не понижаем до среднего.
       const updatedSystem = {
         ...creature.value.system,
-        size: SCALE_TO_SIZE[tokenSettings.value.scale] ?? 'Medium',
+        size:
+          TOKEN_SCALE_TO_CREATURE_SIZE[tokenSettings.value.scale]
+          ?? creature.value.system.size,
       };
 
-      if (props.onSave) {
-        props.onSave({
-          token: updatedToken,
-          system: updatedSystem,
-          autoSaves: autoSaves.value,
-          // Владельца меняет только ГМ
-          ...(isAdmin.value
-            ? { ownerId: selectedOwner.value, isPublic: isPublic.value }
-            : {}),
-        });
+      const adjustedHitPoints =
+        updatedSystem.size !== creature.value.system.size
+          ? resolveCreatureHitPointsByRules({
+              ...creature.value,
+              token: updatedToken,
+              system: updatedSystem,
+            })
+          : undefined;
+
+      const updates: Partial<DnDCreature> = {
+        token: updatedToken,
+        ...(updatedSystem.size !== creature.value.system.size
+          ? {
+              system: {
+                ...updatedSystem,
+                ...(adjustedHitPoints ? { hitPoints: adjustedHitPoints } : {}),
+              },
+            }
+          : {}),
+        autoSaves: autoSaves.value,
+        // Владельца меняет только ГМ
+        ...(isAdmin.value
+          ? { ...ownershipUpdates.value, isPublic: isPublic.value }
+          : {}),
+      };
+
+      if (props.creatureId) {
+        requireSocket(props.socket);
+
+        // Серверу — только то, чем поля окна отличаются от существа мира:
+        // урон, пришедший, пока окно было открыто, сохранение не возвращает
+        if (!(await saveEntityFields(props.socket, creature.value, updates))) {
+          return;
+        }
+
+        props.onPersistedSave?.(updates);
+      } else {
+        props.onSave?.(updates);
       }
 
       toast.add({
-        title: 'Настройки сохранены',
-        description: isAdmin.value
-          ? `Владелец: ${getOwnerName(selectedOwner.value)}`
-          : 'Токен и настройки существа обновлены',
+        title: TOKEN_SETTINGS_LABELS.savedTitle,
         color: 'success',
       });
 
@@ -480,8 +605,8 @@
       console.error(error);
 
       toast.add({
-        title: 'Ошибка',
-        description: 'Не удалось сохранить настройки',
+        title: TOAST_TITLES.error,
+        description: TOKEN_SETTINGS_LABELS.errorSave,
         color: 'error',
       });
     } finally {
@@ -553,10 +678,10 @@
     :draggable="true"
     :resizable="true"
     :z-index="props.zIndex"
-    title="Настройки существа"
+    :title="CREATURE_SETTINGS_LABELS.title"
     :ui="{
       content: 'max-w-2xl',
-      body: 'min-h-[400px]',
+      body: 'min-h-100',
     }"
     @bring-to-front="emit('bring-to-front')"
   >
@@ -564,7 +689,7 @@
       <div v-if="creature">
         <!-- Информация о существе -->
         <div
-          class="mb-4 flex items-center gap-3 rounded-lg border border-default bg-elevated/50 p-3"
+          class="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-default bg-elevated/50 p-3"
         >
           <UAvatar
             :src="getAssetUrl(creature.token?.imageUrl || '')"
@@ -583,37 +708,16 @@
               —
               {{
                 getAlignmentLabel(creature.system.alignment)
-                || 'Без мировоззрения'
+                || CREATURE_NO_ALIGNMENT
               }}
             </p>
           </div>
 
-          <!-- Выбор владельца -->
-          <div class="ml-auto shrink-0 space-y-1">
-            <label class="block text-xs text-muted">Владелец</label>
-
-            <USelect
-              v-if="isAdmin"
-              v-model="selectedOwner"
-              :items="userOptions"
-              value-key="value"
-              placeholder="Не назначен"
-              :portal="false"
-              class="w-40"
-            />
-
-            <div
-              v-else
-              class="flex items-center gap-1.5 text-xs text-muted"
-            >
-              <UIcon
-                name="tabler:user"
-                class="size-3.5"
-              />
-
-              <span>{{ getOwnerName(creature.ownerId) || 'Не назначен' }}</span>
-            </div>
-          </div>
+          <EntityOwnersSelect
+            v-model="selectedOwnerIds"
+            :users="ownershipUsers"
+            :editable="isAdmin"
+          />
         </div>
 
         <!-- Вкладки -->
@@ -630,13 +734,12 @@
                   class="flex items-center justify-between rounded border border-default/50 bg-elevated/30 p-3"
                 >
                   <div class="space-y-0.5">
-                    <label class="text-sm font-medium text-toned"
-                      >Виден всем</label
-                    >
+                    <label class="text-sm font-medium text-toned">
+                      {{ TOKEN_SETTINGS_LABELS.visibleToAll }}
+                    </label>
 
                     <p class="text-xs text-dimmed">
-                      Игроки смогут видеть это существо, но не смогут управлять
-                      им (управление — только у владельца и ГМа).
+                      {{ CREATURE_SETTINGS_LABELS.visibleToAllHint }}
                     </p>
                   </div>
 
@@ -651,12 +754,12 @@
                   class="flex items-center justify-between rounded border border-default/50 bg-elevated/30 p-3"
                 >
                   <div class="space-y-0.5">
-                    <label class="text-sm font-medium text-toned"
-                      >Авто-спасброски</label
-                    >
+                    <label class="text-sm font-medium text-toned">
+                      {{ TOKEN_SETTINGS_LABELS.autoSaves }}
+                    </label>
 
                     <p class="text-xs text-dimmed">
-                      Спасброски при заклинаниях кидаются автоматически.
+                      {{ TOKEN_SETTINGS_LABELS.autoSavesHint }}
                     </p>
                   </div>
 
@@ -667,18 +770,40 @@
                 </div>
               </div>
 
+              <!-- Направление взгляда: стрелка, поворот и автоповорот.
+                   Лежит в «Общем», а не в «Токене»: правило касается и
+                   фишки, и сектора обзора со вкладки «Зрение». -->
+              <div
+                class="flex items-center justify-between gap-3 rounded border border-default/50 bg-elevated/30 p-3"
+              >
+                <div class="space-y-0.5">
+                  <label class="text-sm font-medium text-toned">
+                    {{ TOKEN_SETTINGS_LABELS.facingEnabled }}
+                  </label>
+
+                  <p class="text-xs text-dimmed">
+                    {{ facingEnabledHint }}
+                  </p>
+                </div>
+
+                <USwitch
+                  :model-value="isFacingEnabled"
+                  :disabled="isFacingForced || !canEditToken"
+                  @update:model-value="setFacingEnabled"
+                />
+              </div>
+
               <div class="grid grid-cols-2 gap-3">
                 <div
                   class="flex items-center justify-between rounded border border-default/50 bg-elevated/30 p-3"
                 >
                   <div class="space-y-0.5">
-                    <label class="text-sm font-medium text-toned"
-                      >Показывать имя</label
-                    >
+                    <label class="text-sm font-medium text-toned">
+                      {{ TOKEN_SETTINGS_LABELS.showName }}
+                    </label>
 
                     <p class="text-xs text-dimmed">
-                      По умолчанию имя токена скрыто и отображается только при
-                      включении этой опции.
+                      {{ TOKEN_SETTINGS_LABELS.showNameHint }}
                     </p>
                   </div>
 
@@ -698,9 +823,9 @@
                       class="size-4 text-muted"
                     />
 
-                    <label class="flex-1 text-sm font-medium text-toned"
-                      >Отображение ХП</label
-                    >
+                    <label class="flex-1 text-sm font-medium text-toned">
+                      {{ TOKEN_SETTINGS_LABELS.hpDisplay }}
+                    </label>
                   </div>
 
                   <div class="grid grid-cols-2 gap-2">
@@ -718,7 +843,9 @@
                       />
 
                       <div>
-                        <div class="font-medium">Полоска</div>
+                        <div class="font-medium">
+                          {{ TOKEN_SETTINGS_LABELS.hpBar }}
+                        </div>
                       </div>
                     </button>
 
@@ -736,7 +863,9 @@
                       />
 
                       <div>
-                        <div class="font-medium">Состояние</div>
+                        <div class="font-medium">
+                          {{ TOKEN_SETTINGS_LABELS.hpState }}
+                        </div>
                       </div>
                     </button>
                   </div>
@@ -751,9 +880,9 @@
                     class="size-4 text-muted"
                   />
 
-                  <label class="text-sm font-medium text-toned"
-                    >Размер токена</label
-                  >
+                  <label class="text-sm font-medium text-toned">
+                    {{ TOKEN_SETTINGS_LABELS.tokenSize }}
+                  </label>
                 </div>
 
                 <div class="grid grid-cols-3 gap-1.5">
@@ -784,9 +913,9 @@
                     class="h-4 w-4 text-muted"
                   />
 
-                  <label class="text-sm font-medium text-toned"
-                    >Отношение токена (Disposition)</label
-                  >
+                  <label class="text-sm font-medium text-toned">
+                    {{ TOKEN_SETTINGS_LABELS.disposition }}
+                  </label>
                 </div>
 
                 <div class="grid grid-cols-3 gap-2">
@@ -802,7 +931,9 @@
                       tokenSettings.disposition = 'friendly'
                     "
                   >
-                    <span class="text-sm font-medium">Дружелюбный</span>
+                    <span class="text-sm font-medium">
+                      {{ TOKEN_SETTINGS_LABELS.dispositionFriendly }}
+                    </span>
                   </button>
 
                   <button
@@ -817,7 +948,9 @@
                       tokenSettings.disposition = 'neutral'
                     "
                   >
-                    <span class="text-sm font-medium">Нейтральный</span>
+                    <span class="text-sm font-medium">
+                      {{ TOKEN_SETTINGS_LABELS.dispositionNeutral }}
+                    </span>
                   </button>
 
                   <button
@@ -833,13 +966,14 @@
                       tokenSettings.disposition = 'hostile'
                     "
                   >
-                    <span class="text-sm font-medium">Враждебный</span>
+                    <span class="text-sm font-medium">
+                      {{ TOKEN_SETTINGS_LABELS.dispositionHostile }}
+                    </span>
                   </button>
                 </div>
 
                 <p class="mt-2 text-xs text-dimmed">
-                  Влияет на автоматический расчёт радиусов аур. Враждебный по
-                  умолчанию.
+                  {{ TOKEN_SETTINGS_LABELS.dispositionHint }}
                 </p>
               </div>
             </div>
@@ -849,18 +983,22 @@
           <template #token>
             <div class="flex h-full flex-col gap-4 overflow-hidden pt-4">
               <!-- 1. Превью (Сверху) -->
-              <div class="flex h-[280px] flex-none flex-col">
+              <div class="flex h-70 flex-none flex-col">
                 <div class="mb-2 flex items-center justify-between">
-                  <div class="text-sm font-medium text-toned">Превью</div>
+                  <div class="text-sm font-medium text-toned">
+                    {{ TOKEN_SETTINGS_LABELS.preview }}
+                  </div>
 
                   <div class="flex gap-2 text-xs text-dimmed">
-                    <span class="flex items-center gap-1"
-                      ><UIcon name="tabler:click" /> Перемещение</span
-                    >
+                    <span class="flex items-center gap-1">
+                      <UIcon name="tabler:click" />
+                      {{ TOKEN_SETTINGS_LABELS.previewMove }}
+                    </span>
 
-                    <span class="flex items-center gap-1"
-                      ><UIcon name="tabler:arrows-maximize" /> Колесо: Зум</span
-                    >
+                    <span class="flex items-center gap-1">
+                      <UIcon name="tabler:arrows-maximize" />
+                      {{ TOKEN_SETTINGS_LABELS.previewZoom }}
+                    </span>
                   </div>
                 </div>
 
@@ -871,7 +1009,9 @@
                   <div
                     class="absolute top-2 left-2 z-20 flex items-center gap-1.5 rounded-md bg-default/80 px-2 py-1"
                   >
-                    <span class="text-xs text-muted">Рамка</span>
+                    <span class="text-xs text-muted">
+                      {{ TOKEN_SETTINGS_LABELS.previewFrame }}
+                    </span>
 
                     <USwitch
                       v-model="showFrame"
@@ -886,7 +1026,7 @@
                     class="absolute inset-0 opacity-20"
                     style="
                       background-image: radial-gradient(
-                        #4b5563 1px,
+                        var(--ui-text-muted) 1px,
                         transparent 1px
                       );
                       background-size: 10px 10px;
@@ -932,7 +1072,7 @@
                           class="absolute inset-0 flex items-center justify-center text-dimmed"
                         >
                           <UIcon
-                            name="tabler:alien"
+                            :name="CREATURE_ICON"
                             class="h-1/2 w-1/2"
                           />
                         </div>
@@ -973,7 +1113,7 @@
                           class="flex h-full w-full items-center justify-center text-dimmed"
                         >
                           <UIcon
-                            name="tabler:alien"
+                            :name="CREATURE_ICON"
                             class="h-1/2 w-1/2"
                           />
                         </div>
@@ -987,6 +1127,50 @@
                 </div>
               </div>
 
+              <!-- 1.5. Поворот изображения внутри токена -->
+              <!-- Отступы обязательны: вкладка обрезает переполнение
+                   (`overflow-hidden`), и без них круглый бегунок ползунка
+                   срезался бы по обоим краям. -->
+              <div
+                class="flex-none rounded-lg border border-default/50 bg-elevated/50 p-4"
+              >
+                <div class="mb-2 flex items-center justify-between">
+                  <label class="text-sm font-medium text-toned">
+                    {{ TOKEN_SETTINGS_LABELS.imageRotation }}
+                  </label>
+
+                  <div class="flex items-center gap-2">
+                    <span class="text-sm text-muted">
+                      {{ Math.round(tokenSettings.rotation) }}°
+                    </span>
+
+                    <UButton
+                      icon="tabler:rotate-clockwise"
+                      color="neutral"
+                      variant="ghost"
+                      size="xs"
+                      :title="TOKEN_SETTINGS_LABELS.imageRotationReset"
+                      :disabled="!(isAdmin || isOwner)"
+                      @click.left.exact.prevent="
+                        tokenSettings.rotation = TOKEN_IMAGE_ROTATION_DEFAULT
+                      "
+                    />
+                  </div>
+                </div>
+
+                <USlider
+                  v-model.number="tokenSettings.rotation"
+                  :min="TOKEN_IMAGE_ROTATION_MIN"
+                  :max="TOKEN_IMAGE_ROTATION_MAX"
+                  :step="TOKEN_IMAGE_ROTATION_STEP"
+                  :disabled="!(isAdmin || isOwner)"
+                />
+
+                <p class="mt-2 text-xs text-dimmed">
+                  {{ TOKEN_SETTINGS_LABELS.imageRotationHint }}
+                </p>
+              </div>
+
               <!-- 2. Изображение токена (по стилю EditSceneModal) -->
               <div
                 class="flex min-h-0 flex-1 flex-col space-y-4 overflow-hidden rounded-lg border border-default/50 bg-elevated/50 p-4"
@@ -998,10 +1182,10 @@
                     name="tabler:photo"
                     class="h-5 w-5 text-primary"
                   />
-                  Изображение токена
+                  {{ TOKEN_SETTINGS_LABELS.tokenImage }}
                 </h3>
 
-                <UFormField label="URL изображения">
+                <UFormField :label="TOKEN_SETTINGS_LABELS.imageUrl">
                   <UInput
                     v-model="tokenSettings.imageUrl"
                     placeholder="https://..."
@@ -1034,12 +1218,12 @@
                 class="flex items-center justify-between rounded border border-default/50 bg-elevated/30 p-3"
               >
                 <div class="space-y-0.5">
-                  <label class="text-sm font-medium text-toned"
-                    >Зрение включено</label
-                  >
+                  <label class="text-sm font-medium text-toned">
+                    {{ TOKEN_SETTINGS_LABELS.visionEnabled }}
+                  </label>
 
                   <p class="text-xs text-dimmed">
-                    Токен будет ограничен зрением
+                    {{ TOKEN_SETTINGS_LABELS.visionEnabledHint }}
                   </p>
                 </div>
 
@@ -1052,9 +1236,9 @@
               <template v-if="visionSettings.enabled">
                 <div class="grid grid-cols-2 gap-3">
                   <div class="space-y-2">
-                    <label class="block text-sm font-medium text-toned"
-                      >Зрение</label
-                    >
+                    <label class="block text-sm font-medium text-toned">
+                      {{ TOKEN_SETTINGS_LABELS.vision }}
+                    </label>
 
                     <UInput
                       v-model.number="visionSettings.range"
@@ -1065,14 +1249,14 @@
                     />
 
                     <p class="text-xs text-dimmed">
-                      Дальность зрения в футах (0 = безграничное)
+                      {{ TOKEN_SETTINGS_LABELS.visionRangeHint }}
                     </p>
                   </div>
 
                   <div class="space-y-2">
-                    <label class="block text-sm font-medium text-toned"
-                      >Тёмное зрение</label
-                    >
+                    <label class="block text-sm font-medium text-toned">
+                      {{ TOKEN_SETTINGS_LABELS.darkvision }}
+                    </label>
 
                     <UInput
                       v-model.number="visionSettings.darkvision"
@@ -1083,28 +1267,77 @@
                     />
 
                     <p class="text-xs text-dimmed">
-                      Дальность зрения в темноте в футах
+                      {{ TOKEN_SETTINGS_LABELS.darkvisionRangeHint }}
                     </p>
                   </div>
                 </div>
 
                 <div
+                  class="mt-4 space-y-3 rounded border border-default/50 bg-elevated/30 p-4"
+                >
+                  <div class="flex items-center justify-between gap-3">
+                    <label class="text-sm font-medium text-toned">
+                      {{ TOKEN_SETTINGS_LABELS.visionAngle }}
+                    </label>
+
+                    <div class="flex items-center gap-2">
+                      <span class="text-sm text-muted">
+                        {{ visionAngleLabel }}
+                      </span>
+
+                      <UInput
+                        v-model.number="visionSettings.angle"
+                        type="number"
+                        class="w-24"
+                        :min="TOKEN_VISION_ANGLE_MIN"
+                        :max="TOKEN_VISION_ANGLE_MAX"
+                        :step="TOKEN_VISION_ANGLE_STEP"
+                        :disabled="!(isAdmin || isOwner)"
+                        @blur="normalizeVisionAngle"
+                      />
+                    </div>
+                  </div>
+
+                  <USlider
+                    v-model.number="visionSettings.angle"
+                    :min="TOKEN_VISION_ANGLE_MIN"
+                    :max="TOKEN_VISION_ANGLE_MAX"
+                    :step="TOKEN_VISION_ANGLE_STEP"
+                    :disabled="!(isAdmin || isOwner)"
+                  />
+
+                  <div class="flex flex-wrap gap-2">
+                    <UButton
+                      v-for="preset in TOKEN_VISION_ANGLE_PRESETS"
+                      :key="preset"
+                      size="xs"
+                      :color="getVisionAnglePresetColor(preset)"
+                      :variant="getVisionAnglePresetVariant(preset)"
+                      :disabled="!(isAdmin || isOwner)"
+                      @click.left.exact.prevent="visionSettings.angle = preset"
+                    >
+                      {{ preset }}°
+                    </UButton>
+                  </div>
+
+                  <p class="text-xs text-dimmed">
+                    {{ TOKEN_SETTINGS_LABELS.visionAngleHint }}
+                  </p>
+                </div>
+
+                <div
                   class="mt-6 rounded border border-default/50 bg-elevated/30 p-3 text-xs text-dimmed"
                 >
-                  <p class="mb-2 font-semibold">Подсказка:</p>
+                  <p class="mb-2 font-semibold">
+                    {{ TOKEN_SETTINGS_LABELS.hintPrefix }}
+                  </p>
 
                   <ul class="list-inside list-disc space-y-1">
-                    <li>Зрение: как далеко токен видит в дневном режиме</li>
+                    <li>{{ TOKEN_SETTINGS_LABELS.hintVision }}</li>
 
-                    <li>
-                      Тёмное зрение: как далеко токен видит в темноте (эльфы,
-                      дварфы)
-                    </li>
+                    <li>{{ TOKEN_SETTINGS_LABELS.hintDarkvision }}</li>
 
-                    <li>
-                      Без тёмного зрения в ночи токен видит только освещённые
-                      области
-                    </li>
+                    <li>{{ TOKEN_SETTINGS_LABELS.hintNoDarkvision }}</li>
                   </ul>
                 </div>
               </template>
@@ -1144,7 +1377,7 @@
             icon="tabler:trash"
             @click.left.exact.prevent="isDeleteConfirmOpen = true"
           >
-            Удалить
+            {{ MODAL_BUTTON_LABELS.remove }}
           </UButton>
         </div>
 
@@ -1154,7 +1387,7 @@
             variant="soft"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -1164,7 +1397,7 @@
             :disabled="!hasChanges"
             @click.left.exact.prevent="saveSettings"
           >
-            Сохранить
+            {{ MODAL_BUTTON_LABELS.save }}
           </UButton>
         </div>
       </div>

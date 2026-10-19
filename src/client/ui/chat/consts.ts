@@ -13,3 +13,39 @@ export const RARITY_BORDER_CLASSES: Record<string, string> = {
 
 /** Класс рамки по умолчанию (нет редкости или «none») */
 export const RARITY_BORDER_DEFAULT = 'border-accented/50';
+
+/** Подписи карточки заклинания в чате */
+export const SPELL_CARD_LABELS = {
+  /** Значок концентрации — буквой, ряд от него не растёт */
+  concentrationBadge: 'К',
+  /** Значок ритуала */
+  ritualBadge: 'Р',
+  /** Приставка длительности, когда заклинание требует концентрации */
+  concentrationPrefix: 'Концентрация, ',
+  /** Компоненты по-русски: вербальный, соматический, материальный */
+  componentVerbal: 'В',
+  componentSomatic: 'С',
+  componentMaterial: 'М',
+  castingTimePrefix: 'Время:',
+  durationPrefix: 'Длительность:',
+  componentsPrefix: 'Компоненты:',
+  damagePrefix: 'Урон:',
+  higherLevelsPrefix: 'На высших кругах:',
+  error: 'Ошибка отображения карточки заклинания',
+} as const;
+
+/**
+ * Подписи карточки особенности в чате. Карточка одна на два вида записи —
+ * черту и особенность, и мета-строка называет, какая из них пришла в чат.
+ */
+export const FEATURE_CARD_LABELS = {
+  kindFeat: 'Черта',
+  kindFeature: 'Особенность',
+  error: 'Ошибка отображения карточки особенности',
+} as const;
+
+/** Подписи карточки предыстории в чате */
+export const BACKGROUND_CARD_LABELS = {
+  kind: 'Предыстория',
+  error: 'Ошибка отображения карточки предыстории',
+} as const;

@@ -12,13 +12,41 @@
 
 import type { TypedWebSocketClient } from '@vtt/shared';
 
+import { ClientHooks } from '@/core/clientHooks';
+import { loadCompendiumManifests } from '@/core/compendiumDataClient';
+import { getActiveSocket } from '@/system-runtime/activeSocket';
 import { systemRegistry } from '@vtt/shared';
 import { dnd5eSystemInstance } from '@vtt/shared/system/dnd.js';
 
-import { ClientHooks } from '@/core/clientHooks';
-import { getActiveSocket } from '@/system-runtime/activeSocket';
-
 import { useSystemDataStore } from './stores/systemDataStore';
+
+/**
+ * Достаёт набор уже подписанных сокетов.
+ *
+ * В режиме разработки (`npm run dev:hot`) модуль исполняется заново при каждой
+ * правке движка, и набор, объявленный просто переменной, каждый раз был бы
+ * пустым. Поэтому там он лежит в `import.meta.hot.data`, которое повторное
+ * исполнение переживает. В собранном бандле это обычный набор на всю сессию.
+ *
+ * @returns набор сокетов, на которые система уже подписалась
+ */
+function readSubscribedSockets(): WeakSet<object> {
+  const hot = import.meta.hot;
+
+  if (!hot) {
+    return new WeakSet<object>();
+  }
+
+  const kept: unknown = hot.data.subscribedSockets;
+  const sockets = kept instanceof WeakSet ? kept : new WeakSet<object>();
+
+  hot.data.subscribedSockets = sockets;
+
+  return sockets;
+}
+
+/** Сокеты, на которые система уже подписалась. */
+const subscribedSockets = readSubscribedSockets();
 
 /**
  * Подписывает переданный сокет на все справочные `system:*` события D&D и
@@ -28,6 +56,14 @@ import { useSystemDataStore } from './stores/systemDataStore';
  * @param socket - активный WebSocket-клиент
  */
 function subscribeSystemData(socket: TypedWebSocketClient): void {
+  // Сокет уже подписан: приложение перерегистрировало систему при открытом
+  // мире (режим разработки). Вторая подписка задвоила бы каждый обработчик.
+  if (subscribedSockets.has(socket)) {
+    return;
+  }
+
+  subscribedSockets.add(socket);
+
   const store = useSystemDataStore();
 
   // Агрегированный ответ — все справочные данные одним пакетом
@@ -44,55 +80,48 @@ function subscribeSystemData(socket: TypedWebSocketClient): void {
     store.setToolProperties(data.toolProperties);
   });
 
-  // Индивидуальные обработчики — обратная совместимость
-  socket.on('system:weapon-properties', (properties) => {
-    store.setWeaponProperties(properties);
-  });
+  // Отдельных подписок на `system:weapon-properties`, `system:damage-types` и
+  // остальные восемь здесь нет: сервер шлёт их только в ответ на такой же
+  // одиночный запрос (`system:request-*`), а система запрашивает всё разом.
 
-  socket.on('system:weapon-base-types', (baseTypes) => {
-    store.setWeaponBaseTypes(baseTypes);
-  });
-
-  socket.on('system:damage-types', (types) => {
-    store.setDamageTypes(types);
-  });
-
-  socket.on('system:weapon-categories', (categories) => {
-    store.setWeaponCategories(categories);
-  });
-
-  socket.on('system:ammunition-types', (types) => {
-    store.setAmmunitionTypes(types);
-  });
-
-  socket.on('system:sources', (sources) => {
-    store.setSources(sources);
-  });
-
-  socket.on('system:equipment-categories', (categories) => {
-    store.setArmorCategories(categories);
-  });
-
-  socket.on('system:armor-base-types', (baseTypes) => {
-    store.setArmorBaseTypes(baseTypes);
-  });
-
-  socket.on('system:equipment-properties', (properties) => {
-    store.setEquipmentProperties(properties);
-  });
-
-  socket.on('system:tool-properties', (properties) => {
-    store.setToolProperties(properties);
+  // Источники записей приезжают в манифестах паков: система знает только базовые
+  // книги, а в компендиуме встречается что угодно. Перечитываем и при обновлении
+  // паков — вместе с контентом мог измениться и состав источников.
+  socket.on('compendium:updated', () => {
+    void loadPackSources(socket, store);
   });
 
   // Запрашиваем данные при подключении (и сразу, если сокет уже подключён —
   // случай, когда система загрузилась после установления соединения).
   socket.on('connect', () => {
     socket.emit('system:request-all');
+    void loadPackSources(socket, store);
   });
 
   if (socket.connected) {
     socket.emit('system:request-all');
+    void loadPackSources(socket, store);
+  }
+}
+
+/**
+ * Собирает источники всех паков компендиума в хранилище системы.
+ *
+ * @param socket - активный WebSocket-клиент
+ * @param store - хранилище справочных данных системы
+ */
+async function loadPackSources(
+  socket: TypedWebSocketClient,
+  store: ReturnType<typeof useSystemDataStore>,
+): Promise<void> {
+  try {
+    const manifests = await loadCompendiumManifests(socket);
+
+    store.setPackSources(
+      manifests.flatMap((manifest) => manifest.sources ?? []),
+    );
+  } catch (error) {
+    console.warn('[Dnd5eSystemData] Источники паков не загрузились:', error);
   }
 }
 
@@ -116,9 +145,10 @@ function isOwnSystemActive(): boolean {
 }
 
 /**
- * Обработчик `socket:setup`. Хук ядра живёт до конца сессии (механизма снятия при
- * выгрузке системы нет), поэтому гейтим по активной системе: код dnd5e не должен
- * подписываться на сокет мира ЧУЖОЙ системы и слать ему `system:request-all`.
+ * Обработчик `socket:setup`. Подписка ставится один раз и живёт до конца
+ * сессии — система её не снимает, — поэтому гейтим по активной системе: код
+ * dnd5e не должен подписываться на сокет мира ЧУЖОЙ системы и слать ему
+ * `system:request-all`.
  *
  * @param socket - создаваемый WebSocket-клиент
  */
@@ -128,6 +158,17 @@ function handleSocketSetup(socket: TypedWebSocketClient): void {
   }
 
   subscribeSystemData(socket);
+}
+
+/**
+ * Обработчик `world:closed`: пользователь ушёл из мира — данные мира
+ * отпускаются. Обычное переподключение сокета хук не зовёт, но зовёт отказ в
+ * авторизации при переподключении (сессия истекла, пока мир перезапускался):
+ * для ядра это тот же выход из мира. Справочники после нового входа приедут
+ * сами, вписанный пользователем источник — нет.
+ */
+function handleWorldClosed(): void {
+  useSystemDataStore().releaseWorldData();
 }
 
 /**
@@ -147,5 +188,6 @@ export function registerSystemDataSync(): void {
   if (!hookInstalled) {
     hookInstalled = true;
     ClientHooks.on('socket:setup', handleSocketSetup);
+    ClientHooks.on('world:closed', handleWorldClosed);
   }
 }

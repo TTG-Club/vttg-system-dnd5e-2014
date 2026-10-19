@@ -1,43 +1,113 @@
 <script setup lang="ts">
-  import type { ProficiencyLevel, SkillType } from '@vtt/shared';
+  import type { AbilityType, ProficiencyLevel, SkillType } from '@vtt/shared';
+  import type { SkillEffectInfluence } from '@vtt/shared/system/dnd.js';
 
-  import { getSkillAbility } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
-  import { ABILITY_SHORT_LABELS } from '@/systems/dnd5e/ui/actor/constants';
+  import {
+    PASSIVE_SKILL_BASE,
+    summarizeSkillInfluenceTone,
+  } from '@vtt/shared/system/dnd.js';
 
+  import {
+    ABILITY_SHORT_LABELS,
+    HIGHLIGHTED_SKILL_ROW_CLASS,
+    SKILL_INFLUENCE_ICON,
+    SKILL_INFLUENCE_LABELS,
+    SKILL_INFLUENCE_TONE_CLASS,
+    SKILL_SETTINGS_LABELS,
+  } from './constants';
   import ProficiencyIndicator from './ProficiencyIndicator.vue';
+  import { formatSignedNumber } from './utils/formatSignedNumber';
 
   interface Props {
     label: string;
-    skillKey: SkillType;
+    /** Ключ навыка правил; не задан — навык заведён игроком */
+    skillKey?: SkillType;
+    /**
+     * Характеристика расчёта: в настройке навыков её подменяют, поэтому
+     * приходит готовой, а не выводится из ключа навыка.
+     */
+    ability: AbilityType;
     proficiencyLevel: ProficiencyLevel;
     modifier: number;
     isEditMode: boolean;
+    /** Навык заведён игроком: рядом с названием стоит пометка */
+    isCustom?: boolean;
+    /** Разбор значения для подсказки; пусто — навык считается по правилам */
+    valueHint?: string;
+    /**
+     * Не показывать сокращение характеристики: с группировкой её называет
+     * разделитель, и в строках она не повторяется.
+     */
+    hideAbility?: boolean;
+    /** Строка связана с наведённой характеристикой: она подсвечена */
+    isHighlighted?: boolean;
+    /** Наведена та самая характеристика навыка: её сокращение горит тёплым */
+    isAbilityHighlighted?: boolean;
+    /**
+     * Что сейчас влияет на бросок: кость «Наставления», преимущество, помеха.
+     * В число навыка это не входит — значок говорит, что бросок будет иным
+     */
+    influences: readonly SkillEffectInfluence[];
   }
 
   const props = defineProps<Props>();
 
   const emit = defineEmits<{
     'cycle-proficiency': [];
-    'roll': [modifier: number, label: string, key: SkillType];
+    /** Числа броска лист берёт из своей же строки — они и пришли из неё */
+    'roll': [];
   }>();
 
-  const attributeShortName = computed(() => {
-    const ability = getSkillAbility(props.skillKey);
-
-    return ABILITY_SHORT_LABELS[ability] || '';
-  });
+  const attributeShortName = computed(
+    () => ABILITY_SHORT_LABELS[props.ability] || '',
+  );
 
   const modifier = computed(() => props.modifier);
 
-  const formattedModifier = computed(() => {
-    return modifier.value >= 0 ? `+${modifier.value}` : `${modifier.value}`;
-  });
+  const formattedModifier = computed(() => formatSignedNumber(modifier.value));
+
+  /** Значок владения: без владения приглушён, с владением горит тёплым */
+  const proficiencyClass = computed(() =>
+    props.proficiencyLevel === 'none' ? 'text-muted' : 'text-primary',
+  );
+
+  /** Строка навыка наведённой характеристики: мягкая заливка и обводка */
+  const rowClass = computed(() =>
+    props.isHighlighted ? HIGHLIGHTED_SKILL_ROW_CLASS : undefined,
+  );
+
+  /** Сокращение характеристики: горит только у своей же наведённой */
+  const abilityLabelClass = computed(() =>
+    props.isAbilityHighlighted ? 'text-primary' : 'text-dimmed',
+  );
+
+  /** Цвет значка влияний: помогает, мешает или вперемешку */
+  const influenceClass = computed(
+    () =>
+      SKILL_INFLUENCE_TONE_CLASS[summarizeSkillInfluenceTone(props.influences)],
+  );
+
+  /** Строки подсказки: «Наставление — +1к4 к броску (только: …)» */
+  const influenceLines = computed(() =>
+    props.influences.map((influence) => {
+      const line = `${influence.source}${SKILL_INFLUENCE_LABELS.separator}${influence.text}`;
+
+      return influence.condition
+        ? `${line} (${SKILL_INFLUENCE_LABELS.conditionPrefix}${influence.condition})`
+        : line;
+    }),
+  );
+
+  /** Подпись значка для экранного диктора — те же строки одной фразой */
+  const influenceAriaLabel = computed(
+    () => `${SKILL_INFLUENCE_LABELS.title}: ${influenceLines.value.join('; ')}`,
+  );
 
   function handleClick() {
     if (!props.isEditMode) {
-      emit('roll', modifier.value, props.label, props.skillKey);
+      emit('roll');
     }
   }
 </script>
@@ -45,6 +115,7 @@
 <template>
   <div
     class="group flex cursor-pointer items-center justify-between rounded px-2 py-1.5 transition-colors hover:bg-accented/30"
+    :class="rowClass"
     @click.left.exact.prevent="handleClick"
   >
     <div class="flex min-w-0 flex-1 items-center gap-2.5">
@@ -52,31 +123,84 @@
       <ProficiencyIndicator
         :level="proficiencyLevel"
         :disabled="!isEditMode"
-        class="text-muted"
-        :class="{
-          'text-white': proficiencyLevel !== 'none',
-        }"
+        :class="proficiencyClass"
         @cycle="emit('cycle-proficiency')"
       />
 
       <!-- Сокращение характеристики -->
       <span
-        class="w-6 shrink-0 text-[10px] font-bold tracking-wider text-dimmed uppercase"
+        v-if="!hideAbility"
+        class="w-6 shrink-0 text-[10px] font-bold tracking-wider uppercase transition-colors"
+        :class="abilityLabelClass"
         >{{ attributeShortName }}</span
       >
 
       <span class="truncate text-sm font-medium text-toned">{{ label }}</span>
+
+      <span
+        v-if="isCustom"
+        class="shrink-0 rounded border border-primary/40 px-1 text-[9px] font-bold tracking-wider text-primary uppercase"
+        >{{ SKILL_SETTINGS_LABELS.customBadge }}</span
+      >
     </div>
 
     <div class="flex shrink-0 items-center gap-2">
-      <!-- Модификатор -->
-      <span class="w-6 text-right text-sm font-bold text-white">{{
-        formattedModifier
-      }}</span>
+      <!-- Влияния на бросок: в число навыка они не входят, поэтому о них
+        говорит значок, а разбор — в подсказке -->
+      <UTooltip
+        v-if="influenceLines.length > 0"
+        :delay-duration="300"
+        :ui="{ content: 'h-auto' }"
+      >
+        <span
+          role="img"
+          :aria-label="influenceAriaLabel"
+          class="flex"
+        >
+          <UIcon
+            :name="SKILL_INFLUENCE_ICON"
+            class="size-3.5"
+            :class="influenceClass"
+          />
+        </span>
+
+        <template #content>
+          <div class="flex flex-col gap-0.5">
+            <span class="font-semibold">{{
+              SKILL_INFLUENCE_LABELS.title
+            }}</span>
+
+            <span
+              v-for="(line, index) in influenceLines"
+              :key="index"
+              >{{ line }}</span
+            >
+          </div>
+        </template>
+      </UTooltip>
+
+      <!-- Модификатор. Навык не по правилам не сходится с характеристикой
+        строки: пунктир зовёт навести и прочитать разбор -->
+      <UTooltip
+        v-if="valueHint"
+        :text="valueHint"
+        :delay-duration="300"
+      >
+        <span
+          class="w-6 text-right text-sm font-bold text-highlighted underline decoration-dotted underline-offset-2"
+          >{{ formattedModifier }}</span
+        >
+      </UTooltip>
+
+      <span
+        v-else
+        class="w-6 text-right text-sm font-bold text-highlighted"
+        >{{ formattedModifier }}</span
+      >
 
       <!-- Пассивное значение (10 + модификатор) -->
       <span class="w-5 text-right text-xs font-semibold text-dimmed">{{
-        10 + modifier
+        PASSIVE_SKILL_BASE + modifier
       }}</span>
     </div>
   </div>

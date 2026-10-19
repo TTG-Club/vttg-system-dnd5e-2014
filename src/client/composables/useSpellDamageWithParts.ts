@@ -1,100 +1,100 @@
-import type { DamagePart, Scene, SceneEntity } from '@vtt/shared';
+import type { ChatBlock, ChatBlockRow, Scene, SceneEntity } from '@vtt/shared';
 import type {
   ActiveEffect,
+  AttackDamageRecord,
+  AttackDamageTarget,
+  AttackHitConsequences,
   DamageDefenseOutcome,
+  DamageHit,
   DnDSceneEntity,
+  HpChangeDetail,
+  SavingThrowResult,
   Spell,
 } from '@vtt/shared/system/dnd.js';
 
 import type {
   RolledSpellDamagePart,
-  SavingThrowResult,
   SpellResolutionContext,
   SpellTargetResult,
 } from './spellResolutionShared';
+import type {
+  EffectDamageLine,
+  TargetEffectsResult,
+} from './useTargetEffectResolution';
 
-import {
-  generateId,
-  isActorEntity,
-  isCreatureEntity,
-  resolveGridCellSize,
-} from '@vtt/shared';
+import { useModalManager } from '@/shared_ui/composables/useModalManager';
+import { useChatStore } from '@/stores/chatStore';
+import { generateId, resolveGridCellSize } from '@vtt/shared';
 import {
   applyHpChange,
   applyMultiTypeDamageDefenses,
-  expandDamageParts,
-  findTokensInTemplate,
+  attachHpChangeDetails,
+  buildActionChatHeader,
+  buildDamageChatRowLabel,
+  buildUnappliedDamageValue,
+  captureHitConsequences,
+  describeDamagePartRoll,
+  describeSpellSaveSource,
+  formatDamageDefenseNote,
   formatDamageDefenseSuffix,
-  getEntityConditionImmunities,
-  isImmuneToCondition,
+  formatDiceFormula,
+  formatHpChangeValue,
+  getSpellSaveCondition,
+  headChatBlocks,
+  isDndSceneEntity,
+  isEntityHpShownToPlayers,
+  isSpellRoll,
+  joinChatDetail,
+  limitEntityHealing,
   mergeAppliedEffects,
-  resolveActorStats,
-  resolveEffectApplication,
+  pickRowTargetName,
+  recordDamageHit,
+  resolveEntityCurrentHp,
+  resolveEntityMaxHp,
+  resolveEntityTempHp,
+  resolveTargetDamageDefenses,
+  scaleSaveDamage,
   withInitializedDuration,
+  writeEntityHitPoints,
 } from '@vtt/shared/system/dnd.js';
 
-import { emitEntityUpdate } from '@/core/entityUtils';
-import { useModalManager } from '@/shared_ui/composables/useModalManager';
-import { useChatStore } from '@/stores/chatStore';
-import { useDiceRollerStore } from '@/stores/diceRollerStore';
-import { useTargetStore } from '@/stores/targetStore';
-
 import {
+  DAMAGE_DEDUCTION_LABELS,
+  SPELL_NO_TARGETS_LABELS,
+  SPELL_SUMMARY_LABELS,
+} from '../ui/actor/constants';
+import { chooseAreaTargets } from './areaTargetChoice';
+import { resolveSelectedAttackTarget } from './attackRollSnapshot';
+import {
+  buildAttackDamageChatOptions,
+  buildCombatChatOptions,
+  buildSpeakerChatOptions,
+} from './damageChatMessage';
+import { changeEntityCombatState } from './entityCombatWrite';
+import {
+  buildSaveDamageDefense,
+  formatSaveCancelledMessage,
   formatTargetGateSuffix,
   getPartKindLabel,
-  orderTargetsBySaveMode,
+  isSaveAbility,
   partPassesTargetGate,
-  stampEffectTurnDuration,
+  resolveAttackerIgnoredResistances,
 } from './spellResolutionShared';
 import { useSpellSavingThrows } from './useSpellSavingThrows';
-
-/**
- * Проставляет динамическую Сл повторного спасброска: если у эффекта
- * `recurringSave.dc === 0` (маркер «использовать Сл кастера»), возвращает копию
- * с подставленной Сл заклинателя. Нужно заклинаниям персонажей (Сл зависит от
- * билда); у существ Сл фиксирована (dc > 0) и не трогается.
- *
- * @param effect - накладываемый эффект
- * @param spellSaveDC - Сл спасброска источника (кастера)
- * @returns исходный эффект или копия с проставленной Сл
- */
-function stampRecurringSaveDc(
-  effect: ActiveEffect,
-  spellSaveDC: number,
-): ActiveEffect {
-  if (!effect.recurringSave || effect.recurringSave.dc > 0) {
-    return effect;
-  }
-
-  return {
-    ...effect,
-    recurringSave: { ...effect.recurringSave, dc: spellSaveDC },
-  };
-}
-
-/** Строка чата для одной части урона наложенного эффекта */
-interface EffectDamageLine {
-  /** Локализованный тип урона (для заголовка) */
-  typeLabel: string;
-  /** Формула броска */
-  formula: string;
-  /** Выпавшие значения кубиков */
-  values: number[];
-  /** Итог урона после множителя спаса и защит */
-  applied: number;
-  /** Сработавшая защита (уязв./сопр./иммун.) */
-  outcome: DamageDefenseOutcome;
-}
+import {
+  targetEffectsCanLand,
+  useTargetEffectResolution,
+} from './useTargetEffectResolution';
 
 /**
  * Композабл для многочастного разрешения урона/лечения заклинания.
  */
 export function useSpellDamageWithParts() {
   const chatStore = useChatStore();
-  const targetStore = useTargetStore();
-  const diceRollerStore = useDiceRollerStore();
   const { openModal } = useModalManager();
-  const { resolveSavingThrowForTarget } = useSpellSavingThrows();
+
+  const { resolveSavingThrowsForTargets } = useSpellSavingThrows();
+  const { resolveTargetEffects } = useTargetEffectResolution();
 
   /**
    * Записывает чистое изменение HP сущности ОДНИМ апдейтом.
@@ -113,7 +113,7 @@ export function useSpellDamageWithParts() {
    * @param totalHeal - суммарное лечение
    * @param totalTempHeal - суммарные временные ХП (`@heal.temp`)
    * @param effectsToApply - эффекты для наложения (или undefined)
-   * @param socket - сокет
+   * @param hit - удар для событий урона цели: типы, крит, кто бил
    * @returns HP до/после, полученные временные ХП и имена наложенных эффектов
    */
   function writeEntityHpDelta(
@@ -122,86 +122,133 @@ export function useSpellDamageWithParts() {
     totalHeal: number,
     totalTempHeal: number,
     effectsToApply: ActiveEffect[] | undefined,
-    socket: SpellResolutionContext['socket'],
+    hit: Omit<DamageHit, 'amount'>,
   ): {
     hpBefore: number;
     hpAfter: number;
+    /** Хиты до и после с временными — для подробностей строки сводки */
+    hpChange?: HpChangeDetail;
     tempHpGained: number;
+    /** Сколько временных хитов снято: по нему урон отменяется из чата */
+    tempHpLost: number;
     appliedEffects: string[];
+    /** Что удар изменил у цели помимо хитов: отмена снимет ровно это */
+    consequences: AttackHitConsequences;
   } {
-    // Ядро видит entity как Base*; в D&D-композабле восстанавливаем D&D-форму.
-    const dnd = entity as DnDSceneEntity;
-
-    const hpBefore = isCreatureEntity(dnd)
-      ? (dnd.system.hitPoints.current ?? 0)
-      : dnd.system.hitPoints.current;
-
-    const maxHp = isCreatureEntity(dnd)
-      ? (dnd.system.hitPoints.max ?? 0)
-      : dnd.system.hitPoints.max;
-
-    const tempBefore = dnd.system.hitPoints.temp ?? 0;
-
-    // Урон сначала снимает временные ХП (правило 5e), остаток — текущие
-    const hpChange = applyHpChange({
-      hpBefore,
-      maxHp,
-      tempBefore,
-      damage: totalDamage,
-      heal: totalHeal,
-    });
-
-    const hpAfter = hpChange.hpAfter;
-
-    // Новые временные ХП не суммируются с оставшимися — берётся большее
-    const tempAfter = Math.max(hpChange.tempAfter, totalTempHeal);
-
-    const updatedEntity: DnDSceneEntity = JSON.parse(JSON.stringify(entity));
-
-    if (isCreatureEntity(updatedEntity)) {
-      updatedEntity.system.hitPoints.current = hpAfter;
-      updatedEntity.system.hitPoints.temp = tempAfter;
-    } else if (isActorEntity(updatedEntity)) {
-      updatedEntity.system.hitPoints.current = hpAfter;
-      updatedEntity.system.hitPoints.temp = tempAfter;
+    // Ядро видит entity как Base*; D&D-форму подтверждает гвард. Без данных
+    // системы писать в хиты нечего — запись пропускается, а не считается от
+    // мусора.
+    if (!isDndSceneEntity(entity)) {
+      return {
+        hpBefore: 0,
+        hpAfter: 0,
+        tempHpGained: 0,
+        tempHpLost: 0,
+        appliedEffects: [],
+        consequences: {},
+      };
     }
 
-    const appliedEffects: string[] = [];
+    /**
+     * Хиты и эффекты цели после частей. Считается от той сущности, которую
+     * получает: при записи — от свежей, из мира.
+     *
+     * @param target - цель
+     * @returns новая копия цели и итог для сводки
+     */
+    function settleTarget(target: DnDSceneEntity) {
+      const hpBefore = resolveEntityCurrentHp(target);
+      const maxHp = resolveEntityMaxHp(target);
+      const tempBefore = resolveEntityTempHp(target);
 
-    if (effectsToApply && effectsToApply.length > 0) {
-      if (!updatedEntity.activeEffects) {
-        updatedEntity.activeEffects = [];
-      }
+      // Запрет лечения: «не может восстанавливать хиты» / «временные хиты»
+      const healing = limitEntityHealing(target, {
+        hitPoints: totalHeal,
+        temporary: totalTempHeal,
+      });
 
-      // Один и тот же статус не стакается: повтор ЗАМЕНЯЕТ прежний (5e 2024,
-      // «самый недавний/сильный»); разные эффекты складываются.
-      const instantiated = effectsToApply.map(
-        (effect): ActiveEffect =>
+      // Урон сначала снимает временные ХП (правило 5e), остаток — текущие
+      const hpChange = applyHpChange({
+        hpBefore,
+        maxHp,
+        tempBefore,
+        damage: totalDamage,
+        heal: healing.hitPoints,
+      });
+
+      const hpAfter = hpChange.hpAfter;
+
+      // Новые временные ХП не суммируются с оставшимися — берётся большее
+      const tempAfter = Math.max(hpChange.tempAfter, healing.temporary);
+
+      const updatedEntity: DnDSceneEntity = JSON.parse(JSON.stringify(target));
+
+      writeEntityHitPoints(updatedEntity, {
+        current: hpAfter,
+        temp: tempAfter,
+      });
+
+      recordDamageHit(updatedEntity, {
+        ...hit,
+        amount: hpBefore + tempBefore - hpAfter - tempAfter,
+      });
+
+      const appliedEffects: string[] = [];
+
+      if (effectsToApply && effectsToApply.length > 0) {
+        // Один и тот же статус не стакается: повтор ЗАМЕНЯЕТ прежний (5e 2024,
+        // «самый недавний/сильный»); разные эффекты складываются.
+        const instantiated = effectsToApply.map((effect): ActiveEffect =>
           withInitializedDuration({
             ...effect,
             id: generateId('effect'),
             origin: 'spell',
           }),
-      );
+        );
 
-      updatedEntity.activeEffects = mergeAppliedEffects(
-        updatedEntity.activeEffects,
-        instantiated,
-      );
+        updatedEntity.activeEffects = mergeAppliedEffects(
+          updatedEntity.activeEffects ?? [],
+          instantiated,
+        );
 
-      for (const effect of instantiated) {
-        appliedEffects.push(effect.name);
+        for (const effect of instantiated) {
+          appliedEffects.push(effect.name);
+        }
       }
+
+      return {
+        updatedEntity,
+        outcome: {
+          hpBefore,
+          hpAfter,
+          hpChange: {
+            hpBefore,
+            hpAfter,
+            tempBefore,
+            tempAfter,
+            isPublic: isEntityHpShownToPlayers(target),
+          },
+          tempHpGained: tempAfter - hpChange.tempAfter,
+          tempHpLost: tempBefore - tempAfter,
+          appliedEffects,
+          consequences: captureHitConsequences(target, updatedEntity),
+        },
+      };
     }
 
-    emitEntityUpdate(socket, updatedEntity);
+    let settled: ReturnType<typeof settleTarget> | undefined;
 
-    return {
-      hpBefore,
-      hpAfter,
-      tempHpGained: tempAfter - hpChange.tempAfter,
-      appliedEffects,
-    };
+    // Боевым каналом: цель чужая, полную замену сущности сервер не примет.
+    // Цель перечитывается в момент записи — части катались до окон
+    // спасбросков, и копия из списка устарела бы
+    changeEntityCombatState(entity.id, (current) => {
+      settled = settleTarget(current);
+
+      return settled.updatedEntity;
+    });
+
+    // Записи не было (соединение, цель исчезла) — сводка всё равно нужна
+    return (settled ?? settleTarget(entity)).outcome;
   }
 
   /**
@@ -239,7 +286,7 @@ export function useSpellDamageWithParts() {
       const description = chooseParts
         .map(
           (part) =>
-            `${getPartKindLabel(part)} ${part.formula}${formatTargetGateSuffix(part.targetGate)}`,
+            `${getPartKindLabel(part)} ${part.formula}${formatTargetGateSuffix(part.targetGate, part.targetTypeGate, part.targetStatusGate)}`,
         )
         .join(', ');
 
@@ -260,94 +307,6 @@ export function useSpellDamageWithParts() {
   }
 
   /**
-   * Бросает урон эффекта (с множителем спаса) и применяет защиты цели по типу.
-   * Поддерживает плоские формулы; @-формулы пропускаются с warn (у эффектов
-   * существ/оружия формулы плоские, контекста заклинания тут нет).
-   *
-   * @param entity - цель
-   * @param parts - части урона эффекта
-   * @param multiplier - множитель урона (1 / 0.5 по результату спасброска)
-   * @returns суммарный урон и сработавшая защита цели
-   */
-  function rollEffectDamage(
-    entity: SceneEntity,
-    parts: DamagePart[],
-    multiplier: number,
-  ): {
-    damage: number;
-    outcome: DamageDefenseOutcome;
-    lines: EffectDamageLine[];
-  } {
-    const stats = resolveActorStats(entity as DnDSceneEntity);
-
-    let total = 0;
-    let outcome: DamageDefenseOutcome = 'normal';
-
-    const lines: EffectDamageLine[] = [];
-
-    // Разворачиваем инлайн-токены `@dmg.<type>`/`@target.*` в типизированные
-    // сегменты тем же ядром, что и базовый урон: редактор пишет тип урона
-    // токеном (напр. `2к6@dmg.poison`), а не в поле `type`. У урона эффекта нет
-    // контекста `@mod`/`@prof`/`@level` — нерезолвенные сегменты пропускаем.
-    const segments = expandDamageParts(parts, undefined, (formula) => formula);
-
-    for (const segment of segments) {
-      // Урон эффекта не лечит (редактор скрывает @heal) — на всякий случай.
-      if (segment.isHealing) {
-        continue;
-      }
-
-      if (segment.formula.includes('@')) {
-        console.warn(
-          '[EffectDamage] @-формула не поддержана:',
-          segment.formula,
-        );
-
-        continue;
-      }
-
-      const rolled = diceRollerStore.parseAndRoll(segment.formula);
-      const values = rolled.dice.flatMap((group) => group.values);
-
-      const types = segment.types ?? (segment.type ? [segment.type] : []);
-
-      let damage = Math.floor(rolled.total * multiplier);
-      let partOutcome: DamageDefenseOutcome = 'normal';
-
-      if (types.length > 0) {
-        const defense = applyMultiTypeDamageDefenses(
-          damage,
-          types,
-          stats.damageDefenses,
-        );
-
-        damage = defense.finalDamage;
-        partOutcome = defense.outcome;
-
-        if (defense.outcome !== 'normal') {
-          outcome = defense.outcome;
-        }
-      }
-
-      total += damage;
-
-      lines.push({
-        typeLabel: getPartKindLabel({
-          isHealing: false,
-          type: segment.type,
-          types: segment.types,
-        }),
-        formula: segment.formula,
-        values,
-        applied: damage,
-        outcome: partOutcome,
-      });
-    }
-
-    return { damage: total, outcome, lines };
-  }
-
-  /**
    * Многочастное разрешение урона/лечения заклинания.
    *
    * Бросок уже выполнен в модалке (значения в `parts`). Логика:
@@ -356,9 +315,10 @@ export function useSpellDamageWithParts() {
    * - `self`-части → заклинателю;
    * - гейт-ветки `@target.full`/`@target.notFull` (`targetGate`) — фильтруются
    *   по фактическому HP каждой цели в момент применения (per-target);
-   * - спасбросок — один на цель (авто или ручной через DiceRollModal по
-   *   `autoSaves` цели; авто-цели обрабатываются первыми), влияет на
-   *   урон-части цели;
+   * - спасбросок — один на цель, берётся ПАЧКОЙ до всякого применения:
+   *   цель под чужим владением бросает у себя (запрос владельцу), своя —
+   *   окном или автоматически по `autoSaves`; результат влияет на урон-части
+   *   цели, а отказ сворачивает всё действие;
    * - защиты по типу — на каждую урон-часть;
    * - `requiresDamage` — лечащая/гейтнутая часть применяется только если по
    *   заклинанию суммарно нанесён урон (>0).
@@ -370,6 +330,8 @@ export function useSpellDamageWithParts() {
    * @param options - сцена и кэш шаблона AoE
    * @param options.scene - текущая сцена
    * @param options.cachedTemplate - кэшированный шаблон AoE (если заклинание с областью)
+   * @param options.targetEntities - цели, выбранные для этого каста заранее
+   *   (выбор целей заклинания-эффекта); важнее шаблона и текущей цели
    */
   async function resolveSpellDamageWithParts(
     context: SpellResolutionContext,
@@ -377,30 +339,46 @@ export function useSpellDamageWithParts() {
     options: {
       scene: Scene | null;
       cachedTemplate?: import('@vtt/shared').MeasurementTemplate | null;
+      targetEntities?: readonly SceneEntity[];
     },
   ): Promise<void> {
-    const { spell, spellSaveDC, actors, socket } = context;
+    const { spell, spellSaveDC, actors } = context;
     const { scene, cachedTemplate } = options;
 
-    // 1. Целевые сущности: AoE-шаблон или одиночная цель из targetStore
+    /**
+     * Сворачивает действие: спасбросок цели закрыли, не бросив. Ничего не
+     * применяется (все спасброски берутся ДО первой записи HP), но в чат уходит
+     * явная строка — молчаливое исчезновение действия и было тем багом.
+     */
+    function sendCancelledMessage(): void {
+      chatStore.sendMessage(formatSaveCancelledMessage(spell.name), 'text');
+    }
+
+    // 1. Целевые сущности: заранее выбранные цели, AoE-шаблон или одиночная
+    // цель (`resolveSelectedAttackTarget`)
     const targetEntities: SceneEntity[] = [];
 
-    if (cachedTemplate && scene) {
-      const affectedTokens = findTokensInTemplate(
-        cachedTemplate,
-        scene.tokens ?? [],
-        resolveGridCellSize(scene.gridSettings),
+    if (options.targetEntities) {
+      targetEntities.push(
+        ...options.targetEntities.filter((entity) => entity.system?.abilities),
       );
-
-      for (const token of affectedTokens) {
-        const entity = actors.find((item) => item.id === token.actorId);
-
-        if (entity?.system?.abilities) {
-          targetEntities.push(entity);
-        }
-      }
+    } else if (cachedTemplate && scene) {
+      // Кого накрыл шаблон и кого из них задеть — общим правилом области:
+      // без мёртвых, с выбором применившего, если он настроен
+      targetEntities.push(
+        ...(await chooseAreaTargets({
+          source: spell,
+          casterId: context.casterId,
+          template: cachedTemplate,
+          tokens: scene.tokens ?? [],
+          gridSize: resolveGridCellSize(scene.gridSettings),
+          entities: actors,
+        })),
+      );
     } else {
-      const targetEntity = targetStore.getTargetActor();
+      // Выбранная цель — из сущностей разбора: с эффектами, которые
+      // израсходовал бросок этой атаки
+      const targetEntity = resolveSelectedAttackTarget(actors);
 
       if (targetEntity?.system?.abilities) {
         targetEntities.push(targetEntity);
@@ -411,6 +389,12 @@ export function useSpellDamageWithParts() {
     const caster = context.casterId
       ? (actors.find((item) => item.id === context.casterId) ?? null)
       : null;
+
+    // Сопротивления целей, которые игнорирует урон заклинателя
+    const ignoredResistances = resolveAttackerIgnoredResistances(
+      context.casterId,
+      context.attack,
+    );
 
     // Разделяем части по адресату:
     // - self    → заклинателю;
@@ -430,6 +414,99 @@ export function useSpellDamageWithParts() {
 
     if (chooseParts.length > 0) {
       chooseEntity = await pickChooseTarget(spell, chooseParts, scene, actors);
+    }
+
+    // Эффекты на цель ложатся и без урона, поэтому спасбросок они требуют
+    // наравне с частями — знать об этом надо уже при сборе целей.
+    const hasTargetEffects = (spell.activeEffects ?? []).some(
+      (effect) => !effect.disabled && effect.effectTarget === 'target',
+    );
+
+    /**
+     * Цели, которым нужен спасбросок «на приземление»: те, кому реально что-то
+     * прилетает — часть урона/лечения или эффект. Считается ЧИСТЫМИ проверками,
+     * без бросков: пачку надо знать целиком до первого из них.
+     *
+     * @returns целевые сущности без повторов
+     */
+    function collectLandingSaveTargets(): SceneEntity[] {
+      const collected = new Map<string, SceneEntity>();
+
+      if (selectedParts.length > 0) {
+        for (const entity of targetEntities) {
+          if (
+            selectedParts.some((part) => partPassesTargetGate(part, entity))
+          ) {
+            collected.set(entity.id, entity);
+          }
+        }
+      }
+
+      // Цель, на которую ни один эффект не ляжет (условие наложения,
+      // иммунитет к состоянию), спасбросок ради эффектов не бросает
+      if (hasTargetEffects) {
+        for (const entity of targetEntities) {
+          if (
+            targetEffectsCanLand({
+              spell,
+              entity,
+              spellSaveDC,
+              casterId: context.casterId,
+            })
+          ) {
+            collected.set(entity.id, entity);
+          }
+        }
+      }
+
+      const chosen = chooseEntity;
+
+      if (chosen && chooseParts.length > 0) {
+        const applicable = chooseParts.filter((part) =>
+          partPassesTargetGate(part, chosen),
+        );
+
+        // Лечению спасбросок не нужен — спрашиваем только под урон
+        if (applicable.some((part) => !part.isHealing)) {
+          collected.set(chosen.id, chosen);
+        }
+      }
+
+      return [...collected.values()];
+    }
+
+    // 2b. Спасброски целей берём ОДНОЙ пачкой и ДО всякого применения:
+    // запросы чужим владельцам уходят параллельно (пятеро задетых площадью
+    // бросают разом, а не в очередь), а отмена любого сворачивает действие,
+    // пока ничего ещё не применено.
+    const landingSaves = new Map<string, SavingThrowResult>();
+
+    if (isSaveAbility(spell.saveType)) {
+      const saveAbility = spell.saveType;
+      const againstCondition = getSpellSaveCondition(spell);
+
+      const resolved = await resolveSavingThrowsForTargets(
+        collectLandingSaveTargets().map((entity) => ({
+          entity,
+          ability: saveAbility,
+          dc: spellSaveDC,
+          againstCondition,
+          againstSpell: isSpellRoll(spell),
+          sourceEntityId: context.casterId,
+          sourceName: spell.name,
+          ...describeSpellSaveSource(spell),
+        })),
+      );
+
+      for (const [entityId, save] of resolved) {
+        if (save === null) {
+          sendCancelledMessage();
+
+          return;
+        }
+
+        landingSaves.set(entityId, save);
+      }
     }
 
     interface EntityAccumulator {
@@ -457,6 +534,11 @@ export function useSpellDamageWithParts() {
       outcome: DamageDefenseOutcome;
       /** Лечащая/врем. часть с `requiresDamage` — скрыта, пока урон не нанесён */
       requiresGate: boolean;
+      /**
+       * Доля броска до защит цели (спасбросок): с ней урон перебрасывается
+       * кнопкой из чата. Нет — часть не урон
+       */
+      scale?: number;
     }
 
     // Вклады по частям (ключ — брошенная часть), для разбивки чата по типам
@@ -472,6 +554,7 @@ export function useSpellDamageWithParts() {
       applied: number,
       outcome: DamageDefenseOutcome,
       requiresGate: boolean,
+      scale?: number,
     ): void {
       let list = partContributions.get(part);
 
@@ -486,7 +569,28 @@ export function useSpellDamageWithParts() {
         applied,
         outcome,
         requiresGate,
+        ...(scale === undefined ? {} : { scale }),
       });
+    }
+
+    /**
+     * Типы урона, дошедшего до цели: для условий «урон огнём» у её событий.
+     *
+     * @param entityId - цель
+     * @returns типы без повторов
+     */
+    function listEntityDamageTypes(entityId: string): string[] {
+      const types = [...partContributions].flatMap(([part, contributions]) =>
+        !part.isHealing
+        && contributions.some(
+          (contribution) =>
+            contribution.entityId === entityId && contribution.applied > 0,
+        )
+          ? (part.types ?? (part.type ? [part.type] : []))
+          : [],
+      );
+
+      return [...new Set(types)];
     }
 
     function getAccumulator(
@@ -522,34 +626,39 @@ export function useSpellDamageWithParts() {
       amount: number,
       types: string[] | undefined,
       save: SavingThrowResult | undefined,
-    ): { final: number; outcome: DamageDefenseOutcome } {
-      let dmg = amount;
-
-      if (save?.passed) {
-        if (spell.saveEffect === 'half') {
-          dmg = Math.floor(amount / 2);
-        } else if (spell.saveEffect === 'none') {
-          dmg = 0;
-        }
+    ): { final: number; outcome: DamageDefenseOutcome; scale: number } {
+      // Вычет из урона («минус кость к урону атак носителя») — не урон:
+      // защиты цели и спасбросок его не меняют, он просто уменьшает итог
+      if (amount < 0) {
+        return { final: amount, outcome: 'normal', scale: 1 };
       }
+
+      let scaledDamage = scaleSaveDamage(
+        amount,
+        spell.saveEffect,
+        save?.passed,
+        buildSaveDamageDefense(entity, spell),
+      );
 
       let outcome: DamageDefenseOutcome = 'normal';
 
-      if (types && types.length > 0) {
-        const stats = resolveActorStats(entity as DnDSceneEntity);
+      // Доля спасброска — до защит: её помнит запись урона в карточке чата
+      const scale = amount > 0 ? scaledDamage / amount : 1;
 
+      // Без данных системы защиты цели неизвестны — урон идёт как есть
+      if (types && types.length > 0 && isDndSceneEntity(entity)) {
         // Несколько типов на одной кости — защиты по наиболее выгодному цели
         const defenseResult = applyMultiTypeDamageDefenses(
-          dmg,
+          scaledDamage,
           types,
-          stats.damageDefenses,
+          resolveTargetDamageDefenses(entity, ignoredResistances),
         );
 
-        dmg = defenseResult.finalDamage;
+        scaledDamage = defenseResult.finalDamage;
         outcome = defenseResult.outcome;
       }
 
-      return { final: dmg, outcome };
+      return { final: scaledDamage, outcome, scale };
     }
 
     /** Накапливает часть в аккумулятор сущности. */
@@ -597,7 +706,7 @@ export function useSpellDamageWithParts() {
         return;
       }
 
-      const { final, outcome } = computeDamageFinal(
+      const { final, outcome, scale } = computeDamageFinal(
         accumulator.entity,
         part.amount,
         damageTypes,
@@ -611,20 +720,22 @@ export function useSpellDamageWithParts() {
       // Урон применяется всегда (requiresDamage на уроне игнорируется)
       accumulator.damageBase += final;
 
-      recordContribution(part, accumulator.entity, final, outcome, false);
+      recordContribution(
+        part,
+        accumulator.entity,
+        final,
+        outcome,
+        false,
+        scale,
+      );
     }
 
-    // 3. selected-части → каждой цели (спасбросок один на цель: авто или
-    // ручной по `autoSaves` цели; авто-цели обрабатываются первыми).
-    // Гейт-ветки @target.full/@target.notFull фильтруются по фактическому HP
-    // КАЖДОЙ цели (per-target): цель получает только ветку своего состояния.
+    // 3. selected-части → каждой цели (спасбросок один на цель, уже взят
+    // пачкой на шаге 2b). Гейт-ветки @target.full/@target.notFull фильтруются
+    // по фактическому HP КАЖДОЙ цели (per-target): цель получает только ветку
+    // своего состояния.
     if (selectedParts.length > 0) {
-      const orderedTargets = orderTargetsBySaveMode(
-        targetEntities,
-        spell.saveType,
-      );
-
-      for (const entity of orderedTargets) {
+      for (const entity of targetEntities) {
         const applicableParts = selectedParts.filter((part) =>
           partPassesTargetGate(part, entity),
         );
@@ -635,13 +746,7 @@ export function useSpellDamageWithParts() {
 
         const accumulator = getAccumulator(entity, true);
 
-        if (spell.saveType !== 'none' && accumulator.save === undefined) {
-          accumulator.save = await resolveSavingThrowForTarget(
-            entity,
-            spell.saveType,
-            spellSaveDC,
-          );
-        }
+        accumulator.save ??= landingSaves.get(entity.id);
 
         for (const part of applicableParts) {
           accumulatePart(accumulator, part, accumulator.save);
@@ -663,16 +768,8 @@ export function useSpellDamageWithParts() {
 
         const accumulator = getAccumulator(chooseEntity, hasDamagePart);
 
-        if (
-          hasDamagePart
-          && spell.saveType !== 'none'
-          && accumulator.save === undefined
-        ) {
-          accumulator.save = await resolveSavingThrowForTarget(
-            chooseEntity,
-            spell.saveType,
-            spellSaveDC,
-          );
+        if (hasDamagePart) {
+          accumulator.save ??= landingSaves.get(chooseEntity.id);
         }
 
         for (const part of applicableChooseParts) {
@@ -699,21 +796,11 @@ export function useSpellDamageWithParts() {
     // 4a. Гарантируем аккумулятор цели даже без частей урона (чистый статус):
     // эффекты с effectTarget 'target' должны примениться и без урона. Для
     // save-landing катаем landing-спас, чтобы эффекты без applySave гейтились им.
-    const hasTargetEffects = (spell.activeEffects ?? []).some(
-      (effect) => !effect.disabled && effect.effectTarget === 'target',
-    );
-
     if (hasTargetEffects) {
       for (const entity of targetEntities) {
         const accumulator = getAccumulator(entity, true);
 
-        if (spell.saveType !== 'none' && accumulator.save === undefined) {
-          accumulator.save = await resolveSavingThrowForTarget(
-            entity,
-            spell.saveType,
-            spellSaveDC,
-          );
-        }
+        accumulator.save ??= landingSaves.get(entity.id);
       }
     }
 
@@ -726,112 +813,35 @@ export function useSpellDamageWithParts() {
 
     const gateOpen = totalDamageNonGated > 0;
 
-    /**
-     * Собирает эффекты-состояния и доп.урон для цели: эффекты носителя с
-     * `effectTarget: 'target'` применяются по своему `applySave` (если задан),
-     * иначе по факту приземления; доп.урон эффекта катается с множителем спаса.
-     *
-     * @param entity - цель
-     * @param landingSave - результат landing-спасброска цели (если был)
-     * @returns эффекты для наложения, доп.урон и сработавшая защита
-     */
-    async function resolveTargetEffects(
-      entity: SceneEntity,
-      landingSave: SavingThrowResult | undefined,
-    ): Promise<{
-      effects: ActiveEffect[];
-      bonusDamage: number;
-      defenseOutcome: DamageDefenseOutcome;
-      damageLines: EffectDamageLine[];
-    }> {
-      const targetEffects = (spell.activeEffects ?? []).filter(
-        (effect) => !effect.disabled && effect.effectTarget === 'target',
-      );
+    // 5a. Эффекты целей разбираем ДО первой записи HP: у эффекта бывает свой
+    // спасбросок с окном, и его отмена обязана свернуть действие целиком —
+    // а уже применённый другим целям урон обратно не отыграть.
+    const targetEffectResults = new Map<string, TargetEffectsResult>();
 
-      // Приземление: атака/авто (saveType 'none') доходят сюда только попавшими;
-      // для landing-спаса «приземлилось» = цель провалила спас.
-      const landed = spell.saveType === 'none' || !landingSave?.passed;
-      const immunities = getEntityConditionImmunities(entity as DnDSceneEntity);
-
-      const collected: ActiveEffect[] = [];
-      const damageLines: EffectDamageLine[] = [];
-
-      let bonusDamage = 0;
-      let defenseOutcome: DamageDefenseOutcome = 'normal';
-
-      for (const effect of targetEffects) {
-        let applySaveSucceeded: boolean | undefined;
-
-        if (effect.applySave) {
-          const saveResult = await resolveSavingThrowForTarget(
-            entity,
-            effect.applySave.ability,
-            effect.applySave.dc,
-          );
-
-          applySaveSucceeded = saveResult.passed;
-        }
-
-        const application = resolveEffectApplication(effect, {
-          landed,
-          applySaveSucceeded,
-        });
-
-        if (
-          effect.damageParts
-          && effect.damageParts.length > 0
-          && application.damageMultiplier > 0
-        ) {
-          const rolled = rollEffectDamage(
-            entity,
-            effect.damageParts,
-            application.damageMultiplier,
-          );
-
-          bonusDamage += rolled.damage;
-          damageLines.push(...rolled.lines);
-
-          if (rolled.outcome !== 'normal') {
-            defenseOutcome = rolled.outcome;
-          }
-        }
-
-        if (!application.applyEffect) {
-          continue;
-        }
-
-        // Чисто-урон эффекты (без состояния и без модификаторов) не «висят» на
-        // цели — они только наносят урон (напр. яд за спасбросок). Но эффект с
-        // периодикой (DoT/повторный спас) обязан остаться на цели, чтобы тикать.
-        const isPersistent =
-          effect.conditionKey !== undefined
-          || effect.changes.length > 0
-          || effect.flags.length > 0
-          || effect.recurringDamage !== undefined
-          || effect.recurringSave !== undefined;
-
-        if (!isPersistent) {
-          continue;
-        }
-
-        const immune =
-          effect.conditionKey !== undefined
-          && isImmuneToCondition(immunities, effect.conditionKey);
-
-        if (!immune) {
-          // Точная turn-длительность инициализируется тут же (носитель = цель,
-          // источник = кастер): нужен текущий ход энкаунтера на момент наложения.
-          collected.push(
-            stampEffectTurnDuration(
-              stampRecurringSaveDc(effect, spellSaveDC),
-              entity.id,
-              context.casterId,
-            ),
-          );
-        }
+    for (const accumulator of accumulators.values()) {
+      if (!accumulator.isTarget) {
+        continue;
       }
 
-      return { effects: collected, bonusDamage, defenseOutcome, damageLines };
+      const targetResult = await resolveTargetEffects(
+        {
+          spell,
+          entity: accumulator.entity,
+          spellSaveDC,
+          casterId: context.casterId,
+          // Тот же гейт `requiresDamage`, что и у частей самого заклинания
+          damageDealt: gateOpen,
+        },
+        accumulator.save,
+      );
+
+      if (targetResult === null) {
+        sendCancelledMessage();
+
+        return;
+      }
+
+      targetEffectResults.set(accumulator.entity.id, targetResult);
     }
 
     // 6. Применяем по сущности ОДНИМ апдейтом
@@ -840,9 +850,17 @@ export function useSpellDamageWithParts() {
     // Доп.урон наложенных эффектов по цели — для отдельной группы в чате
     const effectDamageByEntity = new Map<string, EffectDamageLine[]>();
 
+    // Кому и сколько снято уроном: по этому кнопка в карточке чата отменит
+    // урон и нанесёт его заново
+    const damagedTargets: Omit<AttackDamageTarget, 'contributions'>[] = [];
+
     for (const accumulator of accumulators.values()) {
-      let totalDamage =
-        accumulator.damageBase + (gateOpen ? accumulator.damageGated : 0);
+      // «Минус кость к урону атак носителя» (строка урона со знаком минус)
+      // может перебить урон целиком — ниже нуля он не опускается
+      let totalDamage = Math.max(
+        0,
+        accumulator.damageBase + (gateOpen ? accumulator.damageGated : 0),
+      );
 
       const totalHeal =
         accumulator.healBase + (gateOpen ? accumulator.healGated : 0);
@@ -852,12 +870,9 @@ export function useSpellDamageWithParts() {
 
       let effectsToApply: ActiveEffect[] | undefined;
 
-      if (accumulator.isTarget) {
-        const targetResult = await resolveTargetEffects(
-          accumulator.entity,
-          accumulator.save,
-        );
+      const targetResult = targetEffectResults.get(accumulator.entity.id);
 
+      if (targetResult) {
         effectsToApply =
           targetResult.effects.length > 0 ? targetResult.effects : undefined;
 
@@ -875,15 +890,26 @@ export function useSpellDamageWithParts() {
         }
       }
 
-      const { hpBefore, hpAfter, tempHpGained, appliedEffects } =
-        writeEntityHpDelta(
-          accumulator.entity,
-          totalDamage,
-          totalHeal,
-          totalTempHeal,
-          effectsToApply,
-          socket,
-        );
+      const {
+        hpBefore,
+        hpAfter,
+        hpChange,
+        tempHpGained,
+        tempHpLost,
+        appliedEffects,
+        consequences,
+      } = writeEntityHpDelta(
+        accumulator.entity,
+        totalDamage,
+        totalHeal,
+        totalTempHeal,
+        effectsToApply,
+        {
+          types: listEntityDamageTypes(accumulator.entity.id),
+          critical: parts.some((part) => part.critical === true),
+          sourceId: context.casterId,
+        },
+      );
 
       results.push({
         actorName: accumulator.entity.name,
@@ -895,10 +921,26 @@ export function useSpellDamageWithParts() {
         healApplied: totalHeal,
         hpBefore,
         hpAfter,
+        hpChange,
         tempHpGained,
         defenseOutcome: accumulator.defenseOutcome,
         appliedEffects,
       });
+
+      if (totalDamage > 0) {
+        damagedTargets.push({
+          entityId: accumulator.entity.id,
+          name: accumulator.entity.name,
+          hpLost: hpBefore - hpAfter,
+          tempLost: tempHpLost,
+          // Полный урон цели, как он посчитан сейчас: от него «Половина» и
+          // «Крит» под уроном считают разницу
+          totals: parts.some((part) => part.critical === true)
+            ? { critical: totalDamage }
+            : { normal: totalDamage },
+          ...consequences,
+        });
+      }
     }
 
     // 7. Сводка в чат, СГРУППИРОВАННАЯ ПО ТИПУ УРОНА:
@@ -919,24 +961,182 @@ export function useSpellDamageWithParts() {
     const messageLines = [spell.name];
     const usedEffectEntities = new Set<string>();
 
+    /**
+     * Та же сводка блоками карточки чата: блок без шапки на часть, в нём
+     * строка на цель — вид урона или лечения и итог. Текст сводки остаётся
+     * запасным видом — для всплывающих сообщений и ядра без блоков
+     */
+    const summaryBlocks: ChatBlock[] = [];
+
+    /**
+     * Последняя строка каждой цели в сводке: в её подробности встанут хиты
+     * цели до и после — урон разложен по частям, а хиты у цели одни
+     */
+    const hpRowByEntity = new Map<
+      string,
+      { blockIndex: number; rowIndex: number }
+    >();
+
+    /**
+     * Запоминает строку цели в блоке, который сейчас будет добавлен в сводку.
+     *
+     * @param entityId - цель строки
+     * @param rowIndex - номер строки в добавляемом блоке
+     */
+    function markHpRow(entityId: string, rowIndex: number): void {
+      hpRowByEntity.set(entityId, {
+        blockIndex: summaryBlocks.length,
+        rowIndex,
+      });
+    }
+
+    /**
+     * Имя цели для строки сводки: строки называют цель, только когда целей
+     * несколько, — единственную называет шапка карточки.
+     *
+     * @param targetName - имя цели строки
+     * @returns поле `target` строки или пусто
+     */
+    function rowTarget(targetName: string): Pick<ChatBlockRow, 'target'> {
+      const target = pickRowTargetName(targetName, results.length);
+
+      return target ? { target } : {};
+    }
+
+    /**
+     * Запись об уроне для кнопок в карточке атаки: части урона и то, что они
+     * сняли с каждой цели. Лечение в запись не входит — кнопки про урон.
+     *
+     * @returns запись или `null`, если урон никому не достался
+     */
+    function buildDamageRecord(): AttackDamageRecord | null {
+      const damageParts = parts.filter(
+        (part) => !part.isHealing && part.amount !== 0,
+      );
+
+      const targets = damagedTargets.map((target) => ({
+        ...target,
+        contributions: damageParts.flatMap((part, partIndex) =>
+          (partContributions.get(part) ?? [])
+            .filter((contribution) => contribution.entityId === target.entityId)
+            .map((contribution) => ({
+              part: partIndex,
+              scale: contribution.scale ?? 1,
+            })),
+        ),
+      }));
+
+      if (damageParts.length === 0 || targets.length === 0) {
+        return null;
+      }
+
+      return {
+        label: spell.name,
+        critical: parts.some((part) => part.critical === true),
+        ...(context.casterId ? { sourceId: context.casterId } : {}),
+        ...(ignoredResistances.length > 0
+          ? { ignoredResistances: [...ignoredResistances] }
+          : {}),
+        parts: damageParts.map((part) => ({
+          formula: part.formula,
+          types: part.types ?? (part.type ? [part.type] : []),
+          roll: describeDamagePartRoll({
+            formula: part.formula,
+            total: part.amount,
+            values: part.values,
+            critical: part.critical === true,
+          }),
+        })),
+        targets,
+      };
+    }
+
+    /**
+     * Сводка называет брошенный урон — лента выделит её фоном урона. Достался
+     * ли он кому-то, не важно: урон «в пустоту» (цель не выбрана, в области
+     * никого) — тоже бросок урона
+     */
+    let dealsDamage = false;
+
     // Перебираем части В ПОРЯДКЕ заклинания/оружия (пропускаем нулевые —
     // например, не сработавшие условные ветки @target.full/@target.notFull).
     for (const part of parts) {
-      if (part.amount <= 0) {
+      if (part.amount === 0) {
         continue;
       }
 
       const contributions = partContributions.get(part);
-      const header = `${getPartKindLabel(part)}${formatTargetGateSuffix(part.targetGate)}`;
+
+      // Вычет из урона («−1к8 к урону атак носителя») — своей строкой: без
+      // неё в чате стоял бы полный урон, а хитов снялось бы меньше
+      if (part.amount < 0) {
+        if (!part.isHealing && contributions && contributions.length > 0) {
+          const rolledValues =
+            part.values.length > 0 ? `[${part.values.join(', ')}] = ` : '';
+
+          messageLines.push(DAMAGE_DEDUCTION_LABELS.header);
+
+          for (const contribution of contributions) {
+            messageLines.push(
+              `→ ${contribution.entityName}: ${formatDiceFormula(part.formula)} ${rolledValues}${contribution.applied}`,
+            );
+          }
+
+          contributions.forEach((contribution, rowIndex) => {
+            markHpRow(contribution.entityId, rowIndex);
+          });
+
+          summaryBlocks.push({
+            rows: contributions.map((contribution) => ({
+              icon: DAMAGE_DEDUCTION_LABELS.icon,
+              name: DAMAGE_DEDUCTION_LABELS.header,
+              ...rowTarget(contribution.entityName),
+              value: `${contribution.applied}`,
+              detail: `${formatDiceFormula(part.formula)} ${rolledValues}${part.amount}`,
+            })),
+          });
+        }
+
+        continue;
+      }
+
+      const header = `${getPartKindLabel(part)}${formatTargetGateSuffix(part.targetGate, part.targetTypeGate, part.targetStatusGate)}`;
 
       const diceBreakdown =
         part.values.length > 0 ? `[${part.values.join(', ')}] = ` : '';
+
+      /** Вид части: от него значок строки; название — с оговоркой о цели */
+      const rowKind = {
+        isHealing: part.isHealing,
+        healTemp: part.healTemp,
+        types: part.types ?? (part.type ? [part.type] : []),
+      };
+
+      /** Бросок части для подробностей строки: «1к8 + 3 [3] = 6» */
+      const rollDetail = `${formatDiceFormula(part.formula)} ${diceBreakdown}${part.amount}`;
 
       // Целей нет — но кубики брошены: показываем часть «в пустоту»
       if (!contributions || contributions.length === 0) {
         if (results.length === 0) {
           messageLines.push(header);
-          messageLines.push(`→ ${part.formula} ${diceBreakdown}${part.amount}`);
+
+          messageLines.push(
+            `→ ${formatDiceFormula(part.formula)} ${diceBreakdown}${part.amount}`,
+          );
+
+          summaryBlocks.push({
+            rows: [
+              {
+                ...buildDamageChatRowLabel(rowKind),
+                name: header,
+                ...buildUnappliedDamageValue(part.amount, rollDetail),
+              },
+            ],
+          });
+
+          if (!part.isHealing) {
+            dealsDamage = true;
+          }
         }
 
         continue;
@@ -956,20 +1156,72 @@ export function useSpellDamageWithParts() {
       const sign = part.isHealing ? '+' : '-';
       const hpSuffix = part.healTemp ? ' врем. HP' : ' HP';
 
+      if (!part.isHealing) {
+        dealsDamage = true;
+      }
+
+      const blockRows: NonNullable<ChatBlock['rows']> = [];
+
       for (const contribution of visibleContributions) {
         const defenseSuffix = formatDamageDefenseSuffix(contribution.outcome);
 
-        let line = `→ ${contribution.entityName}: ${part.formula} ${diceBreakdown}${sign}${contribution.applied}${hpSuffix}${defenseSuffix}`;
+        let line = `→ ${contribution.entityName}: ${formatDiceFormula(part.formula)} ${diceBreakdown}${sign}${contribution.applied}${hpSuffix}${defenseSuffix}`;
 
         const effects = effectsByEntity.get(contribution.entityId);
 
-        if (effects && !usedEffectEntities.has(contribution.entityId)) {
+        const showsEffects =
+          effects !== undefined
+          && !usedEffectEntities.has(contribution.entityId);
+
+        if (effects && showsEffects) {
           usedEffectEntities.add(contribution.entityId);
           line += ` [${effects.join(', ')}]`;
         }
 
         messageLines.push(line);
+        markHpRow(contribution.entityId, blockRows.length);
+
+        blockRows.push({
+          ...buildDamageChatRowLabel(rowKind),
+          name: header,
+          ...rowTarget(contribution.entityName),
+          ...formatHpChangeValue(contribution.applied, part),
+          // Наложенное ударом — тоже итог: видно сразу, а не в подробностях
+          ...(effects && showsEffects && effects.length > 0
+            ? { note: effects.join(', ') }
+            : {}),
+          detail: joinChatDetail([
+            rollDetail,
+            formatDamageDefenseNote(contribution.outcome),
+          ]),
+        });
       }
+
+      summaryBlocks.push({ rows: blockRows });
+    }
+
+    // Эффекты целей, которых не назвала ни одна часть (у заклинания-эффекта
+    // частей нет вовсе): без этой строки наложенное в чате не видно.
+    const effectRows: NonNullable<ChatBlock['rows']> = [];
+
+    for (const result of results) {
+      const effects = effectsByEntity.get(result.actorId);
+
+      if (effects && !usedEffectEntities.has(result.actorId)) {
+        usedEffectEntities.add(result.actorId);
+        messageLines.push(`→ ${result.actorName}: [${effects.join(', ')}]`);
+
+        effectRows.push({
+          icon: SPELL_SUMMARY_LABELS.effectsIcon,
+          name: SPELL_SUMMARY_LABELS.effects,
+          ...rowTarget(result.actorName),
+          ...(effects.length > 0 ? { note: effects.join(', ') } : {}),
+        });
+      }
+    }
+
+    if (effectRows.length > 0) {
+      summaryBlocks.push({ rows: effectRows });
     }
 
     // Доп.урон от наложенных эффектов — отдельной группой (в HP уже учтён выше).
@@ -986,19 +1238,105 @@ export function useSpellDamageWithParts() {
             ? `[${damageLine.values.join(', ')}] = `
             : '';
 
-        messageLines.push(`${damageLine.typeLabel} (эффект)`);
+        messageLines.push(
+          `${damageLine.typeLabel}${SPELL_SUMMARY_LABELS.effectDamageSuffix}`,
+        );
+
+        dealsDamage = true;
 
         messageLines.push(
-          `→ ${result.actorName}: ${damageLine.formula} ${breakdown}-${damageLine.applied} HP${formatDamageDefenseSuffix(damageLine.outcome)}`,
+          `→ ${result.actorName}: ${formatDiceFormula(damageLine.formula)} ${breakdown}-${damageLine.applied} HP${formatDamageDefenseSuffix(damageLine.outcome)}`,
         );
+
+        markHpRow(result.actorId, 0);
+
+        summaryBlocks.push({
+          rows: [
+            {
+              icon: SPELL_SUMMARY_LABELS.effectsIcon,
+              name: `${damageLine.typeLabel}${SPELL_SUMMARY_LABELS.effectDamageSuffix}`,
+              ...rowTarget(result.actorName),
+              ...formatHpChangeValue(damageLine.applied),
+              detail: joinChatDetail([
+                `${formatDiceFormula(damageLine.formula)} ${breakdown}${damageLine.applied}`,
+                formatDamageDefenseNote(damageLine.outcome),
+              ]),
+            },
+          ],
+        });
       }
     }
 
-    if (results.length === 0) {
-      messageLines.push('→ Нет целей');
+    // Никого не задело и показать нечего — ни одной брошенной части. Только
+    // тогда причина названа явно: пустая карточка читалась бы как поломка.
+    // Брошенный «в пустоту» урон говорит сам за себя — строка «цель не
+    // выбрана» под ним была бы шумом
+    const emptyReason = cachedTemplate
+      ? SPELL_NO_TARGETS_LABELS.emptyArea
+      : SPELL_NO_TARGETS_LABELS.noTarget;
+
+    const noTargetsReason =
+      results.length === 0 && summaryBlocks.length === 0
+        ? emptyReason
+        : undefined;
+
+    if (noTargetsReason) {
+      messageLines.push(`→ ${noTargetsReason}`);
     }
 
-    chatStore.sendMessage(messageLines.join('\n'), 'text');
+    const summary = messageLines.join('\n');
+    const attackMessageId = context.attack?.chatMessageId;
+
+    // Хиты целей до и после — в подробности последней строки каждой цели:
+    // видны всем, только если хиты цели открыты игрокам, иначе — мастеру
+    const detailedBlocks = attachHpChangeDetails(
+      summaryBlocks,
+      results.flatMap((result) => {
+        const placement = hpRowByEntity.get(result.actorId);
+
+        return placement && result.hpChange
+          ? [{ ...placement, change: result.hpChange }]
+          : [];
+      }),
+    );
+
+    // Отдельной карточке нужна шапка — чем действовали и по кому (если цель
+    // одна); в карточке атаки её роль играет шапка броска. Сами строки урона
+    // в обеих одни и те же
+    const standaloneBlocks: ChatBlock[] = noTargetsReason
+      ? [{ title: spell.name, note: noTargetsReason }]
+      : headChatBlocks(
+          buildActionChatHeader({
+            name: spell.name,
+            targetNames: results.map((result) => result.actorName),
+          }),
+          detailedBlocks,
+        );
+
+    const chatOptions = dealsDamage
+      ? buildCombatChatOptions(context.casterId, standaloneBlocks)
+      : {
+          ...buildSpeakerChatOptions(context.casterId),
+          blocks: standaloneBlocks,
+        };
+
+    // Итог атаки дописывается в карточку её броска; без неё — отдельно
+    if (
+      attackMessageId
+      && chatStore.appendToMessage?.(
+        attackMessageId,
+        summary,
+        'text',
+        undefined,
+        dealsDamage
+          ? buildAttackDamageChatOptions(buildDamageRecord(), detailedBlocks)
+          : { blocks: detailedBlocks },
+      )
+    ) {
+      return;
+    }
+
+    chatStore.sendMessage(summary, 'text', undefined, undefined, chatOptions);
   }
 
   return {

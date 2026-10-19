@@ -1,18 +1,21 @@
 <script setup lang="ts">
-  import type { GameItem } from '@vtt/shared/system/dnd.js';
+  import type { DnDGameItem } from '@vtt/shared/system/dnd.js';
 
-  import { formatItemCost } from '@vtt/shared';
-  import {
-    formatWeaponDamageFormula,
-    getEquipmentCategoryIcon,
-    RARITY_COLORS,
-    RARITY_OPTIONS,
-  } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
   import CardErrorFallback from '@/shared_ui/components/CardErrorFallback.vue';
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
+  import { formatItemCost } from '@vtt/shared';
+  import {
+    describeWeaponDamageDisplay,
+    getEquipmentCategoryIcon,
+    isDnDGameItem,
+    RARITY_COLORS,
+    RARITY_OPTIONS,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { EQUIPMENT_CARD_LABELS, WEIGHT_UNIT_LABEL } from '../actor/constants';
+  import { parseCardPayload } from './cardPayload';
   import { RARITY_BORDER_CLASSES, RARITY_BORDER_DEFAULT } from './consts';
 
   const props = defineProps<{
@@ -21,13 +24,9 @@
   }>();
 
   /** Десериализованный предмет */
-  const item = computed<GameItem | null>(() => {
-    try {
-      return JSON.parse(props.payload) as GameItem;
-    } catch {
-      return null;
-    }
-  });
+  const item = computed<DnDGameItem | null>(() =>
+    parseCardPayload(props.payload, isDnDGameItem),
+  );
 
   /** Цвет рамки карточки по редкости */
   const rarityBorderClass = computed(() => {
@@ -57,7 +56,9 @@
       return '';
     }
 
-    return item.value.type === 'weapon' ? 'Оружие' : 'Экипировка';
+    return item.value.type === 'weapon'
+      ? EQUIPMENT_CARD_LABELS.kindWeapon
+      : EQUIPMENT_CARD_LABELS.kindEquipment;
   });
 
   /** Иконка по типу */
@@ -84,7 +85,7 @@
     <div class="flex items-start gap-2 bg-elevated/60 px-3 py-2">
       <UIcon
         :name="typeIcon"
-        class="mt-0.5 size-4 shrink-0 text-primary-400"
+        class="mt-0.5 size-4 shrink-0 text-primary"
       />
 
       <span class="flex-1 text-sm font-semibold text-highlighted">
@@ -121,10 +122,12 @@
           v-if="item.type === 'weapon' && item.damageParts?.length"
           class="flex items-center gap-1"
         >
-          <span class="text-dimmed">Урон:</span>
+          <span class="text-dimmed">{{
+            EQUIPMENT_CARD_LABELS.damagePrefix
+          }}</span>
 
           <span class="font-mono font-semibold text-danger/80">
-            {{ formatWeaponDamageFormula(item) }}
+            {{ describeWeaponDamageDisplay(item).formula }}
           </span>
         </div>
 
@@ -133,7 +136,9 @@
           v-if="item.type === 'equipment' && item.baseArmorAC"
           class="flex items-center gap-1"
         >
-          <span class="text-dimmed">КД:</span>
+          <span class="text-dimmed">{{
+            EQUIPMENT_CARD_LABELS.armorClassPrefix
+          }}</span>
 
           <span class="font-mono font-semibold text-info/80">
             {{
@@ -149,9 +154,11 @@
           v-if="item.cost"
           class="flex items-center gap-1"
         >
-          <span class="text-dimmed">Цена:</span>
+          <span class="text-dimmed">{{
+            EQUIPMENT_CARD_LABELS.costPrefix
+          }}</span>
 
-          <span class="text-gold">{{ formatItemCost(item.cost) }}</span>
+          <span class="text-primary">{{ formatItemCost(item.cost) }}</span>
         </div>
 
         <!-- Вес -->
@@ -159,9 +166,13 @@
           v-if="item.weight"
           class="flex items-center gap-1"
         >
-          <span class="text-dimmed">Вес:</span>
+          <span class="text-dimmed">{{
+            EQUIPMENT_CARD_LABELS.weightPrefix
+          }}</span>
 
-          <span class="text-toned">{{ item.weight }} фнт.</span>
+          <span class="text-toned"
+            >{{ item.weight }} {{ WEIGHT_UNIT_LABEL }}</span
+          >
         </div>
       </div>
 
@@ -178,6 +189,6 @@
   <!-- Fallback при ошибке десериализации -->
   <CardErrorFallback
     v-else
-    message="Ошибка отображения карточки"
+    :message="EQUIPMENT_CARD_LABELS.error"
   />
 </template>

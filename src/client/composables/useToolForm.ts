@@ -1,25 +1,29 @@
 import type {
   AbilityType,
   ItemRarity,
+  SourceDefinition,
   ToolCategory,
   ToolProficiencyMode,
 } from '@vtt/shared';
 import type {
   ActiveEffect,
   CurrencyType,
-  GameItem,
+  DnDGameItem,
 } from '@vtt/shared/system/dnd.js';
+
+import { computed, ref, watch } from 'vue';
 
 import {
   DEFAULT_CURRENCY,
+  FALLBACK_SOURCE_KEY,
   isDnDEffect,
   parseCost,
   TOOL_CATEGORIES,
   TOOLS_LIST,
 } from '@vtt/shared/system/dnd.js';
-import { computed, ref, watch } from 'vue';
 
-import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+import { useSystemDataStore } from '../stores/systemDataStore';
+import { useItemUsesForm } from './useItemUsesForm';
 
 /**
  * Переключает строку в массиве свойств
@@ -41,7 +45,7 @@ function toggleStringProperty(properties: string[], prop: string): void {
  * @param getIsOpen - функция получения флага открытости модалки
  */
 export function useToolForm(
-  getTool: () => GameItem | null,
+  getTool: () => DnDGameItem | null,
   getIsOpen: () => boolean,
 ) {
   // --- Reactive-поля формы ---
@@ -53,13 +57,15 @@ export function useToolForm(
   const weight = ref(0);
   const costValue = ref(0);
   const costCurrency = ref<CurrencyType>(DEFAULT_CURRENCY);
-  const sourceKey = ref('hb');
+  const sourceKey = ref<string | undefined>(FALLBACK_SOURCE_KEY);
+  const source = ref<SourceDefinition | undefined>(undefined);
   const isSRD = ref(false);
   const magicAttunement = ref<'none' | 'required' | 'optional'>('none');
   const isAttuned = ref(false);
   const rarity = ref<ItemRarity>('none');
   const selectedToolProperties = ref<string[]>([]);
   const activeEffects = ref<ActiveEffect[]>([]);
+  const itemUses = useItemUsesForm();
 
   // Tool specific fields
   const toolBonus = ref(0);
@@ -87,7 +93,7 @@ export function useToolForm(
   /** Опции категорий инструментов */
   const toolCategoryOptions = computed(() => {
     return Object.entries(TOOL_CATEGORIES).map(([key, categoryName]) => ({
-      label: categoryName as string,
+      label: categoryName,
       value: key,
     }));
   });
@@ -101,14 +107,6 @@ export function useToolForm(
       value: toolItem.key,
     }));
   });
-
-  /** Опции источников контента */
-  const sourceOptions = computed(() =>
-    systemDataStore.sources.map((src) => ({
-      label: `${src.name} (${src.abbreviation})`,
-      value: src.key,
-    })),
-  );
 
   /** Опции свойств инструментов */
   const toolPropertyOptions = computed(() =>
@@ -154,7 +152,8 @@ export function useToolForm(
 
         costValue.value = parsed.value;
         costCurrency.value = parsed.currency;
-        sourceKey.value = tool.sourceKey ?? 'hb';
+        sourceKey.value = tool.sourceKey ?? FALLBACK_SOURCE_KEY;
+        source.value = tool.source;
         isSRD.value = tool.isSRD ?? false;
 
         // Синхронизируем свойства
@@ -177,6 +176,8 @@ export function useToolForm(
         activeEffects.value = [...(tool.activeEffects || [])].filter(
           isDnDEffect,
         );
+
+        itemUses.loadItemUses(tool.uses);
       } else {
         // Дефолты для создания
         name.value = '';
@@ -191,13 +192,15 @@ export function useToolForm(
         weight.value = 0;
         costValue.value = 0;
         costCurrency.value = DEFAULT_CURRENCY;
-        sourceKey.value = 'hb';
+        sourceKey.value = FALLBACK_SOURCE_KEY;
+        source.value = undefined;
         isSRD.value = false;
         selectedToolProperties.value = [];
         magicAttunement.value = 'none';
         isAttuned.value = false;
         rarity.value = 'none';
         activeEffects.value = [];
+        itemUses.resetItemUses();
       }
     },
     { immediate: true },
@@ -207,7 +210,7 @@ export function useToolForm(
    * Собирает объект GameItem из текущих полей формы
    * @returns объект GameItem для отправки на сервер
    */
-  function buildTool(): GameItem {
+  function buildTool(): DnDGameItem {
     const tool = getTool();
 
     return {
@@ -232,6 +235,7 @@ export function useToolForm(
       toolProficiencyMode: toolProficiencyMode.value,
 
       sourceKey: sourceKey.value || undefined,
+      source: source.value,
       isSRD: isSRD.value || undefined,
       isReadOnly: false,
 
@@ -242,6 +246,7 @@ export function useToolForm(
           ? magicAttunement.value
           : undefined,
       isAttuned: isMagical.value && isAttuned.value ? true : undefined,
+      uses: itemUses.buildItemUses(),
       activeEffects:
         activeEffects.value.length > 0 ? activeEffects.value : undefined,
     };
@@ -261,6 +266,7 @@ export function useToolForm(
     costValue,
     costCurrency,
     sourceKey,
+    source,
     isSRD,
     isMagical,
     isFocus,
@@ -269,11 +275,11 @@ export function useToolForm(
     rarity,
     selectedToolProperties,
     activeEffects,
+    ...itemUses,
 
     // Computed
     toolCategoryOptions,
     toolBaseTypeOptions,
-    sourceOptions,
     toolPropertyOptions,
 
     // Методы

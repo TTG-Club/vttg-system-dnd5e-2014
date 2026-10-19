@@ -1,51 +1,119 @@
 <script setup lang="ts">
-  import type { Actor } from '@vtt/shared/system/dnd.js';
+  import type { CSSProperties } from 'vue';
 
+  import type { ActorClassEntry, DnDActor } from '@vtt/shared/system/dnd.js';
+
+  import type { MissingSheetSectionKey } from './constants';
+  import type { NameEditResult } from './NameEditModal.vue';
+
+  import { computed, ref, toRef } from 'vue';
+
+  import { useImageFallback } from '@/shared_ui/composables';
+  import { useChatStore } from '@/stores/chatStore';
   import { getAssetUrl } from '@vtt/shared';
   import {
     calculateExperienceForNextLevel,
+    collectActorSenses,
+    collectActorTelepathy,
+    formatVisionRange,
     getTotalLevel,
+    MAX_LEVEL,
+    SENSE_ICONS,
+    SENSE_LABELS,
   } from '@vtt/shared/system/dnd.js';
-  import { computed, ref } from 'vue';
 
-  import { useImageFallback } from '@/shared_ui/composables';
-
-  import { CREATURE_SIZE_LABELS, CREATURE_TYPE_LABELS } from './constants';
+  import { useResolvedStats } from '../../composables/useResolvedStats';
+  import { resolveSheetPopOutButton } from '../../composables/useSheetMinimize';
+  import ActorHeaderSection from './ActorHeaderSection.vue';
+  import {
+    ACTOR_HEADER_LABELS,
+    ACTOR_HEADER_SUBCLASS_ICON,
+    CREATURE_SIZE_LABELS,
+    CREATURE_TYPE_LABELS,
+    EDIT_MODE_TOGGLE_TITLE,
+    HEADER_ROUND_BUTTON_CLASS,
+    MISSING_SHEET_SECTIONS,
+    MODAL_BUTTON_LABELS,
+    NAME_EDIT_LABELS,
+    REST_LABELS,
+    SHEET_HEADER_CLASSES,
+    SHEET_INLINE_EDITABLE_CLASS,
+  } from './constants';
   import LevelUpModal from './LevelUpModal.vue';
+  import NameEditModal from './NameEditModal.vue';
+  import { readTokenVision } from './tokenVision';
+
+  /** Выбранный подкласс одного класса персонажа — строка тултипа в шапке */
+  export interface ActorSubclassBadgeEntry {
+    /** Ключ класса — ключ строки в списке */
+    classKey: string;
+    /** Название класса */
+    className: string;
+    /** Название выбранного подкласса */
+    subclassName: string;
+  }
 
   interface Props {
-    actor: Actor;
+    actor: DnDActor;
     isEditMode: boolean;
     isCreating?: boolean;
+    /** Может ли пользователь править лист: ГМ или владелец персонажа */
     canEdit?: boolean;
-    /** Является ли текущий пользователь ГМ (может менять вдохновение) */
-    isAdmin?: boolean;
     worldPort?: number;
+    /**
+     * Выбранные подклассы. Названия знает только каталог классов листа, на
+     * записи актора лежат одни ключи — поэтому список приходит готовым.
+     */
+    subclassEntries?: ActorSubclassBadgeEntry[];
+    /** Показывать ли кнопку выноса листа в отдельное окно */
+    canPopOut?: boolean;
+    /** Вынесен ли лист в отдельное окно браузера */
+    isPoppedOut?: boolean;
   }
 
   const props = withDefaults(defineProps<Props>(), {
     isCreating: false,
     canEdit: true,
-    isAdmin: false,
+    canPopOut: false,
+    isPoppedOut: false,
     worldPort: undefined,
+    subclassEntries: () => [],
   });
 
+  /** Данные для запуска мастера повышения уровня */
+  interface LevelUpWizardPayload {
+    /** Очередь уровней, которые нужно провести через мастер */
+    queue: Array<{ classKey: string; targetLevel: number }>;
+    /** Итоговый опыт персонажа */
+    experience: number;
+    /** Классы, применяемые без мастера (принудительное повышение) */
+    forceApplies: ActorClassEntry[];
+  }
+
+  /** Результат повышения уровня из модалки */
+  interface LevelUpResult {
+    /** Обновлённый набор классов персонажа */
+    classes: ActorClassEntry[];
+    /** Итоговый опыт персонажа */
+    experience: number;
+  }
+
   const emit = defineEmits<{
-    'update:actor': [updates: Partial<Actor>];
+    'update:actor': [updates: Partial<DnDActor>];
     'toggle-edit-mode': [];
     'open-settings': [];
     'short-rest': [];
     'long-rest': [];
     'save': [];
     'close': [];
-    'start-wizard': [
-      data: {
-        queue: Array<{ classKey: string; targetLevel: number }>;
-        experience: number;
-        forceApplies: import('@vtt/shared/system/dnd.js').ActorClassEntry[];
-      },
-    ];
+    /** Свернуть лист в шторку — окно остаётся открытым */
+    'minimize': [];
+    /** Вынести лист в отдельное окно браузера или вернуть на стол */
+    'toggle-pop-out': [];
+    'start-wizard': [payload: LevelUpWizardPayload];
     'remove-class': [classKey: string];
+    /** Открыть окно выбора вида/класса/предыстории из компендиума */
+    'open-compendium-picker': [kind: MissingSheetSectionKey];
   }>();
 
   // Вычисляемые свойства
@@ -86,48 +154,83 @@
     label: string;
     /** Дальность в футах (0 = без ограничений) */
     range: number;
+    /**
+     * Чувство показано справочно: у зрения токена в приложении есть только
+     * обычное и тёмное зрение, поэтому на видимость сцены такая запись не
+     * влияет. Помечается в тултипе звёздочкой, чтобы это не выглядело поломкой.
+     */
+    informational?: boolean;
   }
 
+  // Чувства приходят двумя путями: чертами (их читает `collectActorSenses`) и
+  // активными эффектами — ключи `sense.*` считает тот же пайплайн, что КД и
+  // скорости. Разрешаем статы здесь же, как это делают боковые панели листа
+  const { resolvedStats } = useResolvedStats(toRef(() => props.actor));
+
   /**
-   * Доступные типы зрения актёра из `token.vision`.
-   * Расширяемо: при появлении новых типов зрения достаточно добавить запись.
+   * Доступные типы зрения актёра: зрение токена, чувства черт и чувства
+   * активных эффектов. Расширяемо: при появлении новых типов зрения достаточно
+   * добавить запись.
    */
   const visionEntries = computed<VisionEntry[]>(() => {
-    const vision = props.actor.token?.vision;
+    const entries: VisionEntry[] = [];
+    const vision = readTokenVision(props.actor.token);
+    const senses = resolvedStats.value?.senses;
 
-    if (!vision?.enabled) {
-      return [];
+    // Тёмное зрение — итог пайплайна: база токена плюс эффекты, предметы и
+    // умения. Его же сцена получает хуком системы `resolveEntityVision`, поэтому
+    // оно не справка. Тёмное зрение от эффекта включает и выключенное зрение —
+    // так же, как на сцене
+    const darkvision = senses?.darkvision ?? 0;
+
+    if (vision.enabled || darkvision > 0) {
+      // Обычное зрение (range === 0 трактуется как без ограничений)
+      entries.push({
+        icon: 'tabler:eye',
+        label: ACTOR_HEADER_LABELS.normalVision,
+        range: vision.range,
+      });
     }
 
-    const entries: VisionEntry[] = [];
-
-    // Обычное зрение (range === 0 трактуется как без ограничений)
-    entries.push({
-      icon: 'tabler:eye',
-      label: 'Обычное зрение',
-      range: vision.range,
-    });
-
-    // Тёмное зрение
-    if (vision.darkvision > 0) {
+    if (darkvision > 0) {
       entries.push({
         icon: 'tabler:moon',
-        label: 'Тёмное зрение',
-        range: vision.darkvision,
+        label: ACTOR_HEADER_LABELS.darkvision,
+        range: darkvision,
+      });
+    }
+
+    // Прочие чувства — справкой: у зрения токена в приложении есть только
+    // обычное и тёмное зрение, поэтому на видимость сцены они не влияют. Показываются
+    // независимо от того, включено ли зрение токена: это свойство персонажа,
+    // а не настройка его токена
+    for (const sense of collectActorSenses(props.actor, senses)) {
+      entries.push({
+        icon: SENSE_ICONS[sense.type],
+        label: SENSE_LABELS[sense.type],
+        range: sense.range,
+        informational: true,
+      });
+    }
+
+    const telepathy = collectActorTelepathy(props.actor, senses);
+
+    if (telepathy > 0) {
+      entries.push({
+        icon: 'tabler:brain',
+        label: ACTOR_HEADER_LABELS.telepathy,
+        range: telepathy,
+        informational: true,
       });
     }
 
     return entries;
   });
 
-  /**
-   * Форматирует дальность зрения для отображения.
-   * @param range - дальность в футах (0 = без ограничений)
-   * @returns строка вида "60 фт." или "без ограничений"
-   */
-  function formatVisionRange(range: number): string {
-    return range > 0 ? `${range} фт.` : 'без ограничений';
-  }
+  /** Есть ли среди чувств справочные — под списком тогда идёт пояснение */
+  const hasInformationalVision = computed(() =>
+    visionEntries.value.some((entry) => entry.informational),
+  );
 
   /** Суммарный уровень из всех классов */
   const totalLevel = computed(() => {
@@ -152,6 +255,59 @@
     return props.actor.system.background?.backgroundName ?? '';
   });
 
+  /** Название вида на листе или "" */
+  const speciesLabelValue = computed(
+    () => props.actor.system.species?.speciesName ?? '',
+  );
+
+  /** Текст раздела вида: название либо плейсхолдер «Вид не выбран» */
+  const speciesLabel = computed(
+    () => speciesLabelValue.value || MISSING_SHEET_SECTIONS.species.label,
+  );
+
+  /** Текст раздела классов: перечень либо плейсхолдер */
+  const classLabel = computed(
+    () => mainClassLabel.value || MISSING_SHEET_SECTIONS.class.label,
+  );
+
+  /** Текст раздела предыстории: название либо плейсхолдер */
+  const backgroundSectionLabel = computed(
+    () => backgroundLabel.value || MISSING_SHEET_SECTIONS.background.label,
+  );
+
+  /**
+   * Пробрасывает на лист запрос открыть окно выбора записи компендиума.
+   *
+   * @param kind - раздел шапки: вид, класс или предыстория
+   */
+  function openCompendiumPicker(kind: MissingSheetSectionKey): void {
+    emit('open-compendium-picker', kind);
+  }
+
+  /**
+   * Уточнение вида в скобках: "Гуманоид, Средний".
+   *
+   * Незнакомый тип или размер (например, из стороннего компендиума) выводим
+   * как есть — лучше сырой ключ, чем пустое место в шапке.
+   */
+  const speciesDetails = computed(() => {
+    const species = props.actor.system.species;
+
+    if (!species) {
+      return '';
+    }
+
+    const creatureType = species.creatureType
+      ? CREATURE_TYPE_LABELS[species.creatureType] || species.creatureType
+      : '';
+
+    const size = species.size
+      ? CREATURE_SIZE_LABELS[species.size] || species.size
+      : '';
+
+    return [creatureType, size].filter(Boolean).join(', ');
+  });
+
   const nextLevelXP = computed(() => {
     return calculateExperienceForNextLevel(totalLevel.value);
   });
@@ -168,10 +324,82 @@
   });
 
   /**
-   * Обновляет поле актёра (name, description — корневые поля)
+   * Полоса опыта разорвана посередине подписью «X / Y XP», поэтому состоит из
+   * двух половин: первая половина прогресса заполняет левый отрезок, вторая —
+   * правый. Вместе они читаются как одна непрерывная линия.
    */
-  function updateField(field: keyof Actor, value: Actor[keyof Actor]) {
-    emit('update:actor', { [field]: value });
+  const xpBarLeftWidth = computed(() => Math.min(100, xpProgress.value * 2));
+
+  /** Заполнение правого отрезка полосы опыта, % (см. `xpBarLeftWidth`) */
+  const xpBarRightWidth = computed(() =>
+    Math.max(0, xpProgress.value * 2 - 100),
+  );
+
+  /** Подпись справа от полосы: следующий уровень или «Максимум» на 20-м */
+  const nextLevelLabel = computed(() =>
+    totalLevel.value >= MAX_LEVEL
+      ? ACTOR_HEADER_LABELS.experienceMax
+      : `${ACTOR_HEADER_LABELS.nextLevelPrefix}${totalLevel.value + 1}`,
+  );
+
+  /** Классы строки опыта: кликабельная только у того, кто может править лист */
+  const experienceRowClass = computed(() =>
+    props.canEdit
+      ? 'cursor-pointer hover:bg-inverted/5 hover:text-toned'
+      : 'cursor-default',
+  );
+
+  /** Подсказка строки опыта (без правки прав — без подсказки) */
+  const experienceRowTitle = computed(() =>
+    props.canEdit ? ACTOR_HEADER_LABELS.editLevel : undefined,
+  );
+
+  /** Имя в шапке: у безымянного листа — заглушка, иначе нажимать не на что */
+  const displayName = computed(
+    () => props.actor.name || NAME_EDIT_LABELS.emptyName,
+  );
+
+  /** Правится ли имя: только при снятом замке и правах на лист */
+  const isNameEditable = computed(() => props.isEditMode && props.canEdit);
+
+  /** Подпись и иконка кнопки выноса: вынести лист или вернуть его на стол */
+  const popOutButton = computed(() =>
+    resolveSheetPopOutButton(props.isPoppedOut),
+  );
+
+  /** Тег имени: в режиме правки — кнопка, открывающая окно названия */
+  const nameTag = computed(() => (isNameEditable.value ? 'button' : 'span'));
+
+  /**
+   * Классы имени. Пунктир и подсветка при наведении показывают, что имя
+   * правится, не сдвигая при этом ни его само, ни шапку под ним.
+   */
+  const nameClass = computed(() =>
+    isNameEditable.value
+      ? `${SHEET_INLINE_EDITABLE_CLASS} underline-offset-8`
+      : '',
+  );
+
+  /** Подсказка имени — только когда по нему открывается окно */
+  const nameTitle = computed(() =>
+    isNameEditable.value ? NAME_EDIT_LABELS.editHint : undefined,
+  );
+
+  // Окно названия
+  const isNameEditOpen = ref(false);
+
+  /** Открывает окно названия (вне режима правки имя не трогаем) */
+  function openNameEdit() {
+    if (!isNameEditable.value) {
+      return;
+    }
+
+    isNameEditOpen.value = true;
+  }
+
+  /** Записывает имя из окна названия на лист */
+  function onNameApply(result: NameEditResult) {
+    emit('update:actor', { name: result.name });
   }
 
   /** Есть ли у персонажа вдохновение (у старых актёров поле отсутствует → нет) */
@@ -180,92 +408,141 @@
   );
 
   /**
-   * Даёт или забирает вдохновение (только ГМ). По правилам D&D оно либо есть,
-   * либо нет — поэтому просто переключаем.
+   * Даёт или забирает вдохновение. По правилам D&D оно либо есть, либо нет —
+   * поэтому просто переключаем. Переключают ГМ и владелец персонажа, поэтому
+   * каждое изменение пишется в чат: так видно, кто и когда его отметил.
    */
   function toggleInspiration() {
-    if (!props.isAdmin) {
+    if (!props.canEdit) {
       return;
     }
+
+    const isGained = !hasInspiration.value;
 
     emit('update:actor', {
       system: {
         ...props.actor.system,
-        inspiration: !hasInspiration.value,
+        inspiration: isGained,
       },
     });
+
+    const suffix = isGained
+      ? ACTOR_HEADER_LABELS.inspirationGainedSuffix
+      : ACTOR_HEADER_LABELS.inspirationLostSuffix;
+
+    useChatStore().sendMessage(`${displayName.value}${suffix}`, 'text');
   }
 
   /** Подсказка для блока вдохновения (зависит от роли и текущего состояния) */
   const inspirationTooltip = computed(() => {
-    if (!props.isAdmin) {
+    if (!props.canEdit) {
       return hasInspiration.value
-        ? 'У персонажа есть вдохновение'
-        : 'У персонажа нет вдохновения';
+        ? ACTOR_HEADER_LABELS.inspirationOn
+        : ACTOR_HEADER_LABELS.inspirationOff;
     }
 
-    return hasInspiration.value ? 'Забрать вдохновение' : 'Дать вдохновение';
+    return hasInspiration.value
+      ? ACTOR_HEADER_LABELS.inspirationTake
+      : ACTOR_HEADER_LABELS.inspirationGive;
   });
+
+  /** Тег блока вдохновения: кнопка у ГМ и владельца, обычный блок у прочих */
+  const inspirationTag = computed(() => (props.canEdit ? 'button' : 'div'));
 
   /** Классы блока вдохновения: активный (золотой) или приглушённый */
   const inspirationClass = computed(() => {
-    const interactive = props.isAdmin
-      ? 'cursor-pointer hover:border-gold/70'
+    const interactive = props.canEdit
+      ? 'cursor-pointer hover:border-primary/70'
       : 'cursor-default';
 
     const state = hasInspiration.value
-      ? 'border-gold/60 bg-gold/15 text-gold'
+      ? 'border-primary/60 bg-primary/15 text-primary'
       : 'border-default/50 bg-elevated/30 text-muted';
 
     return `${interactive} ${state}`;
   });
 
+  /** Стиль шапки: она же — область перетаскивания окна листа */
+  const headerStyle = computed<CSSProperties>(() => ({
+    cursor: props.canEdit ? 'move' : 'default',
+    userSelect: 'none',
+  }));
+
+  /** Иконка переключателя режима редактирования (замок открыт/закрыт) */
+  const editModeIcon = computed(() =>
+    props.isEditMode ? 'tabler:lock-open' : 'tabler:lock-filled',
+  );
+
+  /** Цвет переключателя режима редактирования */
+  const editModeClass = computed(() =>
+    props.isEditMode ? 'text-primary' : 'text-muted hover:text-highlighted',
+  );
+
   // Модалка повышения уровня
   const isLevelUpOpen = ref(false);
 
   /**
-   * Открывает модалку повышения уровня
+   * Открывает модалку уровня и опыта.
+   *
+   * Доступна и вне режима редактирования: опыт меняется по ходу игры чаще
+   * всего в шапке, ради него незачем снимать замок со всего листа.
    */
-  function addExperience() {
+  function openLevelUp() {
+    if (!props.canEdit) {
+      return;
+    }
+
     isLevelUpOpen.value = true;
   }
 
   /**
    * Применяет изменения уровня (по классам) и опыта
    */
-  function onLevelUpApply(data: {
-    classes: import('@vtt/shared/system/dnd.js').ActorClassEntry[];
-    experience: number;
-  }) {
+  function onLevelUpApply(result: LevelUpResult) {
     emit('update:actor', {
       system: {
         ...props.actor.system,
-        classes: data.classes,
-        experience: data.experience,
+        classes: result.classes,
+        experience: result.experience,
       },
     });
   }
 
   /**
-   * Скрывает элемент при ошибке загрузки изображения
+   * Пробрасывает запуск мастера повышения уровня на лист персонажа
+   */
+  function onStartWizard(payload: LevelUpWizardPayload) {
+    emit('start-wizard', payload);
+  }
+
+  /**
+   * Пробрасывает удаление класса на лист персонажа
+   */
+  function onRemoveClass(classKey: string) {
+    emit('remove-class', classKey);
+  }
+
+  /**
+   * Скрывает рамку токена, если картинка не загрузилась: битый путь не должен
+   * оставлять пустой прямоугольник поверх аватара.
    */
   function handleImageError(event: Event) {
-    if (event.target) {
-      (event.target as HTMLImageElement).style.display = 'none';
+    const image = event.target;
+
+    if (image instanceof HTMLImageElement) {
+      image.style.display = 'none';
     }
   }
 </script>
 
 <template>
   <header
-    class="relative overflow-hidden rounded-t-2xl"
-    :style="{ cursor: canEdit ? 'move' : 'default', userSelect: 'none' }"
+    :class="SHEET_HEADER_CLASSES.root"
+    :style="headerStyle"
   >
-    <div class="relative z-10 flex w-full items-center gap-6 px-6 pt-8 pb-10">
+    <div :class="SHEET_HEADER_CLASSES.body">
       <!-- Аватар и Рамка -->
-      <div
-        class="relative -my-2 flex h-28 w-28 shrink-0 items-center justify-center"
-      >
+      <div :class="SHEET_HEADER_CLASSES.avatar">
         <!-- Маска аватара под рамку (как в ActorSettingsModal) -->
         <div
           class="relative h-full w-full bg-elevated"
@@ -313,7 +590,7 @@
           class="absolute -bottom-1 left-1/2 z-20 -translate-x-1/2"
         >
           <div
-            class="flex h-6 w-6 cursor-help items-center justify-center rounded-full border border-gold/40 bg-elevated/95 text-gold shadow-md transition-colors hover:border-gold/80"
+            class="flex h-6 w-6 cursor-help items-center justify-center rounded-full border border-primary/40 bg-elevated/95 text-primary shadow-md transition-colors hover:border-primary/80"
           >
             <UIcon
               name="tabler:eye"
@@ -331,7 +608,7 @@
               >
                 <UIcon
                   :name="entry.icon"
-                  class="h-3.5 w-3.5 shrink-0 text-gold"
+                  class="h-3.5 w-3.5 shrink-0 text-primary"
                 />
 
                 <span class="font-medium">{{ entry.label }}:</span>
@@ -339,6 +616,20 @@
                 <span class="ml-auto text-dimmed">
                   {{ formatVisionRange(entry.range) }}
                 </span>
+
+                <!-- Звёздочка-сноска: пояснение к таким чувствам под списком -->
+                <span
+                  v-if="hasInformationalVision"
+                  class="w-1.5 shrink-0 text-warning"
+                  >{{ entry.informational ? '*' : '' }}</span
+                >
+              </div>
+
+              <div
+                v-if="hasInformationalVision"
+                class="mt-1 max-w-48 border-t border-default/50 pt-1 text-[10px] whitespace-normal text-warning"
+              >
+                {{ ACTOR_HEADER_LABELS.senseInformationalHint }}
               </div>
             </div>
           </template>
@@ -346,267 +637,303 @@
       </div>
 
       <!-- Основная информация -->
-      <div class="flex min-w-0 flex-1 items-center justify-between">
-        <div class="w-full min-w-0 flex-1 space-y-1 pr-4">
-          <!-- Имя -->
-          <div class="flex min-h-[44px] items-center">
-            <UInput
-              v-if="isEditMode"
-              :model-value="actor.name"
-              placeholder="Имя персонажа"
-              variant="none"
-              size="xl"
-              class="w-full"
-              :ui="{
-                base: 'bg-white/5 text-3xl font-serif text-highlighted placeholder-gray-600 rounded-lg px-3 py-1 focus:bg-white/10 transition-colors',
-              }"
-              @update:model-value="updateField('name', $event)"
+      <div :class="SHEET_HEADER_CLASSES.info">
+        <!-- Имя: в режиме правки подчёркнуто пунктиром и открывает окно -->
+        <div :class="SHEET_HEADER_CLASSES.nameRow">
+          <h2 :class="SHEET_HEADER_CLASSES.name">
+            <component
+              :is="nameTag"
+              :class="nameClass"
+              :title="nameTitle"
+              @click.left.exact.prevent="openNameEdit"
+            >
+              {{ displayName }}
+            </component>
+          </h2>
+        </div>
+
+        <!-- Раса и класс -->
+        <div
+          class="flex min-h-7 flex-wrap items-center justify-center gap-x-2 gap-y-1 text-sm text-toned @2xl:justify-start"
+        >
+          <span class="flex items-center gap-1">
+            <ActorHeaderSection
+              :label="speciesLabel"
+              :title="MISSING_SHEET_SECTIONS.species.title"
+              :is-filled="Boolean(speciesLabelValue)"
+              :can-edit="canEdit"
+              @open="openCompendiumPicker('species')"
             />
 
-            <h2
-              v-else
-              class="font-serif text-3xl tracking-wide text-highlighted"
-            >
-              {{ actor.name }}
-            </h2>
-          </div>
-
-          <!-- Раса и класс -->
-          <div
-            class="flex min-h-[28px] flex-wrap items-center gap-x-2 gap-y-1 text-toned"
-          >
             <span
-              v-if="actor.system.species?.speciesName"
-              class="text-toned"
-              >{{ actor.system.species.speciesName }}
+              v-if="speciesDetails"
+              class="text-dimmed"
+            >
+              ({{ speciesDetails }})
+            </span>
+          </span>
+
+          <span class="text-dimmed">—</span>
+
+          <span class="flex items-center gap-1.5">
+            <ActorHeaderSection
+              :label="classLabel"
+              :title="MISSING_SHEET_SECTIONS.class.title"
+              :is-filled="Boolean(mainClassLabel)"
+              :can-edit="canEdit"
+              @open="openCompendiumPicker('class')"
+            />
+
+            <!-- Значок подкласса: название видно по наведению -->
+            <UTooltip
+              v-if="subclassEntries.length > 0"
+              :delay-duration="150"
+              :content="{ side: 'bottom' }"
+            >
               <span
-                v-if="
-                  actor.system.species.creatureType || actor.system.species.size
-                "
-                class="text-dimmed"
+                class="flex h-5 w-5 cursor-help items-center justify-center rounded-full border border-primary/40 bg-elevated/95 text-primary transition-colors hover:border-primary/80"
+                :aria-label="ACTOR_HEADER_LABELS.subclassTitle"
               >
-                ({{
-                  [
-                    actor.system.species.creatureType
-                      ? CREATURE_TYPE_LABELS[actor.system.species.creatureType]
-                        || actor.system.species.creatureType
-                      : '',
-                    actor.system.species.size
-                      ? CREATURE_SIZE_LABELS[actor.system.species.size]
-                        || actor.system.species.size
-                      : '',
-                  ]
-                    .filter(Boolean)
-                    .join(', ')
-                }})
+                <UIcon
+                  :name="ACTOR_HEADER_SUBCLASS_ICON"
+                  class="h-3.5 w-3.5"
+                />
               </span>
+
+              <template #content>
+                <div class="flex flex-col gap-1 px-1 py-0.5 text-[11px]">
+                  <span class="text-dimmed">
+                    {{ ACTOR_HEADER_LABELS.subclassTitle }}
+                  </span>
+
+                  <div
+                    v-for="entry in subclassEntries"
+                    :key="entry.classKey"
+                    class="flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    <span class="font-medium">{{ entry.className }}:</span>
+
+                    <span>{{ entry.subclassName }}</span>
+                  </div>
+                </div>
+              </template>
+            </UTooltip>
+          </span>
+
+          <span class="text-dimmed">—</span>
+
+          <ActorHeaderSection
+            :label="backgroundSectionLabel"
+            :title="MISSING_SHEET_SECTIONS.background.title"
+            :is-filled="Boolean(backgroundLabel)"
+            :can-edit="canEdit"
+            @open="openCompendiumPicker('background')"
+          />
+        </div>
+
+        <!-- Уровень и опыт: клик по всей полосе открывает окно уровня. На
+          широкой шапке полоса уступает место кнопкам отдыха справа от неё:
+          они стоят на той же высоте, и без запаса полоса заходила под них -->
+        <button
+          type="button"
+          :disabled="!canEdit"
+          class="mx-auto flex w-full max-w-xl items-center gap-3 rounded-lg px-2 py-1 text-xs font-medium text-muted transition-colors @2xl:-mx-2 @2xl:max-w-[min(36rem,calc(100%-14rem))]"
+          :class="experienceRowClass"
+          :title="experienceRowTitle"
+          @click.left.exact.prevent="openLevelUp"
+        >
+          <span class="whitespace-nowrap"
+            >{{ ACTOR_HEADER_LABELS.nextLevelPrefix }}{{ totalLevel }}</span
+          >
+
+          <!-- Полоса опыта: подпись разрывает её посередине -->
+          <span class="flex flex-1 items-center gap-2">
+            <span class="h-1 flex-1 overflow-hidden rounded-full bg-elevated">
+              <span
+                class="block h-full rounded-full bg-linear-to-r from-primary/60 to-primary transition-all duration-300"
+                :style="{ width: `${xpBarLeftWidth}%` }"
+              />
             </span>
 
             <span
-              v-else
-              class="text-dimmed italic"
-              >Вид не выбран</span
+              class="text-[11px] tracking-widest whitespace-nowrap text-dimmed"
             >
+              {{ actor.system.experience }} / {{ nextLevelXP }} XP
+            </span>
 
-            <span class="text-dimmed">—</span>
-
-            <span
-              v-if="mainClassLabel"
-              class="text-toned"
-              >{{ mainClassLabel }}</span
-            >
-
-            <span
-              v-else
-              class="text-dimmed italic"
-              >Класс не выбран</span
-            >
-
-            <span class="text-dimmed">—</span>
-
-            <span
-              v-if="backgroundLabel"
-              class="text-toned"
-              >{{ backgroundLabel }}</span
-            >
-
-            <span
-              v-else
-              class="text-dimmed italic"
-              >Предыстория не выбрана</span
-            >
-          </div>
-
-          <!-- Уровень и опыт -->
-          <div
-            class="flex max-w-xl items-center gap-4 pt-1 text-xs font-medium text-muted"
-          >
-            <div class="whitespace-nowrap">Уровень {{ totalLevel }}</div>
-
-            <!-- Прогресс-бар опыта -->
-            <div class="relative mx-2 flex-1">
-              <div
-                class="h-[2px] w-full overflow-hidden rounded-full bg-elevated"
-              >
-                <div
-                  class="h-full bg-linear-to-r from-gold/60 to-gold transition-all duration-300"
-                  :style="{ width: `${xpProgress}%` }"
-                />
-              </div>
-
-              <div
-                class="absolute inset-0 mt-4 flex items-center justify-center text-[10px] tracking-widest text-dimmed"
-              >
-                {{ actor.system.experience }} / {{ nextLevelXP }} XP
-              </div>
-            </div>
-
-            <div class="flex items-center gap-1 whitespace-nowrap">
-              Уровень {{ totalLevel + 1 }}
-              <UButton
-                v-if="isEditMode"
-                icon="tabler:circle-plus"
-                variant="ghost"
-                color="neutral"
-                size="2xs"
-                :ui="{
-                  base: 'text-gold hover:text-gold hover:bg-gold/20',
-                }"
-                title="Добавить опыт"
-                @click.left.exact.prevent="addExperience"
+            <span class="h-1 flex-1 overflow-hidden rounded-full bg-elevated">
+              <span
+                class="block h-full rounded-full bg-primary transition-all duration-300"
+                :style="{ width: `${xpBarRightWidth}%` }"
               />
-            </div>
-          </div>
+            </span>
+          </span>
+
+          <span class="whitespace-nowrap">{{ nextLevelLabel }}</span>
+        </button>
+      </div>
+
+      <!-- Кнопки шапки: на узкой — верхним рядом, на широкой — по углам -->
+      <div :class="SHEET_HEADER_CLASSES.actions">
+        <!-- Кнопки отдыха и вдохновение (на широкой шапке — у золотой линии) -->
+        <div
+          v-if="!isCreating"
+          :class="SHEET_HEADER_CLASSES.rest"
+        >
+          <!-- Вдохновение: есть/нет, переключают ГМ и владелец персонажа -->
+          <UTooltip :text="inspirationTooltip">
+            <component
+              :is="inspirationTag"
+              class="flex h-9 items-center gap-1.5 rounded-full border px-2.5 text-sm font-medium transition-colors @2xl:px-3"
+              :class="inspirationClass"
+              @click.left.exact.prevent="toggleInspiration"
+            >
+              <UIcon
+                name="tabler:sparkles"
+                class="h-4 w-4"
+              />
+
+              <!-- На узкой шапке подписи не остаётся: ряд кнопок и без неё
+            занимает всю ширину, а название есть в подсказке -->
+              <span class="hidden @2xl:inline">
+                {{ ACTOR_HEADER_LABELS.inspiration }}
+              </span>
+            </component>
+          </UTooltip>
+
+          <UTooltip
+            v-if="canEdit"
+            :text="REST_LABELS.short"
+          >
+            <UButton
+              icon="tabler:campfire"
+              color="neutral"
+              variant="ghost"
+              size="md"
+              square
+              class="border border-default/50 bg-elevated/30 text-muted hover:bg-accented/50 hover:text-highlighted"
+              @click.left.exact.prevent="emit('short-rest')"
+            />
+          </UTooltip>
+
+          <UTooltip
+            v-if="canEdit"
+            :text="REST_LABELS.long"
+          >
+            <UButton
+              icon="tabler:moon"
+              color="neutral"
+              variant="ghost"
+              size="md"
+              square
+              class="border border-default/50 bg-elevated/30 text-muted hover:bg-accented/50 hover:text-highlighted"
+              @click.left.exact.prevent="emit('long-rest')"
+            />
+          </UTooltip>
+        </div>
+
+        <!-- Кнопки управления (правый верхний угол) -->
+        <div :class="SHEET_HEADER_CLASSES.controls">
+          <!-- Кнопка Создать (при создании нового персонажа) -->
+          <button
+            v-if="isCreating"
+            class="flex h-8 items-center gap-1.5 rounded-full border border-success/50 bg-success/80 px-3 text-sm font-medium text-highlighted transition-colors hover:bg-success/70"
+            :title="ACTOR_HEADER_LABELS.createActor"
+            @click.left.exact.prevent="emit('save')"
+          >
+            <UIcon
+              name="tabler:check"
+              class="h-4 w-4"
+            />
+            {{ MODAL_BUTTON_LABELS.create }}
+          </button>
+
+          <!-- Toggle Edit Mode (только для существующих персонажей) -->
+          <button
+            v-else-if="canEdit"
+            class="flex h-8 w-8 items-center justify-center rounded-full border border-default/50 bg-elevated/30 transition-colors hover:bg-accented/50"
+            :class="editModeClass"
+            :title="EDIT_MODE_TOGGLE_TITLE"
+            @click.left.exact.prevent="emit('toggle-edit-mode')"
+          >
+            <UIcon
+              :name="editModeIcon"
+              class="h-4 w-4"
+            />
+          </button>
+
+          <!-- Settings Button -->
+          <button
+            v-if="canEdit && !isCreating"
+            :class="HEADER_ROUND_BUTTON_CLASS"
+            :title="ACTOR_HEADER_LABELS.tokenSettings"
+            @click.left.exact.prevent="emit('open-settings')"
+          >
+            <UIcon
+              name="tabler:settings-filled"
+              class="h-4 w-4"
+            />
+          </button>
+
+          <!-- Вынести в отдельное окно / вернуть на стол -->
+          <button
+            v-if="canPopOut"
+            :class="HEADER_ROUND_BUTTON_CLASS"
+            :title="popOutButton.label"
+            @click.left.exact.prevent="emit('toggle-pop-out')"
+          >
+            <UIcon
+              :name="popOutButton.icon"
+              class="h-4 w-4"
+            />
+          </button>
+
+          <!-- Minimize Button: вынесенный лист сворачивает сам браузер -->
+          <button
+            v-if="!isPoppedOut"
+            :class="HEADER_ROUND_BUTTON_CLASS"
+            :title="MODAL_BUTTON_LABELS.minimize"
+            @click.left.exact.prevent="emit('minimize')"
+          >
+            <UIcon
+              name="tabler:chevron-up"
+              class="h-5 w-5"
+            />
+          </button>
+
+          <!-- Close Button -->
+          <button
+            :class="HEADER_ROUND_BUTTON_CLASS"
+            :title="MODAL_BUTTON_LABELS.close"
+            @click.left.exact.prevent="emit('close')"
+          >
+            <UIcon
+              name="tabler:x"
+              class="h-5 w-5"
+            />
+          </button>
         </div>
       </div>
     </div>
 
-    <!-- Кнопки управления (правый верхний угол) -->
-    <div class="absolute top-4 right-4 z-20 flex items-center gap-2">
-      <!-- Кнопка Создать (при создании нового персонажа) -->
-      <button
-        v-if="isCreating"
-        class="flex h-8 items-center gap-1.5 rounded-full border border-success/50 bg-success/80 px-3 text-sm font-medium text-white transition-colors hover:bg-success/70"
-        title="Создать персонажа"
-        @click.left.exact.prevent="emit('save')"
-      >
-        <UIcon
-          name="tabler:check"
-          class="h-4 w-4"
-        />
-        Создать
-      </button>
-
-      <!-- Toggle Edit Mode (только для существующих персонажей) -->
-      <button
-        v-else-if="canEdit"
-        class="flex h-8 w-8 items-center justify-center rounded-full border border-default/50 bg-elevated/30 transition-colors hover:bg-accented/50"
-        :class="isEditMode ? 'text-gold' : 'text-muted hover:text-highlighted'"
-        title="Режим редактирования"
-        @click.left.exact.prevent="emit('toggle-edit-mode')"
-      >
-        <UIcon
-          :name="isEditMode ? 'tabler:lock-open' : 'tabler:lock-filled'"
-          class="h-4 w-4"
-        />
-      </button>
-
-      <!-- Settings Button -->
-      <button
-        v-if="canEdit && !isCreating"
-        class="flex h-8 w-8 items-center justify-center rounded-full border border-default/50 bg-elevated/30 text-muted transition-colors hover:bg-accented/50 hover:text-highlighted"
-        title="Настройки токена и прав"
-        @click.left.exact.prevent="emit('open-settings')"
-      >
-        <UIcon
-          name="tabler:settings-filled"
-          class="h-4 w-4"
-        />
-      </button>
-
-      <!-- Close Button -->
-      <button
-        class="flex h-8 w-8 items-center justify-center rounded-full border border-default/50 bg-elevated/30 text-muted transition-colors hover:bg-accented/50 hover:text-highlighted"
-        @click.left.exact.prevent="emit('close')"
-      >
-        <svg
-          class="h-5 w-5"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M6 18L18 6M6 6l12 12"
-          />
-        </svg>
-      </button>
-    </div>
-
-    <!-- Кнопки отдыха и вдохновение (второй ряд, у золотой линии) -->
-    <div
-      v-if="!isCreating"
-      class="absolute right-4 bottom-10 z-20 flex items-center gap-2"
-    >
-      <!-- Вдохновение: есть/нет, даёт и забирает только ГМ -->
-      <UTooltip :text="inspirationTooltip">
-        <component
-          :is="isAdmin ? 'button' : 'div'"
-          class="flex h-9 items-center gap-1.5 rounded-full border px-3 text-sm font-medium transition-colors"
-          :class="inspirationClass"
-          @click.left.exact.prevent="toggleInspiration"
-        >
-          <UIcon
-            name="tabler:sparkles"
-            class="h-4 w-4"
-          />
-
-          Вдохновение
-        </component>
-      </UTooltip>
-
-      <UTooltip
-        v-if="canEdit"
-        text="Короткий отдых"
-      >
-        <UButton
-          icon="tabler:campfire"
-          color="neutral"
-          variant="ghost"
-          size="md"
-          square
-          class="border border-default/50 bg-elevated/30 text-muted hover:bg-accented/50 hover:text-highlighted"
-          @click.left.exact.prevent="emit('short-rest')"
-        />
-      </UTooltip>
-
-      <UTooltip
-        v-if="canEdit"
-        text="Продолжительный отдых"
-      >
-        <UButton
-          icon="tabler:moon"
-          color="neutral"
-          variant="ghost"
-          size="md"
-          square
-          class="border border-default/50 bg-elevated/30 text-muted hover:bg-accented/50 hover:text-highlighted"
-          @click.left.exact.prevent="emit('long-rest')"
-        />
-      </UTooltip>
-    </div>
-
-    <!-- Golden Divider -->
+    <!-- Декоративный разделитель шапки: цвет акцента приложения -->
     <div class="absolute bottom-0 left-0 mb-1 flex w-full items-center gap-3">
-      <div class="h-px flex-1 bg-gold/50" />
+      <div class="h-px flex-1 bg-primary/50" />
 
-      <div class="h-3 w-3 rotate-45 border border-gold opacity-80" />
+      <div class="h-3 w-3 rotate-45 border border-primary opacity-80" />
 
-      <div class="h-px flex-1 bg-gold/50" />
+      <div class="h-px flex-1 bg-primary/50" />
     </div>
   </header>
+
+  <!-- Окно названия -->
+  <NameEditModal
+    v-model:open="isNameEditOpen"
+    :title="NAME_EDIT_LABELS.actorTitle"
+    :name="actor.name"
+    :name-placeholder="ACTOR_HEADER_LABELS.namePlaceholder"
+    @apply="onNameApply"
+  />
 
   <!-- Модалка повышения уровня -->
   <LevelUpModal
@@ -614,7 +941,7 @@
     :classes="actor.system.classes"
     :experience="actor.system.experience"
     @apply="onLevelUpApply"
-    @start-wizard="(data) => emit('start-wizard', data)"
-    @remove-class="(classKey) => emit('remove-class', classKey)"
+    @start-wizard="onStartWizard"
+    @remove-class="onRemoveClass"
   />
 </template>

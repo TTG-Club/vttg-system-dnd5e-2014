@@ -1,6 +1,7 @@
 <script setup lang="ts">
   import type { DamagePart } from '@vtt/shared';
 
+  import { DAMAGE_PART_LABELS } from './constants';
   import DamagePartRow from './DamagePartRow.vue';
 
   const props = withDefaults(
@@ -26,6 +27,12 @@
        * Нужно заклинаниям/атакам/эффектам без урона.
        */
       allowEmpty?: boolean;
+      /**
+       * Считать состояния в формуле выполненными (итог под формулой). Так у
+       * варианта «или»: он берётся, только когда все его состояния есть, и
+       * ветка «без состояния» у него не бросается никогда.
+       */
+      assumeStatuses?: boolean;
     }>(),
     {
       includeSpellModifier: true,
@@ -33,8 +40,9 @@
       hideHealing: false,
       hideConditions: false,
       hideModifiers: false,
-      addLabel: 'Добавить часть',
+      addLabel: DAMAGE_PART_LABELS.add,
       allowEmpty: false,
+      assumeStatuses: false,
     },
   );
 
@@ -81,6 +89,7 @@
       :hide-healing="hideHealing"
       :hide-conditions="hideConditions"
       :hide-modifiers="hideModifiers"
+      :assume-statuses="assumeStatuses"
       @update:model-value="updatePart(partIndex, $event)"
       @remove="removePart(partIndex)"
     />

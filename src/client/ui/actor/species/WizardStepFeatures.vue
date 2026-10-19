@@ -1,20 +1,56 @@
 <script setup lang="ts">
   import type {
+    DnDActor,
     ResolvedGrantedSpell,
     SpeciesDefinition,
     SpeciesFeature,
     SpeciesFeatureChoice,
+    Spell,
   } from '@vtt/shared/system/dnd.js';
 
-  import type { SpeciesWizardState } from './useSpeciesWizard';
+  import type { ChoicePickerOption } from '../ChoicePickerModal.vue';
+  import type { CompendiumFeat } from '../feat/featApply';
+  import type {
+    SpeciesFeatDataSourceView,
+    SpeciesFeatPick,
+    SpeciesGrantedFeat,
+    SpeciesWizardState,
+  } from './useSpeciesWizard';
+
+  import { computed } from 'vue';
 
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
+  import { isFeatPickChoice } from '@vtt/shared/system/dnd.js';
+
+  import ChoicePickerField from '../ChoicePickerField.vue';
+  import {
+    GRANTED_SPELL_FEATURE_PREFIX,
+    LEVEL_BADGE_SUFFIX,
+    SPECIES_FEAT_DEFAULT_EXCLUDED_CATEGORIES,
+    SPECIES_WIZARD_LABELS,
+  } from '../constants';
+  import FeatChoicesFields from '../feat/FeatChoicesFields.vue';
+  import WizardFeatPicker from '../feat/WizardFeatPicker.vue';
 
   const props = defineProps<{
     speciesDefinition: SpeciesDefinition;
     state: SpeciesWizardState;
     /** Granted-заклинания особенностей вида с данными из компендиума */
     grantedSpells: ResolvedGrantedSpell[];
+    /** Лист персонажа: по нему сужаются пулы выборов даров */
+    actor: DnDActor;
+    /** Бонус мастерства — от него зависит количество у некоторых выборов */
+    proficiencyBonus: number;
+    /** Источники блоков даров featData с подготовленными вопросами */
+    featDataSources: SpeciesFeatDataSourceView[];
+    /** Заклинания компендиума — пул для выборов заклинаний в дарах */
+    featChoiceSpells: ReadonlyArray<Spell>;
+    /** Выборы черты в дарах — их спрашивает пикер компендиума */
+    featPicks: SpeciesFeatPick[];
+    /** Черты, выданные дарами без выбора, которым есть что спросить */
+    grantedFeatQuestions: SpeciesGrantedFeat[];
+    /** Черты компендиума — пул этих выборов */
+    featChoiceFeats: ReadonlyArray<CompendiumFeat>;
   }>();
 
   const emit = defineEmits<{
@@ -22,16 +58,119 @@
   }>();
 
   /**
-   * Обновляет выбранный вариант для особенности вида.
-   * @param featureKey - ключ особенности
-   * @param choiceKey - ключ выбранного варианта
+   * Источники с вопросами к игроку и сами вопросы — БЕЗ выбора черты: его
+   * спрашивает пикер компендиума ниже, а общие поля выбора показали бы пустой
+   * список (пул черт живёт в компендиуме, а не в справочнике правил).
    */
-  function selectFeatureChoice(featureKey: string, choiceKey: string) {
+  const sourcesWithChoices = computed(() =>
+    props.featDataSources
+      .map((source) => ({
+        ...source,
+        preparedChoices: source.preparedChoices.filter(
+          (choice) => !isFeatPickChoice(choice),
+        ),
+      }))
+      .filter((source) => source.preparedChoices.length > 0),
+  );
+
+  /**
+   * Выбранная черта одного вопроса; `null` — не выбрана.
+   *
+   * @param pick - вопрос о черте
+   */
+  function selectedFeatId(pick: SpeciesFeatPick): string | null {
+    return (
+      props.state.featDataChoices[pick.sourceKey]?.[pick.choice.key]?.[0]
+      ?? null
+    );
+  }
+
+  /**
+   * Записывает выбранную черту в ответы её блока даров. Ответы прежней черты
+   * при этом стираются: у новой свои вопросы, а чужие ответы выдали бы ей то,
+   * чего она не даёт.
+   *
+   * @param pick - вопрос о черте
+   * @param featId - ключ выбранной черты; `null` — выбор снят
+   */
+  function updateFeatPick(pick: SpeciesFeatPick, featId: string | null): void {
+    emit('update:state', {
+      ...props.state,
+      featDataChoices: {
+        ...props.state.featDataChoices,
+        [pick.sourceKey]: {
+          ...props.state.featDataChoices[pick.sourceKey],
+          [pick.choice.key]: featId ? [featId] : [],
+        },
+      },
+      featPickAnswers: { ...props.state.featPickAnswers, [pick.pickKey]: {} },
+    });
+  }
+
+  /**
+   * Записывает ответы на собственные выборы выбранной черты.
+   *
+   * @param pick - вопрос о черте
+   * @param answers - ответы черты: ключ выбора → выбранные значения
+   */
+  function updateFeatPickAnswers(
+    pick: SpeciesFeatPick,
+    answers: Record<string, string[]>,
+  ): void {
+    updateFeatAnswers(pick.pickKey, answers);
+  }
+
+  /**
+   * Записывает ответы черты на её собственные вопросы под её ключом ответов.
+   *
+   * @param answersKey - ключ ответов черты
+   * @param answers - ответы черты: ключ выбора → выбранные значения
+   */
+  function updateFeatAnswers(
+    answersKey: string,
+    answers: Record<string, string[]>,
+  ): void {
+    emit('update:state', {
+      ...props.state,
+      featPickAnswers: {
+        ...props.state.featPickAnswers,
+        [answersKey]: answers,
+      },
+    });
+  }
+
+  /**
+   * Записывает ответы одного блока даров в состояние мастера.
+   *
+   * @param sourceKey - ключ источника блока
+   * @param answers - ответы блока: ключ выбора → выбранные значения
+   */
+  function updateFeatDataChoices(
+    sourceKey: string,
+    answers: Record<string, string[]>,
+  ): void {
+    emit('update:state', {
+      ...props.state,
+      featDataChoices: {
+        ...props.state.featDataChoices,
+        [sourceKey]: answers,
+      },
+    });
+  }
+
+  /**
+   * Обновляет выбранный вариант для особенности вида. Окно выбора отдаёт набор
+   * отметок, а вариант у особенности один — берётся первая.
+   *
+   * @param featureKey - ключ особенности
+   * @param choiceKeys - ключи отмеченных вариантов
+   */
+  function selectFeatureChoice(featureKey: string, choiceKeys: string[]) {
     emit('update:state', {
       ...props.state,
       featureChoices: {
         ...props.state.featureChoices,
-        [featureKey]: choiceKey,
+        [featureKey]: choiceKeys[0] ?? '',
       },
     });
   }
@@ -63,17 +202,30 @@
   }
 
   /**
-   * Опции селекта вариантов (подвидов) для особенности.
+   * Варианты (подвиды) особенности для окна выбора: описание читают, не
+   * закрывая окна.
    *
    * @param feature - особенность вида с вариантами
    */
   function getFeatureChoiceOptions(
     feature: SpeciesFeature,
-  ): { value: string; label: string }[] {
+  ): ChoicePickerOption[] {
     return (feature.choices ?? []).map((choice) => ({
       value: choice.key,
-      label: choice.name,
+      name: choice.name,
+      description: choice.description,
     }));
+  }
+
+  /**
+   * Выбранный вариант особенности набором отметок — так его ждёт строка выбора.
+   *
+   * @param feature - особенность вида с вариантами
+   */
+  function getFeatureChoiceSelected(feature: SpeciesFeature): string[] {
+    const chosen = props.state.featureChoices[feature.key];
+
+    return chosen ? [chosen] : [];
   }
 </script>
 
@@ -82,9 +234,9 @@
     <div
       v-for="feature in speciesDefinition.features"
       :key="feature.key"
-      class="flex flex-col gap-3 rounded-lg bg-elevated p-4"
+      class="flex flex-col gap-3 rounded-lg border border-default/50 bg-elevated/30 p-4"
     >
-      <span class="font-medium text-primary-400">
+      <span class="font-medium text-primary">
         {{ feature.name }}
       </span>
 
@@ -110,7 +262,7 @@
           {{ granted.spell.name }}
 
           <span class="text-[10px] opacity-60">
-            Умение: {{ granted.featureName }}
+            {{ GRANTED_SPELL_FEATURE_PREFIX }}{{ granted.featureName }}
           </span>
         </UBadge>
       </div>
@@ -120,23 +272,20 @@
         v-if="feature.choices && feature.choices.length > 0"
         class="mt-2 rounded-lg bg-default/50 p-3"
       >
-        <span class="mb-2 block text-xs font-medium text-muted">
-          Сделайте выбор:
-        </span>
-
-        <USelectMenu
-          :model-value="state.featureChoices[feature.key]"
-          :items="getFeatureChoiceOptions(feature)"
-          value-key="value"
-          label-key="label"
-          placeholder="Выберите вариант..."
-          @update:model-value="selectFeatureChoice(feature.key, $event)"
+        <ChoicePickerField
+          :label="SPECIES_WIZARD_LABELS.chooseFeatureChoice"
+          :subtitle="feature.name"
+          :options="getFeatureChoiceOptions(feature)"
+          :selected="getFeatureChoiceSelected(feature)"
+          :max="1"
+          @update:selected="selectFeatureChoice(feature.key, $event)"
         />
 
         <template v-if="getSelectedChoice(feature)">
-          <div class="mt-3 text-sm text-muted">
-            {{ getSelectedChoice(feature)?.description }}
-          </div>
+          <ItemDescriptionRenderer
+            :content="getSelectedChoice(feature)?.description ?? ''"
+            class="mt-3 text-sm text-muted"
+          />
 
           <!-- Что даёт выбранный подвид (со своими уровнями) -->
           <div
@@ -158,7 +307,7 @@
                   variant="subtle"
                   size="sm"
                 >
-                  {{ subFeature.level ?? 1 }} ур.
+                  {{ subFeature.level ?? 1 }}{{ LEVEL_BADGE_SUFFIX }}
                 </UBadge>
               </div>
 
@@ -170,6 +319,81 @@
           </div>
         </template>
       </div>
+    </div>
+
+    <!-- Выборы блоков даров featData: по блоку на источник — ключи выборов у
+      разных особенностей могут совпадать, и общий список их бы склеил -->
+    <div
+      v-for="source in sourcesWithChoices"
+      :key="source.sourceKey"
+      class="flex flex-col gap-3 rounded-lg border border-default/50 bg-elevated/30 p-4"
+    >
+      <span class="font-medium text-primary">
+        {{ SPECIES_WIZARD_LABELS.featDataChoicesPrefix }}{{ source.sourceName }}
+      </span>
+
+      <FeatChoicesFields
+        :choices="source.preparedChoices"
+        :actor="actor"
+        :proficiency-bonus="proficiencyBonus"
+        :spells="featChoiceSpells"
+        :model-value="state.featDataChoices[source.sourceKey] ?? {}"
+        @update:model-value="updateFeatDataChoices(source.sourceKey, $event)"
+      />
+    </div>
+
+    <!-- Выборы черты: пул берётся из компендиума черт, поэтому у них свой
+      пикер, а не общие поля выбора -->
+    <div
+      v-for="pick in featPicks"
+      :key="pick.pickKey"
+      class="flex flex-col gap-3 rounded-lg border border-default/50 bg-elevated/30 p-4"
+    >
+      <span class="font-medium text-primary">
+        {{ SPECIES_WIZARD_LABELS.featDataChoicesPrefix }}{{ pick.sourceName }}
+      </span>
+
+      <WizardFeatPicker
+        :choice="pick.choice"
+        :feats="featChoiceFeats"
+        :actor="actor"
+        :excluded-categories="SPECIES_FEAT_DEFAULT_EXCLUDED_CATEGORIES"
+        :model-value="selectedFeatId(pick)"
+        @update:model-value="updateFeatPick(pick, $event)"
+      />
+
+      <!-- Собственные выборы выбранной черты: без них она легла бы на лист
+        пустой — у «Одарённого» ни прибавки к характеристике, ни навыка -->
+      <FeatChoicesFields
+        v-if="pick.ownChoices.length > 0"
+        :choices="pick.ownChoices"
+        :actor="actor"
+        :proficiency-bonus="proficiencyBonus"
+        :spells="featChoiceSpells"
+        :model-value="state.featPickAnswers[pick.pickKey] ?? {}"
+        @update:model-value="updateFeatPickAnswers(pick, $event)"
+      />
+    </div>
+
+    <!-- Собственные вопросы черт, выданных дарами без выбора: без ответов
+      такая черта легла бы на лист пустой — так же, как выбранная -->
+    <div
+      v-for="granted in grantedFeatQuestions"
+      :key="granted.answersKey"
+      class="flex flex-col gap-3 rounded-lg border border-default/50 bg-elevated/30 p-4"
+    >
+      <span class="font-medium text-primary">
+        {{ SPECIES_WIZARD_LABELS.featDataChoicesPrefix }}{{ granted.feat.name }}
+      </span>
+
+      <FeatChoicesFields
+        :choices="granted.ownChoices"
+        :actor="actor"
+        :proficiency-bonus="proficiencyBonus"
+        :spells="featChoiceSpells"
+        :model-value="state.featPickAnswers[granted.answersKey] ?? {}"
+        @update:model-value="updateFeatAnswers(granted.answersKey, $event)"
+      />
     </div>
   </div>
 </template>

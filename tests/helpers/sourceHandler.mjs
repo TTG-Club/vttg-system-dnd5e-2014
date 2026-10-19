@@ -1,0 +1,177 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const systemRoot = fileURLToPath(new URL('../../', import.meta.url));
+
+const require = createRequire(join(systemRoot, 'package.json'));
+const { runInNewContext } = require('node:vm');
+
+const { parse } = require('@vue/compiler-sfc');
+const typescript = require('typescript');
+
+/** Компилирует настоящий обработчик исходного файла с явно заданными портами окружения. */
+export async function loadHandler(relativePath, name, ports, macro = false) {
+  const content = await readFile(join(systemRoot, relativePath), 'utf8');
+
+  const script = relativePath.endsWith('.vue')
+    ? parse(content).descriptor.scriptSetup.content
+    : content;
+
+  const sourceFile = typescript.createSourceFile(
+    relativePath,
+    script,
+    typescript.ScriptTarget.Latest,
+    true,
+  );
+
+  let handler;
+  let expression = macro;
+
+  /**
+   * Тип макроса в регистрации: строкой или константой.
+   *
+   * @param {object | undefined} argument - первый аргумент `registerMacro`
+   * @returns {string | undefined} тип
+   */
+  function macroTypeOf(argument) {
+    return argument?.text ?? argument?.getText(sourceFile);
+  }
+
+  /** Ищет объявление функции либо зарегистрированный обработчик макроса. */
+  function visit(node) {
+    if (
+      !macro
+      && typescript.isFunctionDeclaration(node)
+      && node.name?.text === name
+    ) {
+      handler = node;
+    }
+
+    if (
+      !macro
+      && typescript.isVariableDeclaration(node)
+      && node.name.getText(sourceFile) === name
+      && node.initializer
+    ) {
+      handler = node.initializer;
+      expression = true;
+    }
+
+    if (
+      macro
+      && typescript.isCallExpression(node)
+      && node.expression.getText(sourceFile) === 'registerMacro'
+      && macroTypeOf(node.arguments[0]) === name
+    ) {
+      handler = node.arguments[1];
+    }
+
+    typescript.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  assert.ok(handler, `Не найден обработчик ${name}`);
+
+  // Экспорт модуля не нужен при запуске отдельной настоящей функции в VM.
+  if (typescript.isFunctionDeclaration(handler)) {
+    handler = typescript.factory.updateFunctionDeclaration(
+      handler,
+      handler.modifiers?.filter(
+        (modifier) =>
+          modifier.kind !== typescript.SyntaxKind.ExportKeyword
+          && modifier.kind !== typescript.SyntaxKind.DefaultKeyword,
+      ),
+      handler.asteriskToken,
+      handler.name,
+      handler.typeParameters,
+      handler.parameters,
+      handler.type,
+      handler.body,
+    );
+  }
+
+  const handlerSource = typescript
+    .createPrinter()
+    .printNode(typescript.EmitHint.Unspecified, handler, sourceFile);
+
+  const moduleSource = expression
+    ? `const execute = ${handlerSource};`
+    : handlerSource;
+
+  const compiled = typescript.transpileModule(moduleSource, {
+    compilerOptions: { target: typescript.ScriptTarget.ES2022 },
+  });
+
+  // Выбор варианта эффекта проходной: у фикстур обработчиков групп вариантов
+  // нет. Пишем в сам объект портов, а не в копию: он и есть контекст VM, и
+  // тесты подменяют порты уже после загрузки обработчика
+  ports.runWithEffectVariants ??= (source, proceed) => proceed(source);
+
+  // Вид атаки «рукопашная или дальнобойная» так же проходной: фикстуры
+  // атакуют одним видом, и вопрос не задаётся
+  ports.runWeaponAttackChoices ??= (source, _attackerId, proceed) =>
+    proceed(source);
+
+  ports.runCreatureActionChoices ??= (source, _attackerId, proceed) =>
+    proceed(source);
+
+  // Тип урона на выбор так же проходной: у фикстур токенов `@dmg.choice(…)`
+  // нет, и окну вопрос не отдаётся, а плашка пропускает действие сразу
+  ports.requestDamageTypeChoice ??= () => undefined;
+  ports.requestDamageTypeChoiceFor ??= () => undefined;
+  ports.runWithDamageTypeChoices ??= (source, proceed) => proceed(source);
+  ports.applySourceDamageTypeChoices ??= (source) => source;
+
+  // Сл спасброска у фикстур считается: проверка непосчитанной Сл проходная
+  ports.findUnresolvedTargetSaveDc ??= () => null;
+
+  // Действие существа «спасбросок без урона» идёт мимо окна броска: у фикстур
+  // с уроном разбор отвечает «нет» и окно открывается как раньше
+  ports.runDamagelessCreatureAction ??= () => false;
+
+  // Снимка броска атаки у фикстур нет: сущности разбора — сущности мира
+  ports.listAttackResolutionEntities ??= () =>
+    ports.useWorldEntities?.().getCurrentWorldEntities() ?? [];
+
+  // Числа сущности с аурами карты — тем же расчётом, что помощник клиента,
+  // из портов теста: расчёт чисел и ауры тест даёт сам
+  ports.resolveEntityStats ??= (entity) =>
+    ports.resolveActorStats(
+      entity,
+      ports.listAmbientEffects?.(entity.id) ?? [],
+    );
+
+  // Разделитель раздела и названия в ключе источника действия существа
+  ports.ACTION_SOURCE_SEPARATOR ??= '/';
+
+  // Окно того же источника у фикстур не открыто: заменять нечего
+  ports.closeRollWindow ??= () => false;
+
+  ports.buildRollSourceKey ??= (entityId, kind, sourceId) =>
+    [entityId, kind, sourceId].join(':');
+
+  // Лист фикстур не в режиме правки: проверка листа проходная
+  ports.refuseWhileSheetEditing ??= () => false;
+
+  // Игра у фикстур не на паузе: проверка паузы проходная
+  ports.refuseWhilePaused ??= () => false;
+
+  // Окно броска открывает один помощник: тестам с подменённым менеджером окон
+  // он даётся настоящим поверх их менеджера (импорт здесь, а не наверху:
+  // модуль помощника сам собирается этим загрузчиком)
+  if (ports.useModalManager && !('openDiceRollWindow' in ports)) {
+    const { bindOpenDiceRollWindow } = await import('./diceRollWindow.mjs');
+
+    ports.openDiceRollWindow = bindOpenDiceRollWindow(() =>
+      ports.useModalManager(),
+    );
+  }
+
+  return runInNewContext(
+    `${compiled.outputText}\n${expression ? 'execute' : name}`,
+    ports,
+  );
+}

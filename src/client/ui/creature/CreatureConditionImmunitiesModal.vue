@@ -1,9 +1,15 @@
 <script setup lang="ts">
-  import { CONDITIONS } from '@vtt/shared/system/dnd.js';
   import { computed, ref, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
+  import { listSelectableConditions } from '@vtt/shared/system/dnd.js';
+
+  import { MODAL_BUTTON_LABELS } from '../actor/constants';
+  import {
+    CREATURE_CONDITION_IMMUNITIES_LABELS,
+    CREATURE_DEFENSES_LABELS,
+  } from './constants';
 
   /** Блокирующий модал — фиксированный z-index поверх остальных */
   const MODAL_Z_INDEX = Z_INDEX.MODAL_ELEVATED;
@@ -32,9 +38,9 @@
   /** Строка для особых (кастомных) значений */
   const customValues = ref('');
 
-  /** Опции состояний из констант (CONDITIONS) */
+  /** Состояния системы и мира — из реестра состояний */
   const conditionOptions = computed(() => {
-    return CONDITIONS.map((condition) => ({
+    return listSelectableConditions().map((condition) => ({
       key: condition.key,
       label: condition.nameRu,
     }));
@@ -109,7 +115,7 @@
     :blocking="true"
     :min-width="600"
     :min-height="400"
-    title="Невосприимчивость к состояниям"
+    :title="CREATURE_CONDITION_IMMUNITIES_LABELS.title"
     :z-index="MODAL_Z_INDEX"
   >
     <template #body>
@@ -122,11 +128,11 @@
             <div
               class="mb-2 border-b border-default/50 pb-2 text-center text-xs font-bold tracking-wider text-warning uppercase"
             >
-              Состояния
+              {{ CREATURE_CONDITION_IMMUNITIES_LABELS.conditions }}
             </div>
 
             <div
-              class="custom-scrollbar max-h-[380px] space-y-0.5 overflow-y-auto pr-1"
+              class="custom-scrollbar max-h-95 space-y-0.5 overflow-y-auto pr-1"
             >
               <div
                 v-for="option in conditionOptions"
@@ -153,18 +159,20 @@
               <div
                 class="mb-2 border-b border-default/50 pb-2 text-center text-xs font-bold tracking-wider text-highlighted uppercase"
               >
-                Особое
+                {{ CREATURE_DEFENSES_LABELS.customTitle }}
               </div>
 
               <textarea
                 v-model="customValues"
-                class="w-full resize-none rounded border-none bg-black/20 p-2 text-sm text-default outline-none placeholder:text-dimmed focus:ring-1 focus:ring-primary"
+                class="w-full resize-none rounded border-none bg-default/20 p-2 text-sm text-default outline-none placeholder:text-dimmed focus:ring-1 focus:ring-primary"
                 rows="3"
-                placeholder="от заклинаний школы Иллюзии..."
+                :placeholder="
+                  CREATURE_CONDITION_IMMUNITIES_LABELS.customPlaceholder
+                "
               />
 
               <div class="mt-1 text-xs text-dimmed">
-                Значения разделяются точкой с запятой.
+                {{ CREATURE_DEFENSES_LABELS.customHint }}
               </div>
             </div>
           </div>
@@ -178,7 +186,7 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -186,7 +194,7 @@
             size="sm"
             @click.left.exact.prevent="applySelection"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

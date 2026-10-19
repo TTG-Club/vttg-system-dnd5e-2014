@@ -11,17 +11,52 @@
  * сопротивления и уязвимости.
  */
 
-import type { DefensibleDamageType } from '@vtt/shared';
 // DamageApplyResult / DamageDefenseOutcome — нейтральные контрактные типы (живут в
 // system/contracts/combat), D&D их лишь реэкспортит для своих потребителей.
 import type {
   DamageApplyResult,
   DamageDefenseOutcome,
+  DefensibleDamageType,
 } from '@vtt/shared';
 
 import { DEFENSIBLE_DAMAGE_TYPES } from './damageConstants.js';
 
 export type { DamageApplyResult, DamageDefenseOutcome };
+
+/**
+ * Хиты цели до и после изменения — для строки «HP: 47 → 42» в подробностях
+ * карточки чата.
+ */
+export interface HpChangeDetail {
+  /** Хиты до изменения */
+  hpBefore: number;
+  /** Хиты после изменения */
+  hpAfter: number;
+  /** Временные хиты до изменения */
+  tempBefore: number;
+  /** Временные хиты после изменения */
+  tempAfter: number;
+  /**
+   * Хиты цели открыты игрокам (см. `isEntityHpShownToPlayers`). Нет — строку
+   * увидит только мастер: игрокам сервер её не пришлёт
+   */
+  isPublic: boolean;
+}
+
+/**
+ * Итог применения урона вместе с тем, что нужно карточке чата. Контракт ядра
+ * (`DamageApplyResult`) временных хитов «до» и видимости хитов цели не знает —
+ * система дописывает их сама; ядро лишние поля не читает.
+ */
+export interface DndDamageApplyResult extends DamageApplyResult {
+  /** Хиты цели до и после — для подробностей строки урона */
+  hpChange?: HpChangeDetail;
+  /**
+   * Урон после защит цели, сколько бы хитов у неё ни было: по нему кнопки
+   * под уроном в чате считают половину и крит
+   */
+  damageDealt?: number;
+}
 
 /** Урон при иммунитете (полностью игнорируется) */
 const IMMUNITY_DAMAGE = 0;
@@ -285,6 +320,49 @@ export function applyDamageDefenses(
   }
 
   return { finalDamage, outcome };
+}
+
+/** Приставка флага атакующего «урон этого типа игнорирует сопротивление» */
+export const IGNORE_RESISTANCE_FLAG_PREFIX = 'damage.ignoreResistance.';
+
+/**
+ * Типы урона, чьё сопротивление игнорирует урон носителя флагов.
+ *
+ * @param flags - активные флаги атакующего
+ * @returns типы урона
+ */
+export function listIgnoredResistances(
+  flags: ReadonlySet<string>,
+): DefensibleDamageType[] {
+  return DEFENSIBLE_DAMAGE_TYPES.filter((damageType) =>
+    flags.has(`${IGNORE_RESISTANCE_FLAG_PREFIX}${damageType}`),
+  );
+}
+
+/**
+ * Защиты цели без сопротивлений, которые урон атакующего игнорирует
+ * («Сила могилы»). Иммунитет и уязвимость остаются.
+ *
+ * @param defenses - защиты цели
+ * @param ignored - типы урона, чьё сопротивление игнорируется
+ * @returns защиты для этого удара
+ */
+export function withoutIgnoredResistances(
+  defenses: DamageDefenses,
+  ignored: readonly string[] | undefined,
+): DamageDefenses {
+  if (!ignored || ignored.length === 0) {
+    return defenses;
+  }
+
+  const ignoredSet = new Set(ignored);
+
+  return {
+    ...defenses,
+    resistances: new Set(
+      [...defenses.resistances].filter((type) => !ignoredSet.has(type)),
+    ),
+  };
 }
 
 /**
