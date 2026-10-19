@@ -1,40 +1,95 @@
 <script setup lang="ts">
   import type { BackgroundEquipmentOption } from '@vtt/shared/system/dnd.js';
 
-  import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
+  import { computed } from 'vue';
 
-  defineProps<{
+  import { hasGrantableEquipment } from '@vtt/shared/system/dnd.js';
+
+  import { BACKGROUND_WIZARD_LABELS } from '../constants';
+  import StartingEquipmentOptionBody from '../StartingEquipmentOptionBody.vue';
+
+  const props = defineProps<{
     equipmentOptions: BackgroundEquipmentOption[];
   }>();
+
+  /**
+   * Выбранный вариант. `null` — ничего не выбрано: у предысторий без позиций
+   * выбирать нечего, и мастер тогда просто показывает варианты текстом.
+   */
+  const selectedIndex = defineModel<number | null>('selectedIndex', {
+    default: null,
+  });
+
+  /** Есть ли хоть у одного варианта что выдать — иначе выбор не показываем. */
+  const isSelectable = computed(() =>
+    props.equipmentOptions.some(hasGrantableEquipment),
+  );
+
+  /** Тег карточки варианта: выбираемый вариант — кнопка, иначе обычный блок */
+  const optionTag = computed(() => (isSelectable.value ? 'button' : 'div'));
+
+  /** Кнопке нужен явный тип, блоку — нет */
+  const optionType = computed(() =>
+    isSelectable.value ? 'button' : undefined,
+  );
+
+  /** Оформление карточки: выбранный вариант подсвечен */
+  function optionClass(index: number): string {
+    return selectedIndex.value === index
+      ? 'border-primary bg-primary/10'
+      : 'border-default/50 bg-elevated/30';
+  }
+
+  /**
+   * Выбирает вариант; повторное нажатие снимает выбор. У вариантов без позиций
+   * выбирать нечего — нажатие там ничего не делает.
+   *
+   * @param index - порядковый номер варианта
+   */
+  function selectOption(index: number): void {
+    if (!isSelectable.value) {
+      return;
+    }
+
+    selectedIndex.value = selectedIndex.value === index ? null : index;
+  }
 </script>
 
 <template>
   <div class="space-y-6">
     <div class="space-y-2">
       <h3 class="font-serif text-xl font-medium text-highlighted">
-        Стартовое снаряжение
+        {{ BACKGROUND_WIZARD_LABELS.equipmentTitle }}
       </h3>
 
       <p class="text-sm text-muted">
-        Выберите один из вариантов стартового снаряжения. Пока что выдача
-        предметов не автоматизирована — вам потребуется добавить их из
-        справочника в инвентарь вручную после завершения настройки.
+        {{
+          isSelectable
+            ? BACKGROUND_WIZARD_LABELS.equipmentChooseHint
+            : BACKGROUND_WIZARD_LABELS.equipmentHint
+        }}
       </p>
     </div>
 
     <div class="grid gap-4 sm:grid-cols-2">
-      <div
+      <component
+        :is="optionTag"
         v-for="(option, index) in equipmentOptions"
         :key="index"
-        class="flex flex-col rounded-xl border border-default/50 bg-elevated/30 p-4"
+        :type="optionType"
+        class="flex flex-col rounded-xl border p-4 text-left"
+        :class="optionClass(index)"
+        @click.left.exact.prevent="selectOption(index)"
       >
         <div
           class="mb-3 flex items-center justify-between border-b border-default/50 pb-2"
         >
-          <span
-            class="text-xs font-bold tracking-wider text-primary-400 uppercase"
-          >
-            {{ index === 0 ? 'Вариант А' : 'Вариант Б' }}
+          <span class="text-xs font-bold tracking-wider text-primary uppercase">
+            {{
+              index === 0
+                ? BACKGROUND_WIZARD_LABELS.equipmentOptionA
+                : BACKGROUND_WIZARD_LABELS.equipmentOptionB
+            }}
           </span>
 
           <UIcon
@@ -50,9 +105,10 @@
           />
         </div>
 
-        <div class="flex-1 text-sm text-toned">
-          <ItemDescriptionRenderer :content="option.description" />
-        </div>
+        <StartingEquipmentOptionBody
+          :option="option"
+          class="flex-1"
+        />
 
         <div
           v-if="option.goldAlternative"
@@ -64,10 +120,11 @@
           />
 
           <span class="text-sm font-semibold"
-            >{{ option.goldAlternative }} золотых монет</span
+            >{{ option.goldAlternative
+            }}{{ BACKGROUND_WIZARD_LABELS.equipmentGoldSuffix }}</span
           >
         </div>
-      </div>
+      </component>
     </div>
   </div>
 </template>

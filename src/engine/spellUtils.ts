@@ -5,66 +5,450 @@
  * формул урона с учётом усиления и масштабирования заговоров.
  */
 
-import type { AbilityType, MeasurementTemplateType } from '@vtt/shared';
 import type {
+  AbilityType,
   DamagePart,
   DamagePartTarget,
   DamageType,
+  SpellSaveType,
 } from '@vtt/shared';
-import type { ResolvedActorStats } from './activeEffectTypes.js';
-import type { DnDActor, Spell, SpellProjectiles } from './dndEntities.js';
 
+import type { ActiveEffect, ResolvedActorStats } from './activeEffectTypes.js';
+import type { ConditionRef } from './conditionKeys.js';
+import type { CreatureSpellcastingBlock } from './creatureSpellcasting.js';
+import type {
+  CreatureCategory,
+  CreatureSpellcasting,
+} from './creatureTypes.js';
+import type { DnDCustomBonusContext } from './customBonuses.js';
+import type {
+  DnDActor,
+  DnDCreature,
+  DnDGameItem,
+  DnDSceneEntity,
+  Spell,
+  SpellProjectiles,
+  SpellRollSource,
+} from './dndEntities.js';
+import type { DamageTypeChoice, HealKind } from './formulaTokens.js';
+import type { DnDAbilityScores } from './types.js';
+
+import { isActorEntity, isRecord } from '@vtt/shared';
+
+import { isCarrierEffect } from './activeEffectTypes.js';
 import {
   calculateAbilityModifier,
-  calculateProficiencyBonus,
+  getActorAbilityModifiers,
+  getActorProficiencyBonus,
+  getCreatureProficiencyBonus,
+  getWeaponDamageParts,
 } from './calculations.js';
-import { getTotalLevel } from './classTypes.js';
-import { getSpellDamageParts } from './damageParts.js';
+import { getConditionEntry } from './conditionTemplates.js';
 import {
-  buildFormulaContext,
-  substituteFormulaVariables,
-} from './formulaParser.js';
+  CREATURE_TYPE_LABELS,
+  isAbilityType,
+  SPELL_SAVE_DC_BASE,
+} from './consts.js';
+import {
+  parseTargetTypeToken,
+  TARGET_TYPE_STRIP_REGEX,
+} from './creatureTypeGate.js';
+import { CHOICE_DAMAGE_TYPE, isDamageType } from './damageConstants.js';
+import { getSpellDamageParts } from './damageParts.js';
+import { entityHasDamageStatus } from './damageTargetGate.js';
+import { formatDiceLetters } from './diceFormula.js';
+import { substituteFormulaVariables } from './formulaParser.js';
+import {
+  applyStatusConditionals,
+  DAMAGE_TYPE_TOKEN_GLOBAL_REGEX,
+  damageTypeChoiceKey,
+  detectFormulaDamageType,
+  detectFormulaHealKind,
+  hasDamageTypeToken,
+  hasHealToken,
+  hasStatusToken,
+  readDamageTypeChoiceToken,
+  readStatusToken,
+  splitByTargetStatus,
+  splitFormulaTerms,
+  spreadKindTokens,
+  stripDamageTypeTokens,
+  stripHealTokens,
+  stripStatusTokens,
+  uniqueDamageTypeChoices,
+} from './formulaTokens.js';
+import { buildResolvedFormulaContext } from './resolvedFormulaContext.js';
+import {
+  getSpellAttackBreakdown,
+  getSpellSaveDCBreakdown,
+  parseSpellcastingSettings,
+} from './spellcastingSettings.js';
+
+// ── Разбор внешних данных ────────────────────────────────────
+
+/**
+ * Проверяет, что значение — заклинание.
+ *
+ * Проверка структурная и намеренно ленивая, как у схем предметов: сверяется
+ * «конверт» заклинания (то, без чего оно не заклинание и без чего сломается
+ * лист), а прочие поля идут как есть. Строже нельзя — заклинания приезжают из
+ * компендиумов и миров разных лет, и полная сверка отвергала бы рабочие записи.
+ *
+ * Нужна там, где заклинание приходит извне: перетаскивание между окнами,
+ * буфер обмена, полезная нагрузка сокета.
+ *
+ * @param value - произвольное значение (разобранный JSON, данные события)
+ * @returns `true`, если значение — заклинание
+ */
+export function isSpell(value: unknown): value is Spell {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    typeof value.id === 'string'
+    && typeof value.name === 'string'
+    && typeof value.level === 'number'
+  );
+}
 
 // ── Расчёт атаки ─────────────────────────────────────────────
+
+/**
+ * Разыгрывается ли настоящее заклинание, а не удар оружием, действие существа
+ * или предмет псевдо-заклинанием. Спасбросок от него — «против заклинания».
+ *
+ * @param spell - заклинание или псевдо-заклинание броска
+ * @returns `true` для настоящего заклинания
+ */
+export function isSpellRoll(spell: Spell): boolean {
+  return spell.rollSource === undefined;
+}
+
+/**
+ * Источники бросков, которые сами по себе не магия: удар оружием (приём,
+ * спасбросок оружия) и действие существа (дыхание, укус). «Магическое
+ * сопротивление» против них не помогает (PHB 2024: «заклинания и другие
+ * магические эффекты»).
+ */
+const MUNDANE_ROLL_SOURCES: ReadonlySet<SpellRollSource> = new Set([
+  'weapon',
+  'creatureAction',
+]);
+
+/**
+ * Навязан ли спасбросок броска магией: заклинание, магический предмет,
+ * применённое умение.
+ *
+ * @param spell - заклинание или псевдо-заклинание броска
+ * @returns `true` для магического броска
+ */
+export function isMagicRoll(spell: Spell): boolean {
+  return (
+    spell.rollSource === undefined
+    || !MUNDANE_ROLL_SOURCES.has(spell.rollSource)
+  );
+}
+
+/**
+ * Тип спасброска — характеристика, а не `none`. Сужает значение до
+ * `AbilityType` без приведения типов.
+ *
+ * @param saveType - тип спасброска заклинания, оружия или действия
+ * @returns `true`, если спасбросок есть
+ */
+export function isSaveAbility(
+  saveType: SpellSaveType | undefined,
+): saveType is AbilityType {
+  return saveType !== undefined && saveType !== 'none';
+}
+
+/** Поля псевдо-заклинания, которые задаёт источник броска */
+export type PseudoSpellFields = Pick<Spell, 'id' | 'name'>
+  & Required<Pick<Spell, 'rollSource'>>
+  & Partial<Spell>;
+
+/**
+ * Псевдо-заклинание броска не-заклинания: удар оружием, действие существа,
+ * применение предмета или эффекта идут тем же путём, что и заклинание.
+ * Общие поля — здесь, источник задаёт своё.
+ *
+ * @param fields - поля источника
+ * @returns псевдо-заклинание
+ */
+export function buildPseudoSpell(fields: PseudoSpellFields): Spell {
+  return {
+    level: 0,
+    school: 'evocation',
+    castingTimeValue: 1,
+    castingTimeUnit: 'action',
+    components: { verbal: false, somatic: false, material: false },
+    range: 0,
+    rangeUnit: 'ft',
+    durationValue: 0,
+    durationUnit: 'instantaneous',
+    concentration: false,
+    ritual: false,
+    targetType: 'creature',
+    deliveryType: 'touch',
+    saveType: 'none',
+    description: '',
+    ...fields,
+  };
+}
 
 /**
  * Определяет характеристику заклинания для актора.
  *
  * Приоритет:
  * 1. `spell.attackAbility` (переопределение на самом заклинании)
- * 2. `actor.system.spellcastingAbility` (глобальное переопределение)
- * 3. `ActorClassEntry.spellcastingAbility` (из класса)
- * 4. Fallback: 'intelligence'
+ * 2. `spell.spellcastingAbility` (характеристика записи справочника)
+ * 3. `actor.system.spellcastingAbility` (глобальное переопределение)
+ * 4. `ActorClassEntry.spellcastingAbility` (из класса)
+ * 5. Fallback: 'intelligence'
  *
- * @param actor - актор-владелец
+ * Запись справочника идёт после переопределения на листе и перед классом:
+ * заклинание, считающееся не от класса, называет свою характеристику само
+ * (так приезжают заклинания черт и хоумбрю из компендиума), но передумать за
+ * игрока, если он задал характеристику руками, оно не должно.
+ *
+ * @param actor - лист-владелец: актёр или существо
  * @param spell - заклинание
  * @returns характеристика заклинания
  */
 export function resolveSpellcastingAbility(
-  actor: DnDActor,
+  actor: DnDSceneEntity,
   spell: Spell,
 ): AbilityType {
   if (spell.attackAbility) {
     return spell.attackAbility;
   }
 
-  const systemAbility = actor.system?.spellcastingAbility;
-
-  if (systemAbility) {
-    return systemAbility;
+  if (spell.spellcastingAbility) {
+    return spell.spellcastingAbility;
   }
 
-  const casterClass = actor.system?.classes?.find(
-    (entry) => entry.spellcastingAbility != null,
-  );
+  return resolveActorSpellcastingAbility(actor);
+}
 
-  return casterClass?.spellcastingAbility ?? 'intelligence';
+/**
+ * Заклинательная характеристика листа: ручная настройка, иначе первый класс, у
+ * которого она заполнена.
+ *
+ * Отдельной функцией, потому что её спрашивают с разными ожиданиями: расчёт Сл в
+ * конвейере эффектов пропускает лист без заклинательства ({@code null}), а
+ * заклинанию нужна характеристика всегда — см. {@link resolveActorSpellcastingAbility}.
+ *
+ * @param actor - актор или существо
+ * @returns характеристика заклинаний листа либо {@code null}, если её нет
+ */
+export function findSpellcastingAbility(
+  actor: DnDActor | DnDCreature,
+): AbilityType | null {
+  const manualSpellcastingAbility = actor.system?.spellcastingAbility;
+
+  if (isAbilityType(manualSpellcastingAbility)) {
+    return manualSpellcastingAbility;
+  }
+
+  if (isActorEntity(actor)) {
+    const casterClass = actor.system.classes?.find(
+      (entry) => entry.spellcastingAbility != null,
+    );
+
+    if (casterClass?.spellcastingAbility) {
+      return casterClass.spellcastingAbility;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Заклинательная характеристика САМОГО ЛИСТА — без учёта переопределения на
+ * заклинании.
+ *
+ * Нужна, чтобы заклинание со своей характеристикой могло сравнить себя с листом:
+ * разница модификаторов и есть поправка к его Сл. Лист без заклинательства
+ * считается по Интеллекту — так же, как это делает расчёт атаки.
+ *
+ * @param actor - лист-владелец: актёр или существо
+ * @returns характеристика заклинаний листа
+ */
+export function resolveActorSpellcastingAbility(
+  actor: DnDSceneEntity,
+): AbilityType {
+  return findSpellcastingAbility(actor) ?? 'intelligence';
+}
+
+/**
+ * Включённые эффекты записи для окна броска. Пусто и «нет вовсе» здесь значат
+ * разное: по наличию списка решают, звать ли оркестратор на попадании без
+ * частей урона, поэтому выключенные не просто отсеиваются — список из них
+ * целиком превращается в `undefined`.
+ *
+ * @param effects - эффекты записи (заклинания, действия, предмета)
+ * @returns включённые эффекты либо `undefined`, если их нет
+ */
+export function listEnabledEffects(
+  effects: readonly ActiveEffect[] | undefined,
+): ActiveEffect[] | undefined {
+  const enabled = (effects ?? []).filter((effect) => !effect.disabled);
+
+  return enabled.length > 0 ? enabled : undefined;
+}
+
+/**
+ * Эффекты заклинания, которые ложатся на самого заклинателя: включённые, без
+ * адресата или с `effectTarget: 'self'`. Эффекты «на цели» и «в зону» сюда не
+ * попадают — у них свои пути наложения.
+ *
+ * @param spell - заклинание
+ * @returns эффекты на заклинателя (может быть пусто)
+ */
+export function getCasterSpellEffects(
+  spell: Pick<Spell, 'activeEffects'>,
+): ActiveEffect[] {
+  return (spell.activeEffects ?? []).filter(
+    (effect) => !effect.disabled && isCarrierEffect(effect),
+  );
+}
+
+/**
+ * Эффекты заклинания, предназначенные ЦЕЛИ (`effectTarget: 'target'`). Когда
+ * их накладывать (попадание, провал спасброска), решает вызывающий.
+ *
+ * @param spell - заклинание
+ * @returns эффекты на цель (может быть пусто)
+ */
+export function getTargetSpellEffects(
+  spell: Pick<Spell, 'activeEffects'>,
+): ActiveEffect[] {
+  return (spell.activeEffects ?? []).filter(
+    (effect) => !effect.disabled && effect.effectTarget === 'target',
+  );
+}
+
+/**
+ * Эффекты заклинания, которые уходят в зону на месте шаблона
+ * (`effectTarget: 'zone'`).
+ *
+ * @param spell - заклинание
+ * @returns эффекты зоны (может быть пусто)
+ */
+export function getZoneSpellEffects(
+  spell: Pick<Spell, 'activeEffects'>,
+): ActiveEffect[] {
+  return (spell.activeEffects ?? []).filter(
+    (effect) => !effect.disabled && effect.effectTarget === 'zone',
+  );
+}
+
+/** Поля заклинания, от которых зависит его Сл */
+export type SpellSaveDCSource = Pick<
+  Spell,
+  'saveDC' | 'attackAbility' | 'spellcastingAbility'
+>;
+
+/**
+ * Своя Сл заклинания, не зависящая от заклинателя (жезл, свиток, предмет).
+ *
+ * @param spell - заклинание
+ * @returns Сл либо `undefined`, если её нет и Сл считается от заклинателя
+ */
+export function readSpellOwnSaveDC(
+  spell: Pick<Spell, 'saveDC'>,
+): number | undefined {
+  const { saveDC } = spell;
+
+  return typeof saveDC === 'number' && Number.isFinite(saveDC) && saveDC >= 1
+    ? Math.round(saveDC)
+    : undefined;
+}
+
+/** Сл заклинаний существа, у которого не задано заклинательство */
+export const DEFAULT_CREATURE_SPELL_SAVE_DC = 10;
+
+/**
+ * Сл спасброска заклинания существа. Своя Сл заклинания (жезл, свиток) главнее
+ * Сл блока заклинаний; у существа без заклинательства — Сл по умолчанию.
+ *
+ * @param spell - заклинание
+ * @param blockSaveDC - Сл блока заклинаний существа
+ * @returns сложность спасброска
+ */
+export function resolveCreatureSpellSaveDC(
+  spell: Pick<Spell, 'saveDC'>,
+  blockSaveDC: number | undefined,
+): number {
+  return (
+    readSpellOwnSaveDC(spell) ?? blockSaveDC ?? DEFAULT_CREATURE_SPELL_SAVE_DC
+  );
+}
+
+/**
+ * Сл спасброска от КОНКРЕТНОГО заклинания.
+ *
+ * Своя Сл заклинания ({@link readSpellOwnSaveDC}) главнее всего: её задаёт
+ * предмет, а не персонаж. Иначе Сл берётся у листа. Но у заклинания может
+ * стоять своя характеристика («Посвящённый в магию» творит по той, что выбрал
+ * игрок, а не по характеристике класса) — тогда Сл пересчитывается от неё тем же
+ * расчётом, что у листа: `8 + бонус мастерства + модификатор` с настройкой
+ * листа. Прибавки активных эффектов переносятся как есть.
+ *
+ * Своё число в настройке листа («Настроить заклинательство») — это число: от
+ * характеристики заклинания оно не меняется. У листа без заклинательной
+ * характеристики и без настройки Сл заклинания со своей характеристикой всё
+ * равно считается — прежде она выходила разницей модификаторов (Сл 2).
+ *
+ * @param actor - актор-владелец
+ * @param spell - заклинание
+ * @param resolvedStats - итоговые статы листа
+ * @returns Сл спасброска для этого заклинания
+ */
+export function resolveSpellSaveDC(
+  actor: DnDActor,
+  spell: SpellSaveDCSource,
+  resolvedStats: ResolvedActorStats,
+): number {
+  const ownSaveDC = readSpellOwnSaveDC(spell);
+
+  if (ownSaveDC !== undefined) {
+    return ownSaveDC;
+  }
+
+  const spellAbility = spell.attackAbility ?? spell.spellcastingAbility;
+  const sheetAbility = findSpellcastingAbility(actor);
+
+  if (spellAbility === undefined || spellAbility === sheetAbility) {
+    return resolvedStats.spellSaveDC;
+  }
+
+  const settings = parseSpellcastingSettings(
+    actor.system.spellcastingSettings,
+  )?.saveDC;
+
+  const context = resolvedStats.abilityBonusContext;
+
+  const sheetValue =
+    getSpellSaveDCBreakdown({ ability: sheetAbility, settings, context })?.value
+    ?? 0;
+
+  // Всё, что эффекты прибавили к Сл листа, достаётся и заклинанию
+  const effectsDelta = resolvedStats.spellSaveDC - sheetValue;
+
+  const spellValue =
+    getSpellSaveDCBreakdown({ ability: spellAbility, settings, context })?.value
+    ?? 0;
+
+  return spellValue + effectsDelta;
 }
 
 /**
  * Рассчитывает модификатор атаки заклинанием.
  *
- * Формула: мод. характеристики + бонус мастерства + attack.spell + доп. бонус
+ * Формула: мод. характеристики + бонус мастерства + настройка листа +
+ * attack.spell + доп. бонус заклинания
  *
  * @param actor - актор-владелец
  * @param spell - заклинание
@@ -80,21 +464,25 @@ export function calculateSpellAttackModifier(
 
   // Мод характеристики и бонус мастерства берём из ИТОГОВЫХ статов (с учётом
   // Active Effects, в т.ч. бонусов к самому стату), иначе — из базовых значений.
-  let modifier: number;
+  const context: DnDCustomBonusContext = resolvedStats
+    ? {
+        abilityMods: resolvedStats.abilityMods,
+        proficiencyBonus: resolvedStats.proficiencyBonus,
+      }
+    : {
+        abilityMods: getActorAbilityModifiers(actor),
+        proficiencyBonus: getActorProficiencyBonus(actor),
+      };
 
-  if (resolvedStats) {
-    modifier =
-      resolvedStats.abilityMods[ability]
-      ?? calculateAbilityModifier(actor.system?.abilities?.[ability] ?? 10);
-
-    modifier += resolvedStats.proficiencyBonus;
-  } else {
-    modifier = calculateAbilityModifier(
-      actor.system?.abilities?.[ability] ?? 10,
-    );
-
-    modifier += calculateProficiencyBonus(getTotalLevel(actor.system?.classes));
-  }
+  // Характеристика здесь всегда есть (без своей берётся классовая), поэтому
+  // разбор числом отдаётся всегда — подстраховка нужна только типу
+  let modifier =
+    getSpellAttackBreakdown({
+      ability,
+      settings: parseSpellcastingSettings(actor.system?.spellcastingSettings)
+        ?.attack,
+      context,
+    })?.value ?? 0;
 
   // Доп. бонус на заклинании
   if (spell.attackBonus) {
@@ -159,7 +547,7 @@ export interface ProjectileCountContext {
  * Возвращает снарядный режим заклинания.
  *
  * Источник истины — ТОЛЬКО явный блок `spell.projectiles`; `targetCount` —
- * информационное «число целей эффекта» и распределение по целям не включает.
+ * число разных целей эффекта и снарядный режим не включает.
  *
  * @param spell - заклинание
  * @returns снарядный режим или undefined (обычное заклинание)
@@ -221,6 +609,24 @@ export function getSpellProjectileCount(
   return count;
 }
 
+/**
+ * Считает предел разных целей эффекта с учётом выбранной ячейки.
+ *
+ * @param spell - заклинание
+ * @param slotLevel - круг ячейки каста
+ * @returns наибольшее число разных целей эффекта
+ */
+export function getSpellEffectTargetCount(
+  spell: Spell,
+  slotLevel: number,
+): number {
+  return (
+    (spell.targetCount ?? 1)
+    + Math.max(0, slotLevel - spell.level)
+      * (spell.scaling?.additionalTargets ?? 0)
+  );
+}
+
 // ── Формулы урона ────────────────────────────────────────────
 
 /** Регулярное выражение для поиска кубиков в формуле */
@@ -234,6 +640,9 @@ const TARGET_CONDITION_STRIP_REGEX = /\s*@target\.(?:full|notFull)\b\s*/gi;
 /** Регэксп определения ветки условного токена цели в слагаемом. */
 const TARGET_CONDITION_DETECT_REGEX = /@target\.(full|notFull)\b/i;
 
+/** Регэксп «в строке есть токен типа цели» (без захвата самого типа). */
+const TARGET_TYPE_DETECT_ANY_REGEX = /@target\.type\.[a-z]+\b/i;
+
 /**
  * Снимает условные токены цели `@target.full`/`@target.notFull` из формулы
  * (для отображения, когда состояние цели неизвестно). Кубиковая нотация не
@@ -245,14 +654,147 @@ const TARGET_CONDITION_DETECT_REGEX = /@target\.(full|notFull)\b/i;
  * @returns формула без токенов @target
  */
 export function stripTargetTokens(formula: string): string {
-  if (!formula || !/@target\./i.test(formula)) {
+  if (!formula || !/@(?:target|self)\./i.test(formula)) {
     return formula ?? '';
   }
 
-  return formula
+  // Состояния (`@target.status.prone`, `@self.status.bloodied`) — такие же
+  // условия на слагаемое: доживи они до подстановки, формула упала бы
+  return stripStatusTokens(formula)
     .replace(TARGET_CONDITION_STRIP_REGEX, '')
+    .replace(TARGET_TYPE_STRIP_REGEX, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+// ── Условные слагаемые по типу цели (@target.type.<тип>) ──
+
+/**
+ * Ветка формулы, применяемая только к целям одного типа существа.
+ *
+ * В отличие от веток по хитам, эти ветки НЕ взаимоисключающие: безусловное
+ * слагаемое достаётся любой цели, а типовое ложится сверху только «своим». Из
+ * этого следует правило слот-скейлинга — усиление круга получает ровно одна
+ * ветка, иначе оно удвоится.
+ */
+export interface TargetTypeBranch {
+  /** Тип цели, к которой применяется ветка; пусто — ко всем */
+  typeGate?: CreatureCategory;
+  /** Формула ветки с уже снятыми типовыми токенами */
+  formula: string;
+}
+
+/**
+ * Применяет токены типа цели к формуле как ГЕЙТ НА СЛАГАЕМОЕ — цель известна.
+ *
+ * Слагаемое с `@target.type.undead` остаётся только у цели-нежити, иначе
+ * удаляется целиком (той же логикой, что и `@target.full`: зануление оставило бы
+ * «осиротевший» типизированный урон). Слагаемое с неизвестным типом в токене
+ * тоже удаляется: автор явно ограничил его целями, которых не бывает.
+ *
+ * @param formula - формула с возможными токенами `@target.type.*`
+ * @param targetType - тип цели; `undefined` — тип неизвестен, типовые слагаемые
+ *   не применяются
+ * @returns формула с оставленными слагаемыми (токены сняты)
+ */
+export function applyTargetTypeConditionals(
+  formula: string,
+  targetType: CreatureCategory | undefined,
+): string {
+  if (!formula || !TARGET_TYPE_DETECT_ANY_REGEX.test(formula)) {
+    return formula ?? '';
+  }
+
+  const kept: string[] = [];
+
+  for (const rawTerm of splitFormulaTerms(formula)) {
+    if (!TARGET_TYPE_DETECT_ANY_REGEX.test(rawTerm)) {
+      const term = rawTerm.trim();
+
+      if (term.length > 0) {
+        kept.push(term);
+      }
+
+      continue;
+    }
+
+    const termType = parseTargetTypeToken(rawTerm);
+
+    if (!termType || termType !== targetType) {
+      continue;
+    }
+
+    const cleaned = rawTerm.replace(TARGET_TYPE_STRIP_REGEX, '').trim();
+
+    if (cleaned.length > 0) {
+      kept.push(cleaned);
+    }
+  }
+
+  return kept.join(' + ').trim();
+}
+
+/**
+ * Раскладывает формулу по веткам типа цели — цель НЕизвестна (AoE, цель не
+ * выбрана).
+ *
+ * Веток ровно столько, сколько типов реально вписано в формулу, плюс одна
+ * безусловная — перебирать все четырнадцать типов незачем. Порядок: безусловная
+ * ветка первой (она и получает слот-скейлинг), дальше типовые.
+ *
+ * @param formula - формула с возможными токенами `@target.type.*`
+ * @returns ветки с непустыми формулами
+ */
+export function splitByTargetTypeGate(formula: string): TargetTypeBranch[] {
+  if (!formula || !TARGET_TYPE_DETECT_ANY_REGEX.test(formula)) {
+    return [{ formula: formula ?? '' }];
+  }
+
+  const unconditional: string[] = [];
+  const byType = new Map<CreatureCategory, string[]>();
+
+  for (const rawTerm of splitFormulaTerms(formula)) {
+    if (!TARGET_TYPE_DETECT_ANY_REGEX.test(rawTerm)) {
+      const term = rawTerm.trim();
+
+      if (term.length > 0) {
+        unconditional.push(term);
+      }
+
+      continue;
+    }
+
+    const termType = parseTargetTypeToken(rawTerm);
+
+    // Неизвестный тип в токене — слагаемое отбрасывается: цели такого типа не
+    // существует, и без отбрасывания оно досталось бы всем
+    if (!termType) {
+      continue;
+    }
+
+    const cleaned = rawTerm.replace(TARGET_TYPE_STRIP_REGEX, '').trim();
+
+    if (cleaned.length === 0) {
+      continue;
+    }
+
+    const terms = byType.get(termType) ?? [];
+
+    terms.push(cleaned);
+    byType.set(termType, terms);
+  }
+
+  const branches: TargetTypeBranch[] = [];
+
+  if (unconditional.length > 0) {
+    branches.push({ formula: unconditional.join(' + ') });
+  }
+
+  for (const [typeGate, terms] of byType) {
+    branches.push({ typeGate, formula: terms.join(' + ') });
+  }
+
+  return branches;
 }
 
 /**
@@ -284,7 +826,7 @@ export function applyTargetConditionals(
 
   const kept: string[] = [];
 
-  for (const rawTerm of formula.split('+')) {
+  for (const rawTerm of splitFormulaTerms(formula)) {
     const match = rawTerm.match(TARGET_CONDITION_DETECT_REGEX);
 
     if (!match) {
@@ -314,6 +856,23 @@ export function applyTargetConditionals(
   return kept.join(' + ').trim();
 }
 
+/** Чья сторона в пометке слагаемого по состоянию */
+const STATUS_SIDE_LABELS: Record<'self' | 'target', string> = {
+  self: 'атакующий',
+  target: 'цель',
+};
+
+/**
+ * Название состояния для показа: из справочника (канон и состояния мира);
+ * незнакомый ключ — как есть, чтобы опечатка была видна.
+ *
+ * @param status - ключ состояния
+ * @returns название на русском
+ */
+export function readDamageStatusName(status: string): string {
+  return getConditionEntry(status)?.nameRu ?? status;
+}
+
 /**
  * Формирует ОТОБРАЖЕНИЕ формулы с условными ветками `@target` в виде
  * «ветка_полного ИЛИ ветка_раненого + общие_слагаемые».
@@ -330,25 +889,145 @@ export function applyTargetConditionals(
  * `"1к8@dmg.psychic@target.full + 1к12@dmg.lightning@target.notFull + @mod.spell"`
  * → `"1к8 или 1к12 + @mod.spell"`.
  *
+ * Условие на числе в конце блока относится ко всему блоку, как и при броске:
+ * `1к6+1@dmg.cold@target.status.prone` → «1к6 + 1 (цель: Лежащий ничком)».
+ *
  * @param formula - формула части (возможно с токенами @target)
  * @param resolveTerm - резолвер набора слагаемых в отображаемую строку
+ * @param hasOwnType - у части свой тип (ведущие слагаемые берут его, см.
+ *   `spreadKindTokens`)
  * @returns строка для отображения
  */
 export function formatConditionalDamageDisplay(
   formula: string,
   resolveTerm: (subFormula: string) => string,
+  hasOwnType = false,
 ): string {
-  if (!formula || !/@target\./i.test(formula)) {
-    return resolveTerm(stripTargetTokens(formula ?? ''));
+  const { base, conditional } = splitConditionalDamageDisplay(
+    formula,
+    resolveTerm,
+    hasOwnType,
+  );
+
+  return [base, ...conditional].filter((piece) => piece.length > 0).join(' + ');
+}
+
+/** Показ формулы, разложенный на постоянное и на добавки по условию */
+export interface ConditionalDamageDisplay {
+  /**
+   * То, что бросается всегда: ветки `@target.full` через «или» и общие
+   * слагаемые. Пусто — вся формула под условием
+   */
+  base: string;
+  /**
+   * Добавки по условию, каждая со своей пометкой: «1к8 (атакующий:
+   * Окровавленный)», «2к6 (цель: Исчадие)»
+   */
+  conditional: string[];
+}
+
+/** Условие слагаемого для показа: ключ группы и пометка «чьё и какое» */
+interface TermDisplayCondition {
+  /** Слагаемые с одним ключом идут под одной пометкой */
+  key: string;
+  /** Пометка: «цель: Лежащий ничком», «цель: Исчадие» */
+  label: string;
+}
+
+/**
+ * Условие, под которым слагаемое достаётся не всем: состояние стороны
+ * (`@target.status.*`, `@self.status.*`) либо тип цели (`@target.type.*`).
+ * Ветки `@target.full`/`@target.notFull` сюда не входят: из них одна бросается
+ * всегда, это не добавка, а «или».
+ *
+ * @param term - слагаемое формулы
+ * @returns условие либо `null`, если слагаемое безусловное
+ */
+function readTermDisplayCondition(term: string): TermDisplayCondition | null {
+  const status = readStatusToken(term);
+
+  if (status) {
+    return {
+      key: `status:${status.side}:${status.status}`,
+      label: `${STATUS_SIDE_LABELS[status.side]}: ${readDamageStatusName(status.status)}`,
+    };
   }
+
+  const targetType = parseTargetTypeToken(term);
+
+  return targetType
+    ? {
+        key: `type:${targetType}`,
+        label: `${STATUS_SIDE_LABELS.target}: ${CREATURE_TYPE_LABELS[targetType]}`,
+      }
+    : null;
+}
+
+/**
+ * Раскладывает показ формулы на постоянную часть и добавки по условию —
+ * состоянию стороны или типу цели. Плитке строки листа нужна только постоянная
+ * часть: добавок может быть сколько угодно, и в плитку они не помещаются — их
+ * место в подсказке. Склеенный показ даёт {@link formatConditionalDamageDisplay}.
+ *
+ * @param formula - формула части (возможно с токенами @target)
+ * @param resolveTerm - резолвер набора слагаемых в отображаемую строку
+ * @param hasOwnType - у части свой тип (ведущие слагаемые берут его, см.
+ *   `spreadKindTokens`)
+ * @returns постоянная часть и добавки по условию
+ */
+export function splitConditionalDamageDisplay(
+  formula: string,
+  resolveTerm: (subFormula: string) => string,
+  hasOwnType = false,
+): ConditionalDamageDisplay {
+  if (!formula || !/@(?:target|self)\./i.test(formula)) {
+    return {
+      base: resolveTerm(stripTargetTokens(formula ?? '')),
+      conditional: [],
+    };
+  }
+
+  // Блоки раскладываются так же, как при броске, — иначе подпись условия
+  // досталась бы одному числу в конце блока, а кость показалась безусловной
+  const typedFormula = spreadKindTokens(formula, hasOwnType);
 
   const fullTerms: string[] = [];
   const notFullTerms: string[] = [];
   const commonTerms: string[] = [];
 
-  for (const rawTerm of formula.split('+')) {
+  // Слагаемые по условию — отдельно от остальных, с пометкой «чьё и какое»:
+  // «2к6 (цель: Лежащий ничком)», «2к6 (цель: Исчадие)». Слагаемые одного
+  // условия идут под одной пометкой — блок `1к6+1` показывается целиком
+  const statusTerms = new Map<string, { label: string; terms: string[] }>();
+
+  for (const rawTerm of splitFormulaTerms(typedFormula)) {
     const match = rawTerm.match(TARGET_CONDITION_DETECT_REGEX);
-    const cleaned = rawTerm.replace(TARGET_CONDITION_STRIP_REGEX, '').trim();
+    const condition = readTermDisplayCondition(rawTerm);
+
+    if (condition) {
+      const conditionTerm = resolveTerm(stripTargetTokens(rawTerm)).trim();
+
+      if (conditionTerm.length > 0) {
+        const group = statusTerms.get(condition.key) ?? {
+          label: condition.label,
+          terms: [],
+        };
+
+        statusTerms.set(condition.key, {
+          ...group,
+          terms: [...group.terms, conditionTerm],
+        });
+      }
+
+      continue;
+    }
+
+    // Сюда доходит только токен типа с незнакомым типом (опечатка): условием
+    // он не стал, но и сырым его пользователю показывать нельзя.
+    const cleaned = rawTerm
+      .replace(TARGET_CONDITION_STRIP_REGEX, '')
+      .replace(TARGET_TYPE_STRIP_REGEX, '')
+      .trim();
 
     if (cleaned.length === 0) {
       continue;
@@ -377,11 +1056,18 @@ export function formatConditionalDamageDisplay(
   const commonStr =
     commonTerms.length > 0 ? resolveTerm(commonTerms.join(' + ')).trim() : '';
 
-  if (commonStr) {
-    return branch ? `${branch} + ${commonStr}` : commonStr;
-  }
+  // Блок из нескольких слагаемых — в скобках: без них «1к6 + 1 + 1к6 + 1
+  // (цель: …)» не отличить от условия на одном числе
+  const statusStrs = [...statusTerms.values()].map(({ label, terms }) =>
+    terms.length > 1
+      ? `(${terms.join(' + ')}) (${label})`
+      : `${terms[0]} (${label})`,
+  );
 
-  return branch;
+  return {
+    base: [branch, commonStr].filter((piece) => piece.length > 0).join(' + '),
+    conditional: statusStrs,
+  };
 }
 
 /**
@@ -390,7 +1076,7 @@ export function formatConditionalDamageDisplay(
  * Подставляет числовые значения вместо `@mod.str`, `@mod.spell`, `@prof` и т.д.,
  * оставляя кубиковую нотацию (`1к4`) нетронутой — результат готов для роллера.
  * Токен `@mod.spell` разрешается в модификатор заклинательной характеристики
- * (с учётом возможного переопределения через `spell.attackAbility`).
+ * (с учётом характеристики самого заклинания — см. {@link resolveSpellcastingAbility}).
  *
  * Используется во всех точках броска урона заклинанием (хотбар, лист персонажа),
  * чтобы поведение `@`-переменных было единым.
@@ -400,7 +1086,7 @@ export function formatConditionalDamageDisplay(
  * используется базовое значение характеристики (legacy-поведение).
  *
  * @param spell - заклинание
- * @param actor - актор-заклинатель
+ * @param actor - лист-заклинатель: актёр или существо
  * @param baseFormula - формула для подстановки (по умолчанию — первая часть
  *   из `getSpellDamageParts`)
  * @param resolvedStats - итоговые статы из пайплайна (для бонусов от эффектов)
@@ -408,10 +1094,11 @@ export function formatConditionalDamageDisplay(
  */
 export function resolveSpellDamageFormula(
   spell: Spell,
-  actor: DnDActor,
+  actor: DnDSceneEntity,
   baseFormula?: string,
   resolvedStats?: ResolvedActorStats,
   targetIsFull?: boolean,
+  targetType?: CreatureCategory,
 ): string {
   // Инлайн-токены типа урона @dmg.<type> и лечения @heal/@heal.temp — это
   // метки, НЕ переменные роллера. Снимаем их до подстановки, иначе
@@ -424,83 +1111,54 @@ export function resolveSpellDamageFormula(
     ),
   );
 
-  // Условные слагаемые по состоянию цели (@target.full/@target.notFull):
-  // при известном состоянии цели (каст) — гасим неактивные слагаемые целиком;
-  // без контекста цели (отображение) — просто снимаем токены, показывая
-  // базовые кости. После этого @target в формуле не остаётся.
+  // Условные слагаемые по цели (`@target.full`/`@target.notFull` и
+  // `@target.type.<тип>`): при известной цели (каст) — гасим неактивные
+  // слагаемые целиком; без контекста цели (отображение) — просто снимаем
+  // токены, показывая базовые кости.
+  //
+  // После этого `@target` в формуле не остаётся НИ В ОДНОЙ ветке — это условие,
+  // а не переменная: доживи токен до подстановки, он превратился бы в число
+  // прямо посреди формулы («2к6@target.type.undead» → «2к61»).
+  // Состояния бросающего известны всегда — это сам заклинатель
+  formula = applyStatusConditionals(formula, 'self', (status) =>
+    entityHasDamageStatus(actor, status),
+  );
+
   if (formula.includes('@target')) {
+    // Состояния цели одиночный путь не сверяет: формулу с ними ведёт
+    // многочастный путь (`damagePartNeedsOwnResolution`), а сюда она доходит
+    // лишь снарядами и показом — тогда слагаемое «при состоянии» не бросается
     formula =
       targetIsFull === undefined
         ? stripTargetTokens(formula)
-        : applyTargetConditionals(formula, targetIsFull);
+        : applyTargetTypeConditionals(
+            applyTargetConditionals(
+              applyStatusConditionals(formula, 'target', () => false),
+              targetIsFull,
+            ),
+            targetType,
+          );
   }
 
   if (!formula || !formula.includes('@')) {
     return formula;
   }
 
-  const context = buildFormulaContext(actor);
+  // Итоговые числа листа — переданные готовыми или посчитанные здесь: и
+  // @mod.<характеристика>, и @<характеристика>, и @prof читают то, что
+  // показывает лист. Без готовых чисел раньше брались сырые значения записи
+  const context = buildResolvedFormulaContext(
+    actor,
+    resolvedStats ? { stats: resolvedStats } : {},
+  );
+
   const spellAbility = resolveSpellcastingAbility(actor, spell);
 
-  // С resolvedStats модификаторы учитывают внешние бонусы (Active Effects),
-  // поэтому переопределяем как @mod.spell, так и @mod.<характеристика>.
-  if (resolvedStats) {
-    const abilities: AbilityType[] = [
-      'strength',
-      'dexterity',
-      'constitution',
-      'intelligence',
-      'wisdom',
-      'charisma',
-    ];
-
-    for (const ability of abilities) {
-      const mod = resolvedStats.abilityMods[ability];
-
-      if (mod !== undefined) {
-        context.abilities[ability] = {
-          value:
-            resolvedStats.abilities[ability]
-            ?? context.abilities[ability].value,
-          mod,
-        };
-      }
-    }
-
-    context.spellMod =
-      resolvedStats.abilityMods[spellAbility]
-      ?? calculateAbilityModifier(
-        actor.system?.abilities?.[spellAbility] ?? 10,
-      );
-  } else {
-    context.spellMod = calculateAbilityModifier(
-      actor.system?.abilities?.[spellAbility] ?? 10,
-    );
-  }
-
-  return substituteFormulaVariables(formula, context);
+  return substituteFormulaVariables(formula, {
+    ...context,
+    spellMod: context.abilities[spellAbility]?.mod ?? 0,
+  });
 }
-
-// ── Инлайн-токены типа урона (@dmg.<type>) и лечения (@heal) ─
-
-/** Регэксп инлайн-токена типа урона: `@dmg.fire`, `@dmg.cold` и т.п. */
-const DAMAGE_TYPE_TOKEN_REGEX = /@dmg\.([a-z]+)/i;
-
-/**
- * Вид лечения сегмента формулы: обычные хиты (`@heal`) или временные ХП
- * (`@heal.temp`). Временные ХП не суммируются с текущими — берётся большее.
- */
-export type HealKind = 'hp' | 'temp';
-
-/**
- * Регэксп инлайн-токена лечения: `@heal` (хиты) или `@heal.temp` (врем. ХП).
- * Лукэхед запрещает хвост (`@heal.spell` НЕ матчится и всплывёт ошибкой
- * парсера формул, а не молча станет лечением).
- */
-const HEAL_TOKEN_REGEX = /@heal(\.temp)?(?![\w.])/i;
-
-/** Глобальная версия {@link HEAL_TOKEN_REGEX} для вырезания токенов. */
-const HEAL_TOKEN_STRIP_REGEX = /@heal(\.temp)?(?![\w.])/gi;
 
 /** Сегмент формулы урона с привязанным типом (после разбора @dmg.<type>). */
 export interface TypedDamageSegment {
@@ -516,43 +1174,12 @@ export interface TypedDamageSegment {
   types?: string[];
   /** Вид лечения сегмента (`@heal`/`@heal.temp`); undefined — сегмент урона */
   healing?: HealKind;
-}
-
-/**
- * Удаляет инлайн-токены лечения `@heal`/`@heal.temp` из формулы
- * (для отображения и legacy-путей, где формула идёт в роллер целиком).
- *
- * @param formula - формула с возможными токенами @heal
- * @returns формула без токенов @heal (лишние пробелы схлопнуты)
- */
-export function stripHealTokens(formula: string): string {
-  if (!formula || !HEAL_TOKEN_REGEX.test(formula)) {
-    return formula ?? '';
-  }
-
-  return formula
-    .replace(HEAL_TOKEN_STRIP_REGEX, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-/**
- * Определяет вид лечения из первого инлайн-токена `@heal`/`@heal.temp`.
- *
- * Формула — единственный источник истины вида части (legacy-флаг
- * `DamagePart.isHealing` удалён).
- *
- * @param formula - формула с возможным токеном @heal
- * @returns вид лечения или null, если токена нет
- */
-export function detectFormulaHealKind(formula: string): HealKind | null {
-  const match = formula.match(HEAL_TOKEN_REGEX);
-
-  if (!match) {
-    return null;
-  }
-
-  return match[1] ? 'temp' : 'hp';
+  /**
+   * Тип урона на выбор (`@dmg.choice(…)`/`@dmg.random(…)`): тип сегмента —
+   * служебный `choice`, настоящий решается перед броском
+   * (`settleDamageTypeChoices`).
+   */
+  typeChoice?: DamageTypeChoice;
 }
 
 /**
@@ -562,7 +1189,7 @@ export function detectFormulaHealKind(formula: string): HealKind | null {
  * @returns true если часть лечит (хиты или временные ХП)
  */
 export function damagePartIsHealing(part: DamagePart): boolean {
-  return HEAL_TOKEN_REGEX.test(part.formula);
+  return hasHealToken(part.formula);
 }
 
 /**
@@ -632,98 +1259,12 @@ export function getSpellPrimaryDamageType(
     return undefined;
   }
 
-  return (primaryPart.type
-    ?? detectFormulaDamageType(primaryPart.formula)
-    ?? undefined) as DamageType | undefined;
-}
+  // Тип части и тип из формулы — обычные строки записи мира; неизвестный
+  // системе тип к урону не применяется, и защиты по нему не ищутся
+  const rawType =
+    primaryPart.type ?? detectFormulaDamageType(primaryPart.formula);
 
-/**
- * Устанавливает/заменяет токен `@heal`/`@heal.temp` на ПЕРВОМ слагаемом формулы
- * (аналог {@link setFormulaDamageType}): первое слагаемое — «базовое», его вид
- * наследуют последующие слагаемые без собственного токена.
- *
- * Используется миграцией формы: устаревший флаг `isHealing` переносится в
- * формулу. Пустой `kind` — удаляет токен с первого слагаемого.
- *
- * @param formula - исходная формула
- * @param kind - вид лечения (или пустая строка для удаления)
- * @returns формула с обновлённым токеном лечения на первом слагаемом
- */
-export function setFormulaHealKind(
-  formula: string,
-  kind: HealKind | '',
-): string {
-  const terms = formula.split('+').map((term) => term.trim());
-
-  const firstBase = (terms[0] ?? '').replace(HEAL_TOKEN_STRIP_REGEX, '').trim();
-
-  if (kind) {
-    const token = kind === 'temp' ? '@heal.temp' : '@heal';
-
-    terms[0] = `${firstBase}${token}`;
-  } else {
-    terms[0] = firstBase;
-  }
-
-  return terms.filter((term) => term.length > 0).join(' + ');
-}
-
-/**
- * Удаляет инлайн-токены типа урона `@dmg.<type>` из формулы (для отображения).
- *
- * @param formula - формула с возможными токенами @dmg
- * @returns формула без токенов @dmg (лишние пробелы схлопнуты)
- */
-export function stripDamageTypeTokens(formula: string): string {
-  if (!formula || !/@dmg\./i.test(formula)) {
-    return formula ?? '';
-  }
-
-  return formula
-    .replace(/@dmg\.[a-z]+/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-/**
- * Определяет тип урона из первого инлайн-токена `@dmg.<type>` в формуле.
- *
- * Используется как канонический источник типа части (формула — источник истины).
- *
- * @param formula - формула с возможным токеном @dmg
- * @returns тип урона (lowercase) или null, если токена нет
- */
-export function detectFormulaDamageType(formula: string): string | null {
-  const match = formula.match(DAMAGE_TYPE_TOKEN_REGEX);
-
-  return match ? match[1].toLowerCase() : null;
-}
-
-/**
- * Устанавливает/заменяет токен `@dmg.<type>` на ПЕРВОМ слагаемом формулы.
- *
- * Первое слагаемое — «базовое»; его тип задаёт тип всех последующих слагаемых
- * без собственного токена (см. поток типов в `splitFormulaByDamageType`).
- * Пустой `type` — удаляет токен с первого слагаемого.
- *
- * Примеры: `setFormulaDamageType("1к8", "fire")` → `"1к8@dmg.fire"`;
- * `setFormulaDamageType("1к8@dmg.fire + @mod.spell", "cold")`
- * → `"1к8@dmg.cold + @mod.spell"`.
- *
- * @param formula - исходная формула
- * @param type - тип урона (или пустая строка для удаления)
- * @returns формула с обновлённым токеном типа на первом слагаемом
- */
-export function setFormulaDamageType(formula: string, type: string): string {
-  const terms = formula.split('+').map((term) => term.trim());
-
-  const firstBase = (terms[0] ?? '')
-    .replace(DAMAGE_TYPE_TOKEN_REGEX, '')
-    .trim();
-
-  terms[0] = type ? `${firstBase}@dmg.${type}` : firstBase;
-
-  return terms.filter((term) => term.length > 0).join(' + ');
+  return rawType && isDamageType(rawType) ? rawType : undefined;
 }
 
 /**
@@ -733,7 +1274,11 @@ export function setFormulaDamageType(formula: string, type: string): string {
  * Слагаемые верхнего уровня (разделённые `+`) группируются по виду с ПОТОКОМ
  * вида слева направо: токен `@dmg.cold` (или `@heal`) задаёт «текущий вид» для
  * своего слагаемого и всех последующих слагаемых без собственного токена.
- * Стартовое значение — `defaultType`. Токены вида взаимоисключающие: `@heal`
+ * Стартовое значение — `defaultType`; без него ведущие слагаемые до первого
+ * токена берут вид этого токена (`3к6+3@dmg.force` → сила целиком). Токен на
+ * числе закрывает свой блок: кость перед ним берёт его вид, даже если левее
+ * был другой (`1к8+3@dmg.piercing + 2к6+1@dmg.poison` — 2к6 ядом, см.
+ * `spreadKindTokens`). Токены вида взаимоисключающие: `@heal`
  * сбрасывает тип урона (сегмент лечения не типизирован), `@dmg` — лечение.
  * Токен вырезается из формулы (роллер его не видит), гейты `@target.*` и
  * вычитания остаются внутри слагаемого.
@@ -743,6 +1288,9 @@ export function setFormulaDamageType(formula: string, type: string): string {
  * - `"1к8@dmg.fire + @mod.spell"` → `[{"1к8 + @mod.spell", fire}]`
  * - `"2к4@heal + @mod.spell"` → `[{"2к4 + @mod.spell", heal:hp}]`
  * - `"1к8@dmg.fire + 2к4@heal.temp"` → `[{1к8, fire}, {2к4, heal:temp}]`
+ *
+ * Без defaultType: `"3к6+3@dmg.force"` → `[{"3к6 + 3", force}]`,
+ * `"1к8+3@dmg.piercing + 2к6+1@dmg.poison"` → `[{"1к8 + 3", piercing}, {"2к6 + 1", poison}]`.
  *
  * Если токенов нет — возвращается один сегмент с исходной формулой
  * (нулевое изменение для обычных формул).
@@ -755,12 +1303,13 @@ export function splitFormulaByDamageType(
   formula: string,
   defaultType?: string,
 ): TypedDamageSegment[] {
-  if (
-    !formula
-    || (!/@dmg\./i.test(formula) && !HEAL_TOKEN_REGEX.test(formula))
-  ) {
+  if (!formula || (!hasDamageTypeToken(formula) && !hasHealToken(formula))) {
     return [{ formula: formula ?? '', type: defaultType }];
   }
+
+  // Без типа части ведущие слагаемые берут вид первого токена формулы
+  // (`3к6+3@dmg.force` — сила целиком), а не остаются безтиповыми
+  const typedFormula = spreadKindTokens(formula, Boolean(defaultType));
 
   /** Ключ-маркер для слагаемых без явного вида (базовый тип/лечение части). */
   const DEFAULT_KEY = ' default';
@@ -769,6 +1318,7 @@ export function splitFormulaByDamageType(
     type?: string;
     types?: string[];
     healing?: HealKind;
+    typeChoice?: DamageTypeChoice;
     terms: string[];
   }
 
@@ -781,31 +1331,44 @@ export function splitFormulaByDamageType(
   // Слагаемое может нести НЕСКОЛЬКО токенов @dmg → несколько типов сразу.
   let currentTypes: string[] = defaultType ? [defaultType] : [];
   let currentHealing: HealKind | undefined;
+  // Тип на выбор — отдельный вид слагаемого: один тип из списка, а не все
+  // сразу. Рядом с ним простые `@dmg.<тип>` того же слагаемого не читаются
+  let currentChoice: DamageTypeChoice | undefined;
 
-  for (const term of formula.split('+')) {
-    const healMatch = term.match(HEAL_TOKEN_REGEX);
-    const typeMatches = [...term.matchAll(/@dmg\.([a-z]+)/gi)];
+  for (const term of splitFormulaTerms(typedFormula)) {
+    const healKind = detectFormulaHealKind(term);
+    const typeChoice = readDamageTypeChoiceToken(term);
+    const typeMatches = [...term.matchAll(DAMAGE_TYPE_TOKEN_GLOBAL_REGEX)];
 
-    if (healMatch) {
-      currentHealing = healMatch[1] ? 'temp' : 'hp';
+    if (healKind) {
+      currentHealing = healKind;
       currentTypes = [];
+      currentChoice = undefined;
+    } else if (typeChoice) {
+      currentChoice = typeChoice;
+      currentTypes = [CHOICE_DAMAGE_TYPE];
+      currentHealing = undefined;
     } else if (typeMatches.length > 0) {
       currentTypes = typeMatches.map((match) => match[1].toLowerCase());
       currentHealing = undefined;
+      currentChoice = undefined;
     }
 
-    const cleaned = term
-      .replace(HEAL_TOKEN_STRIP_REGEX, '')
-      .replace(/@dmg\.[a-z]+/gi, '')
-      .trim();
+    // Слагаемое без токенов общие функции возвращают как есть (без trim),
+    // поэтому обрезка нужна и здесь.
+    const cleaned = stripDamageTypeTokens(stripHealTokens(term)).trim();
 
     if (cleaned.length === 0) {
       continue;
     }
 
+    const choiceKey = currentChoice
+      ? `choice:${damageTypeChoiceKey(currentChoice)}`
+      : undefined;
+
     const key = currentHealing
       ? `heal:${currentHealing}`
-      : currentTypes.join('+') || DEFAULT_KEY;
+      : (choiceKey ?? (currentTypes.join('+') || DEFAULT_KEY));
 
     let group = groupByKey.get(key);
 
@@ -814,6 +1377,7 @@ export function splitFormulaByDamageType(
         type: currentTypes[0],
         types: currentTypes.length > 1 ? [...currentTypes] : undefined,
         healing: currentHealing,
+        typeChoice: currentChoice,
         terms: [],
       };
 
@@ -829,6 +1393,7 @@ export function splitFormulaByDamageType(
     type: group.type,
     types: group.types,
     healing: group.healing,
+    ...(group.typeChoice ? { typeChoice: group.typeChoice } : {}),
   }));
 }
 
@@ -840,12 +1405,27 @@ export interface DamagePartInfo {
    * @-переменные НЕ подставляются (это «определение», не каст).
    */
   formula: string;
+  /**
+   * То же без добавок по состоянию стороны — то, что бросается всегда. Пусто,
+   * если вся часть под условием
+   */
+  baseFormula: string;
+  /**
+   * Добавки по состоянию стороны с пометкой: «1к8 (атакующий: Окровавленный)».
+   * В `formula` они тоже есть — здесь отдельно, для подсказки
+   */
+  conditionalFormulas: string[];
   /** Является ли часть лечением */
   isHealing: boolean;
   /** Лечение временными ХП (`@heal.temp`) */
   isTemp: boolean;
   /** Уникальные типы урона части (ключи; пусто для чистого лечения) */
   types: string[];
+  /**
+   * Типы урона на выбор (`@dmg.choice(…)`) — по одному на токен, без
+   * повторов. В `types` их нет: это не «урон всеми типами», а один из них.
+   */
+  typeChoices: DamageTypeChoice[];
 }
 
 /**
@@ -860,18 +1440,130 @@ export interface DamagePartInfo {
 export function describeDamagePart(part: DamagePart): DamagePartInfo {
   const segments = splitFormulaByDamageType(part.formula, part.type);
 
-  const typeList = segments.flatMap(
-    (segment) => segment.types ?? (segment.type ? [segment.type] : []),
+  const typeList = segments.flatMap((segment) => {
+    if (segment.typeChoice) {
+      return [];
+    }
+
+    return segment.types ?? (segment.type ? [segment.type] : []);
+  });
+
+  const typeChoices = uniqueDamageTypeChoices(
+    segments.flatMap((segment) =>
+      segment.typeChoice ? [segment.typeChoice] : [],
+    ),
+  );
+
+  const display = splitConditionalDamageDisplay(
+    part.formula,
+    (subFormula) => stripHealTokens(stripDamageTypeTokens(subFormula)),
+    Boolean(part.type),
+  );
+
+  const baseFormula = formatDiceLetters(display.base);
+
+  const conditionalFormulas = display.conditional.map((piece) =>
+    formatDiceLetters(piece),
   );
 
   return {
-    formula: formatConditionalDamageDisplay(part.formula, (subFormula) =>
-      stripHealTokens(stripDamageTypeTokens(subFormula)),
-    ).replace(/(\d+)d(\d+)/gi, '$1к$2'),
+    formula: [baseFormula, ...conditionalFormulas]
+      .filter((piece) => piece.length > 0)
+      .join(' + '),
+    baseFormula,
+    conditionalFormulas,
     isHealing: segments.some((segment) => segment.healing !== undefined),
     isTemp: segments.some((segment) => segment.healing === 'temp'),
     types: [...new Set(typeList)],
+    typeChoices,
   };
+}
+
+/** Показ набора урона: целиком и разложенный для плитки строки листа */
+export interface DamageSetDisplay {
+  /** Весь набор одной строкой, с добавками по условию; пусто — урона нет */
+  formula: string;
+  /**
+   * То, что бросается всегда, — для плитки. У набора целиком под условием
+   * постоянной части нет, и тут пусто: плитка ставит короткую заглушку, а
+   * добавки — как всегда, в подсказке
+   */
+  baseFormula: string;
+  /** Добавки по условию: «1к8 (атакующий: Окровавленный)» — для подсказки */
+  conditionalFormulas: string[];
+}
+
+/** Показ одной части: постоянное и добавки по условию */
+export type DamagePartDisplay = Pick<
+  DamagePartInfo,
+  'baseFormula' | 'conditionalFormulas'
+>;
+
+/**
+ * Склеивает показ частей в показ набора. Плитка строки листа — оружия,
+ * заклинания, действия существа — показывает только постоянный урон: добавок по
+ * условию может быть сколько угодно, их место в подсказке. У набора целиком
+ * под условием («2к10 по исчадиям + 2к10 по нежити» у оружия без своей основы)
+ * постоянной части нет: полный текст добавок раздувал бы плитку и выдавливал
+ * название из строки, поэтому она пуста — показ ставит заглушку.
+ *
+ * @param parts - показ частей по порядку
+ * @returns показ набора
+ */
+export function combineDamagePartDisplays(
+  parts: readonly DamagePartDisplay[],
+): DamageSetDisplay {
+  const formula = parts
+    .flatMap((part) => [part.baseFormula, ...part.conditionalFormulas])
+    .filter((piece) => piece.length > 0)
+    .join(' + ');
+
+  const baseFormula = parts
+    .map((part) => part.baseFormula)
+    .filter((piece) => piece.length > 0)
+    .join(' + ');
+
+  return {
+    formula,
+    baseFormula,
+    conditionalFormulas: parts.flatMap((part) => part.conditionalFormulas),
+  };
+}
+
+/**
+ * Показ урона оружия для плитки строки листа: постоянный урон и добавки по
+ * условию отдельно. Хват двумя руками и замены от эффектов учитываются — через
+ * `getWeaponDamageParts`.
+ *
+ * @param weapon - оружие
+ * @param resolvedStats - итоговые статы владельца (для замен от эффектов)
+ * @returns показ урона оружия
+ */
+export function describeWeaponDamageDisplay(
+  weapon: DnDGameItem,
+  resolvedStats?: ResolvedActorStats,
+): DamageSetDisplay {
+  return combineDamagePartDisplays(
+    getWeaponDamageParts(weapon, resolvedStats).map((part) =>
+      describeDamagePart(part),
+    ),
+  );
+}
+
+/**
+ * Основной тип урона набора частей (действия или заклинания существа):
+ * первый тип первой части. По нему выбирается цвет шаблона области и
+ * подпись броска.
+ *
+ * @param parts - части урона/лечения (могут отсутствовать)
+ * @returns ключ типа урона или undefined, если частей нет или первая — чистое лечение
+ */
+export function getDamagePartsPrimaryType(
+  parts: readonly DamagePart[] | undefined,
+): string | undefined {
+  const firstPart = parts?.[0];
+
+  return firstPart ? describeDamagePart(firstPart).types[0] : undefined;
 }
 
 /**
@@ -896,6 +1588,40 @@ export interface BonusDamageFormula {
    * гейт — оркестратор проверит HP каждой цели в момент применения.
    */
   conditionGate?: TargetHpGate;
+  /**
+   * Отложенное условие `target.creatureType`: на касте единой цели нет,
+   * поэтому условие change превращено в per-target гейт по типу — оркестратор
+   * проверит тип каждой цели в момент применения. Симметрично
+   * {@link conditionGate}.
+   */
+  conditionTypeGate?: CreatureCategory;
+}
+
+/**
+ * Сводит отложенное условие по типу цели и типовую ветку токенов.
+ *
+ * Два разных типа означают, что часть не применится ни к одной цели — ветка
+ * отбрасывается (`null`). Совпадающие или одиночный — берётся он.
+ *
+ * @param conditionTypeGate - тип из отложенного условия change
+ * @param branchTypeGate - тип ветки токенов `@target.type.*`
+ * @returns итоговый тип (возможно undefined) или null (отбросить ветку)
+ */
+function combineTargetTypeGates(
+  conditionTypeGate: CreatureCategory | undefined,
+  branchTypeGate: CreatureCategory | undefined,
+): { typeGate: CreatureCategory | undefined } | null {
+  if (!conditionTypeGate) {
+    return { typeGate: branchTypeGate };
+  }
+
+  if (!branchTypeGate) {
+    return { typeGate: conditionTypeGate };
+  }
+
+  return conditionTypeGate === branchTypeGate
+    ? { typeGate: conditionTypeGate }
+    : null;
 }
 
 /**
@@ -940,6 +1666,11 @@ export interface ResolvedDamagePartInput {
   type?: string;
   /** Все типы урона части, если их несколько (напр. рубящий+огонь) */
   types?: string[];
+  /**
+   * Тип урона на выбор (`@dmg.choice(…)`): `type` — служебный `choice`, а
+   * настоящий тип выбирается перед броском (`settleDamageTypeChoices`)
+   */
+  typeChoice?: DamageTypeChoice;
   /** Является ли часть лечением */
   isHealing: boolean;
   /**
@@ -960,9 +1691,31 @@ export interface ResolvedDamagePartInput {
    */
   targetGate?: TargetHpGate;
   /**
+   * Гейт по типу существа цели: часть применяется только к целям этого типа.
+   * Появляется, когда тип цели на касте неизвестен (AoE / цель не выбрана) и
+   * формула содержит `@target.type.*` — оркестратор проверяет тип каждой цели.
+   */
+  targetTypeGate?: CreatureCategory;
+  /**
+   * Гейт по состоянию цели (`@target.status.<ключ>`): часть применяется только
+   * к целям с этим состоянием. Сверяется при нанесении урона — и у единой
+   * цели тоже: её состояние на момент удара надёжнее, чем при броске.
+   */
+  targetStatusGate?: string;
+  /**
+   * Состояние атакующего, при котором часть применяется. Ставит только итог
+   * формулы в редакторе ({@link ExpandDamagePartsOptions.selfBranches}): бросок
+   * состояния атакующего знает и лишние слагаемые гасит до броска.
+   */
+  selfStatusGate?: string;
+  /**
    * Часть получает усиление высших кругов (слот-скейлинг) в модалке броска.
    * Помечается первый сегмент КАЖДОЙ гейт-ветки первой урон-части: к цели
-   * применяется только одна из веток, поэтому двойного усиления нет.
+   * применяется только одна из веток по хитам, поэтому двойного усиления нет.
+   *
+   * Типовые ветки внутри одной ветки по хитам НЕ взаимоисключающие (безусловное
+   * слагаемое достаётся всем, типовое ложится сверху), поэтому усиление внутри
+   * ветки по хитам получает только ПЕРВАЯ типовая ветка.
    */
   applySlotScaling: boolean;
 }
@@ -989,14 +1742,16 @@ export interface ResolvedDamagePartInput {
  * @param resolvedStats - итоговые статы (для @mod.* с учётом эффектов)
  * @param targetIsFull - состояние HP цели для @target.* (одиночная цель);
  *   undefined — состояние неизвестно, ветки раскладываются per-target
+ * @param targetType - тип существа цели для `@target.type.*` (одиночная цель)
  * @returns массив разрешённых частей (по сегментам)
  */
 export function resolveDamagePartsForCast(
   spell: Spell,
-  actor: DnDActor,
+  actor: DnDSceneEntity,
   parts: DamagePart[],
   resolvedStats?: ResolvedActorStats,
   targetIsFull?: boolean,
+  targetType?: CreatureCategory,
 ): ResolvedDamagePartInput[] {
   return expandDamageParts(
     parts,
@@ -1008,9 +1763,77 @@ export function resolveDamagePartsForCast(
         formula,
         resolvedStats,
         targetIsFull,
+        targetType,
       ),
-    { assignScaling: true },
+    {
+      assignScaling: true,
+      targetType,
+      selfHasStatus: (status) => entityHasDamageStatus(actor, status),
+    },
   );
+}
+
+/**
+ * Вливает плоский бонус урона в первую урон-часть.
+ *
+ * Плоские бонусы эффектов (`damage.spell`, `damage.melee`, `damage.ranged`)
+ * прибавляются один раз ко всему броску, а не к каждой части: иначе «+2 к урону
+ * заклинаниями» удваивался бы у заклинания с двумя типами урона. Лечащие части
+ * бонус не получают — он про урон.
+ *
+ * @param parts - разрешённые части урона
+ * @param flatBonus - плоский бонус урона (0 — вернуть части как есть)
+ * @returns части с бонусом в первой урон-части
+ */
+export function withFlatDamageBonus<
+  PartType extends { formula: string; isHealing?: boolean },
+>(parts: PartType[], flatBonus: number): PartType[] {
+  if (flatBonus === 0) {
+    return parts;
+  }
+
+  const firstDamageIndex = parts.findIndex((part) => !part.isHealing);
+
+  if (firstDamageIndex === -1) {
+    return parts;
+  }
+
+  const sign = flatBonus > 0 ? '+' : '';
+
+  return parts.map((part, index) =>
+    index === firstDamageIndex
+      ? { ...part, formula: `${part.formula}${sign}${flatBonus}` }
+      : part,
+  );
+}
+
+/**
+ * Вливает плоский бонус урона в ОДИНОЧНУЮ формулу броска.
+ *
+ * Одноформульный путь каста обслуживает и обычное одночастное заклинание, и
+ * СНАРЯДЫ (Волшебная стрела, Мистический заряд). Разница принципиальная: у
+ * снарядов эта формула катается на КАЖДЫЙ снаряд, а по правилам PHB 2024
+ * плоский бонус к урону применяется один раз к броску, а не к каждому снаряду.
+ * Поэтому снарядам бонус сюда не передают — он едет отдельной бонус-частью,
+ * которая катается один раз на каст (см. `buildFlatDamageBonusPart`).
+ *
+ * Лечение бонус не получает: `damage.*` — это про урон.
+ *
+ * @param formula - формула с уже разрешёнными @-переменными
+ * @param flatBonus - плоский бонус урона (0 — вернуть формулу как есть)
+ * @returns формула с бонусом либо исходная
+ */
+export function withFlatFormulaBonus(
+  formula: string,
+  flatBonus: number,
+): string {
+  if (flatBonus === 0 || !formula.trim()) {
+    return formula;
+  }
+
+  const sign = flatBonus > 0 ? '+' : '';
+
+  return `${formula}${sign}${flatBonus}`;
 }
 
 /**
@@ -1027,24 +1850,38 @@ export function resolveDamagePartsForCast(
  * @param parts - части урона/лечения действия существа
  * @param targetIsFull - состояние HP цели для @target.* (undefined — per-target)
  * @param creature - существо-источник (для редких @-переменных в формуле)
+ * @param targetType - тип существа цели для `@target.type.*` (одиночная цель)
  * @returns массив разрешённых частей (по сегментам)
  */
 export function resolveCreatureDamageParts(
   parts: DamagePart[],
   targetIsFull?: boolean,
-  creature?: import('./dndEntities.js').Creature,
+  creature?: import('./dndEntities.js').DnDCreature,
+  targetType?: CreatureCategory,
 ): ResolvedDamagePartInput[] {
-  return expandDamageParts(parts, targetIsFull, (formula) => {
-    if (!formula.includes('@') || !creature) {
-      return formula;
-    }
+  return expandDamageParts(
+    parts,
+    targetIsFull,
+    (formula) => {
+      if (!formula.includes('@') || !creature) {
+        return formula;
+      }
 
-    try {
-      return substituteFormulaVariables(formula, buildFormulaContext(creature));
-    } catch {
-      return formula;
-    }
-  });
+      try {
+        return substituteFormulaVariables(
+          formula,
+          buildResolvedFormulaContext(creature),
+        );
+      } catch {
+        return formula;
+      }
+    },
+    {
+      targetType,
+      selfHasStatus: (status) =>
+        creature ? entityHasDamageStatus(creature, status) : false,
+    },
+  );
 }
 
 /**
@@ -1070,12 +1907,16 @@ export function getCreatureSpellRollButtonText(
  * Если заклинательная характеристика не задана — 0.
  *
  * @param creature - существо
+ * @param abilityOverride - характеристика блока заклинаний; у блока она своя
+ *   («Магия шабаша» от Интеллекта при мудром существе), и без переопределения
+ *   `@mod.spell` считался бы не от той характеристики
  * @returns модификатор `floor((значение - 10) / 2)` или 0
  */
 export function getCreatureSpellMod(
-  creature: import('./dndEntities.js').Creature,
+  creature: import('./dndEntities.js').DnDCreature,
+  abilityOverride?: AbilityType,
 ): number {
-  const ability = creature.system.spellcasting?.ability;
+  const ability = abilityOverride ?? creature.system.spellcasting?.ability;
 
   if (!ability) {
     return 0;
@@ -1087,57 +1928,129 @@ export function getCreatureSpellMod(
 }
 
 /**
- * Эффективная сложность спасброска заклинаний существа.
+ * Числа заклинательства существа: сложность спасброска и бонус атаки.
  *
- * Если значение задано вручную (`spellcasting.saveDC`) — берётся как есть.
- * Иначе, если выбрана заклинательная характеристика, выводится автоматически:
- * `8 + бонус мастерства + модификатор характеристики` (как у актёров). Без
- * ручного значения и без характеристики — `undefined` (показывать нечего).
+ * Правило у обоих одно. Своё число (`saveDC` / `attackBonus`) берётся как есть —
+ * в стат-блоке уже стоит готовое значение, и характеристика с бонусом мастерства
+ * в счёт не идут. Иначе, если выбрана заклинательная характеристика, число
+ * выводится по правилам (`8 + бонус мастерства + модификатор` у сложности спаса,
+ * то же без восьмёрки у атаки), и сверху ложится поправка (`saveDCBonus` /
+ * `attackBonusExtra`) — плащ, посох и прочее. Без своего числа и без
+ * характеристики — `undefined` (показывать нечего).
  *
- * @param creature - существо
- * @returns DC спасброска или undefined
+ * Считается по параметрам, а не по записи существа: окно настройки показывает
+ * теми же числами предпросмотр ещё не сохранённой правки.
+ *
+ * @param spellcasting - параметры заклинательства
+ * @param abilities - значения характеристик существа
+ * @param proficiencyBonus - бонус мастерства существа
+ * @returns сложность спасброска и бонус атаки; поле `undefined` — считать не от чего
  */
-export function getCreatureSpellSaveDC(
-  creature: import('./dndEntities.js').Creature,
-): number | undefined {
-  const block = creature.system.spellcasting;
+export function calculateCreatureSpellcasting(
+  spellcasting: CreatureSpellcasting | undefined,
+  abilities: DnDAbilityScores,
+  proficiencyBonus: number,
+): { saveDC: number | undefined; attackBonus: number | undefined } {
+  const ability = spellcasting?.ability;
 
-  if (block?.saveDC !== undefined) {
-    return block.saveDC;
+  const autoBase =
+    ability === undefined
+      ? undefined
+      : proficiencyBonus + calculateAbilityModifier(abilities[ability] ?? 10);
+
+  /**
+   * Итог одного числа: своё главнее расчёта по правилам.
+   *
+   * @param manual - своё число
+   * @param bonus - поправка к расчёту по правилам
+   * @param base - прибавка правил (8 у сложности спасброска)
+   * @returns итог или undefined
+   */
+  function resolve(
+    manual: number | undefined,
+    bonus: number | undefined,
+    base: number,
+  ): number | undefined {
+    if (manual !== undefined) {
+      return manual;
+    }
+
+    if (autoBase === undefined) {
+      return undefined;
+    }
+
+    return base + autoBase + (bonus ?? 0);
   }
 
-  if (!block?.ability) {
-    return undefined;
-  }
-
-  return 8 + creature.system.proficiencyBonus + getCreatureSpellMod(creature);
+  return {
+    saveDC: resolve(
+      spellcasting?.saveDC,
+      spellcasting?.saveDCBonus,
+      SPELL_SAVE_DC_BASE,
+    ),
+    attackBonus: resolve(
+      spellcasting?.attackBonus,
+      spellcasting?.attackBonusExtra,
+      0,
+    ),
+  };
 }
 
 /**
- * Эффективный бонус к атаке заклинаниями существа.
+ * Числа заклинательства блока: сложность спасброска и бонус атаки.
  *
- * Если значение задано вручную (`spellcasting.attackBonus`) — берётся как есть.
- * Иначе, если выбрана заклинательная характеристика, выводится автоматически:
- * `бонус мастерства + модификатор характеристики`. Без ручного значения и без
- * характеристики — `undefined`.
+ * У блока свои характеристика и числа — «Магия шабаша» карги считается от
+ * Интеллекта со Сл 11, когда у самого существа заклинательство мудрое. Заданное
+ * у блока главнее; чего у блока нет — берётся у существа, иначе блок без своих
+ * чисел показывал бы прочерки там, где статблок даёт числа записи.
  *
  * @param creature - существо
- * @returns бонус к атаке или undefined
+ * @param block - блок заклинаний; без него берутся числа самого существа
+ * @returns сложность спасброска и бонус атаки блока
  */
-export function getCreatureSpellAttackBonus(
-  creature: import('./dndEntities.js').Creature,
-): number | undefined {
-  const block = creature.system.spellcasting;
+export function calculateCreatureSpellBlockNumbers(
+  creature: import('./dndEntities.js').DnDCreature,
+  block: CreatureSpellcastingBlock | undefined,
+): { saveDC: number | undefined; attackBonus: number | undefined } {
+  const creatureNumbers = calculateCreatureSpellcasting(
+    creature.system.spellcasting,
+    creature.system.abilities,
+    getCreatureProficiencyBonus(creature),
+  );
 
-  if (block?.attackBonus !== undefined) {
-    return block.attackBonus;
+  if (!block) {
+    return creatureNumbers;
   }
 
-  if (!block?.ability) {
-    return undefined;
-  }
+  const blockNumbers = calculateCreatureSpellcasting(
+    {
+      ability: block.ability,
+      saveDC: block.saveDC,
+      attackBonus: block.attackBonus,
+    },
+    creature.system.abilities,
+    getCreatureProficiencyBonus(creature),
+  );
 
-  return creature.system.proficiencyBonus + getCreatureSpellMod(creature);
+  return {
+    saveDC: blockNumbers.saveDC ?? creatureNumbers.saveDC,
+    attackBonus: blockNumbers.attackBonus ?? creatureNumbers.attackBonus,
+  };
+}
+
+/**
+ * Заклинательная характеристика, от которой считается каст: своя у блока, иначе
+ * общая у существа.
+ *
+ * @param creature - существо
+ * @param block - блок заклинаний
+ * @returns характеристика либо `undefined`, если её нет нигде
+ */
+export function getCreatureSpellBlockAbility(
+  creature: import('./dndEntities.js').DnDCreature,
+  block: CreatureSpellcastingBlock | undefined,
+): AbilityType | undefined {
+  return block?.ability ?? creature.system.spellcasting?.ability;
 }
 
 /**
@@ -1146,88 +2059,245 @@ export function getCreatureSpellAttackBonus(
  * В отличие от {@link resolveCreatureDamageParts}, токен `@mod.spell`
  * подставляется из модификатора заклинательной характеристики существа —
  * заклинания из компендиума несут `@mod.spell` в формулах (напр. лечение
- * «2к8 + @mod.spell»). Слот-скейлинг существам не применяется.
+ * «2к8 + @mod.spell»).
+ *
+ * Слот-скейлинг здесь НУЖЕН, в отличие от действий: группа блока называет круг
+ * наложения (`castLevel`), и заклинание с него кастуется усиленным. Получателя
+ * помечает общий {@link expandDamageParts}, а само усиление дописывает окно
+ * броска — только когда круг наложения выше базового круга заклинания.
  *
  * @param parts - части урона/лечения заклинания
  * @param targetIsFull - состояние HP цели для @target.* (undefined — per-target)
  * @param creature - существо-заклинатель
  * @param spellMod - модификатор заклинательной характеристики (см. {@link getCreatureSpellMod})
+ * @param targetType - тип существа цели для `@target.type.*` (одиночная цель)
  * @returns массив разрешённых частей (по сегментам)
  */
 export function resolveCreatureSpellDamageParts(
   parts: DamagePart[],
   targetIsFull: boolean | undefined,
-  creature: import('./dndEntities.js').Creature,
+  creature: import('./dndEntities.js').DnDCreature,
   spellMod: number,
+  targetType?: CreatureCategory,
 ): ResolvedDamagePartInput[] {
-  const context = { ...buildFormulaContext(creature), spellMod };
+  const context = { ...buildResolvedFormulaContext(creature), spellMod };
 
-  return expandDamageParts(parts, targetIsFull, (formula) => {
-    if (!formula.includes('@')) {
-      return formula;
-    }
+  return expandDamageParts(
+    parts,
+    targetIsFull,
+    (formula) => {
+      if (!formula.includes('@')) {
+        return formula;
+      }
 
-    try {
-      return substituteFormulaVariables(formula, context);
-    } catch {
-      return formula;
-    }
-  });
+      try {
+        return substituteFormulaVariables(formula, context);
+      } catch {
+        return formula;
+      }
+    },
+    {
+      assignScaling: true,
+      targetType,
+      selfHasStatus: (status) => entityHasDamageStatus(creature, status),
+    },
+  );
 }
 
 /**
- * Универсальное ядро развёртывания частей урона: ветки `@target.*` → сегменты
- * `@dmg`/`@heal` → разрешение формулы переданным резолвером. Носитель (заклинание/
- * оружие/существо) задаёт только способ резолва @-переменных и нужен ли
- * слот-скейлинг — остальная механика общая (единый знаменатель).
+ * Ветки формулы по хитам цели (`@target.full` / `@target.notFull`). Известное
+ * состояние гасит лишние слагаемые сразу; неизвестное даёт обе ветки с гейтом.
+ * Проверяются именно токены ХИТОВ, а не любой `@target`: формула с одним лишь
+ * `@target.type.*` или `@target.status.*` в ветках по хитам не нуждается.
+ *
+ * @param formula - формула части
+ * @param targetIsFull - полнота хитов единой цели; undefined — цели нет
+ * @returns ветки по хитам
+ */
+function buildTargetHpBranches(
+  formula: string,
+  targetIsFull: boolean | undefined,
+): { gate?: TargetHpGate; formula: string }[] {
+  if (!TARGET_CONDITION_DETECT_REGEX.test(formula)) {
+    return [{ formula }];
+  }
+
+  if (targetIsFull !== undefined) {
+    return [{ formula: applyTargetConditionals(formula, targetIsFull) }];
+  }
+
+  return [
+    { gate: 'full', formula: applyTargetConditionals(formula, true) },
+    { gate: 'notFull', formula: applyTargetConditionals(formula, false) },
+  ];
+}
+
+/** Опции развёртывания частей урона */
+export interface ExpandDamagePartsOptions {
+  /** Помечать ли получателя слот-скейлинга (заклинания) */
+  assignScaling?: boolean;
+  /**
+   * Тип существа цели для `@target.type.*`; читается, только когда цель одна
+   * (`targetIsFull !== undefined`)
+   */
+  targetType?: CreatureCategory;
+  /**
+   * Есть ли состояние у бросающего — для `@self.status.<ключ>`. Не задано —
+   * состояний нет: у урона эффекта бросающего нет, и слагаемые «при моём
+   * состоянии» не бросаются.
+   */
+  selfHasStatus?: (status: string) => boolean;
+  /**
+   * Показать слагаемые `@self.status.*` отдельными ветками с `selfStatusGate`
+   * — только итог формулы в редакторе, где бросающего нет. Броску ставить
+   * нельзя: он бросил бы их без проверки.
+   */
+  selfBranches?: boolean;
+}
+
+/**
+ * Ветки формулы по состоянию бросающего. Бросок его состояния знает и
+ * оставляет одну ветку; итог в редакторе (`selfBranches`) показывает основу и
+ * по ветке на каждое состояние.
+ *
+ * @param formula - формула части
+ * @param options - опции развёртывания
+ * @returns ветки по состоянию бросающего
+ */
+function buildSelfStatusBranches(
+  formula: string,
+  options: ExpandDamagePartsOptions,
+): { selfStatusGate?: string; formula: string }[] {
+  if (!hasStatusToken(formula, 'self')) {
+    return [{ formula }];
+  }
+
+  if (!options.selfBranches) {
+    return [
+      {
+        formula: applyStatusConditionals(
+          formula,
+          'self',
+          options.selfHasStatus ?? (() => false),
+        ),
+      },
+    ];
+  }
+
+  const statuses = [
+    ...new Set(
+      splitFormulaTerms(formula)
+        .map((term) => readStatusToken(term))
+        .filter((token) => token?.side === 'self')
+        .map((token) => token?.status ?? ''),
+    ),
+  ];
+
+  return [
+    { formula: applyStatusConditionals(formula, 'self', () => false) },
+    ...statuses.map((status) => ({
+      selfStatusGate: status,
+      formula: applyStatusConditionals(
+        formula,
+        'self',
+        (other) => other === status,
+      ),
+    })),
+  ];
+}
+
+/**
+ * Универсальное ядро развёртывания частей урона: состояния бросающего
+ * `@self.status.*` → ветки `@target.*` (хиты, состояние, тип) → сегменты
+ * `@dmg`/`@heal` → разрешение формулы переданным резолвером. Носитель
+ * (заклинание/оружие/существо) задаёт только способ резолва @-переменных и нужен
+ * ли слот-скейлинг — остальная механика общая (единый знаменатель).
  *
  * @param parts - части урона/лечения
  * @param targetIsFull - состояние HP цели для @target.* (undefined — per-target)
  * @param resolveFormula - резолвер сегмента (подстановка @-переменных)
  * @param options - опции развёртывания
- * @param options.assignScaling - помечать ли получателя слот-скейлинга (заклинания)
  * @returns массив разрешённых частей (по сегментам)
  */
 export function expandDamageParts(
   parts: DamagePart[],
   targetIsFull: boolean | undefined,
   resolveFormula: (formula: string) => string,
-  options: { assignScaling?: boolean } = {},
+  options: ExpandDamagePartsOptions = {},
 ): ResolvedDamagePartInput[] {
   const result: ResolvedDamagePartInput[] = [];
+
+  // Одна ли цель у броска — решает состояние HP: оба признака цели читаются с
+  // одной и той же сущности, и второго сигнала заводить незачем
+  const hasSingleTarget = targetIsFull !== undefined;
 
   // Метаданные сегментов для пост-назначения слот-скейлинга: лечение теперь
   // определяется на уровне СЕГМЕНТА (@heal в формуле), поэтому получатель
   // усиления выбирается после полного развёртывания.
   const segmentMeta: {
     partIndex: number;
-    branchIndex: number;
+    scalingGroup: number;
     isHealing: boolean;
   }[] = [];
 
   for (const [partIndex, part] of parts.entries()) {
-    // Гасим условные слагаемые @target.* ДО разбиения по типам: удалённые
-    // слагаемые не оставляют «осиротевших» типизированных модификаторов, а
-    // хвостовой @mod.spell прилипает к типу активной ветки.
-    const branches: { gate?: TargetHpGate; formula: string }[] = [];
+    // Ветки по хитам взаимоисключающие, а по состоянию и типу внутри них — нет:
+    // безусловное слагаемое достаётся любой цели, условное ложится сверху
+    // только «своим». Поэтому группой слот-скейлинга остаётся ветка ПО ХИТАМ
+    // (и по состоянию бросающего в итоге редактора): внутри неё усиление круга
+    // получает ровно одна (первая) ветка.
+    const branches: {
+      gate?: TargetHpGate;
+      typeGate?: CreatureCategory;
+      statusGate?: string;
+      selfStatusGate?: string;
+      formula: string;
+      scalingGroup: number;
+    }[] = [];
 
-    if (!part.formula.includes('@target')) {
-      branches.push({ formula: part.formula });
-    } else if (targetIsFull !== undefined) {
-      branches.push({
-        formula: applyTargetConditionals(part.formula, targetIsFull),
-      });
-    } else {
-      branches.push(
-        { gate: 'full', formula: applyTargetConditionals(part.formula, true) },
-        {
-          gate: 'notFull',
-          formula: applyTargetConditionals(part.formula, false),
-        },
-      );
+    let scalingGroup = 0;
+
+    // Вид блоков проставляется ДО ветвления: ветка по состоянию или хитам
+    // вырезает слагаемые, и кость без токена потеряла бы тип
+    // (`3к6+3@dmg.force + 2к6@dmg.force@target.status.prone`)
+    const typedFormula = spreadKindTokens(part.formula, Boolean(part.type));
+
+    for (const selfBranch of buildSelfStatusBranches(typedFormula, options)) {
+      for (const hpBranch of buildTargetHpBranches(
+        selfBranch.formula,
+        targetIsFull,
+      )) {
+        // Состояние цели сверяется при нанесении урона — ветками с гейтом и у
+        // единой цели: на момент удара оно надёжнее, чем при броске
+        for (const statusBranch of splitByTargetStatus(hpBranch.formula)) {
+          const typeBranches: TargetTypeBranch[] = hasSingleTarget
+            ? [
+                {
+                  formula: applyTargetTypeConditionals(
+                    statusBranch.formula,
+                    options.targetType,
+                  ),
+                },
+              ]
+            : splitByTargetTypeGate(statusBranch.formula);
+
+          for (const typeBranch of typeBranches) {
+            branches.push({
+              gate: hpBranch.gate,
+              typeGate: typeBranch.typeGate,
+              statusGate: statusBranch.status,
+              selfStatusGate: selfBranch.selfStatusGate,
+              formula: typeBranch.formula,
+              scalingGroup,
+            });
+          }
+        }
+
+        scalingGroup += 1;
+      }
     }
 
-    for (const [branchIndex, branch] of branches.entries()) {
+    for (const branch of branches) {
       if (branch.formula.trim().length === 0) {
         continue;
       }
@@ -1245,17 +2315,23 @@ export function expandDamageParts(
           formula: resolved,
           type: segment.healing ? undefined : segment.type,
           types: segment.healing ? undefined : segment.types,
+          ...(segment.typeChoice ? { typeChoice: segment.typeChoice } : {}),
           isHealing: segment.healing !== undefined,
           healTemp: segment.healing === 'temp' || undefined,
           target: part.target ?? 'selected',
           requiresDamage: part.requiresDamage ?? false,
           targetGate: branch.gate,
+          targetTypeGate: branch.typeGate,
+          ...(branch.statusGate ? { targetStatusGate: branch.statusGate } : {}),
+          ...(branch.selfStatusGate
+            ? { selfStatusGate: branch.selfStatusGate }
+            : {}),
           applySlotScaling: false,
         });
 
         segmentMeta.push({
           partIndex,
-          branchIndex,
+          scalingGroup: branch.scalingGroup,
           isHealing: segment.healing !== undefined,
         });
       }
@@ -1272,18 +2348,25 @@ export function expandDamageParts(
 /**
  * Помечает части-получатели усиления высших кругов (слот-скейлинг).
  *
- * Получатель — первая часть, породившая урон-сегмент; в каждой её гейт-ветке
- * помечается первый урон-сегмент (к цели применяется только одна ветка —
- * двойного усиления нет). Если урон-сегментов нет вообще (чисто лечащее
- * заклинание, напр. «Лечение ран») — усиление достаётся первому лечащему
- * сегменту каждой ветки первой части, иначе апкаст лечения терялся бы.
+ * Получатель — первая часть, породившая урон-сегмент; в каждой её ветке ПО
+ * ХИТАМ помечается первый урон-сегмент (к цели применяется только одна такая
+ * ветка — двойного усиления нет). Типовые ветки внутри одной ветки по хитам
+ * НЕ взаимоисключающие, поэтому усиление достаётся только первой из них.
+ *
+ * Если урон-сегментов нет вообще (чисто лечащее заклинание, напр. «Лечение
+ * ран») — усиление достаётся первому лечащему сегменту каждой ветки первой
+ * части, иначе апкаст лечения терялся бы.
  *
  * @param result - развёрнутые части (мутируются: applySlotScaling)
  * @param segmentMeta - метаданные сегментов (параллельны result)
  */
 function assignSlotScaling(
   result: ResolvedDamagePartInput[],
-  segmentMeta: { partIndex: number; branchIndex: number; isHealing: boolean }[],
+  segmentMeta: {
+    partIndex: number;
+    scalingGroup: number;
+    isHealing: boolean;
+  }[],
 ): void {
   const hasDamageSegment = segmentMeta.some((meta) => !meta.isHealing);
 
@@ -1306,11 +2389,11 @@ function assignSlotScaling(
       continue;
     }
 
-    if (markedBranches.has(meta.branchIndex)) {
+    if (markedBranches.has(meta.scalingGroup)) {
       continue;
     }
 
-    markedBranches.add(meta.branchIndex);
+    markedBranches.add(meta.scalingGroup);
     result[index].applySlotScaling = true;
   }
 }
@@ -1338,6 +2421,10 @@ function assignSlotScaling(
  * @param defaultType - тип урона для сегментов без токена @dmg
  * @param targetIsFull - состояние HP цели (undefined — неизвестно, ветки per-target)
  * @param resolveFormula - резолвер @-переменных сегмента (контекст вызова)
+ * @param targetType - тип существа цели для `@target.type.*`; читается, только
+ *   когда цель одна (`targetIsFull !== undefined`)
+ * @param selfHasStatus - есть ли состояние у бросающего (`@self.status.*`);
+ *   не задано — состояний нет
  * @returns массив разрешённых бонус-частей
  */
 export function resolveBonusDamageParts(
@@ -1345,26 +2432,58 @@ export function resolveBonusDamageParts(
   defaultType: string | undefined,
   targetIsFull: boolean | undefined,
   resolveFormula: (subFormula: string) => string,
+  targetType?: CreatureCategory,
+  selfHasStatus: (status: string) => boolean = () => false,
 ): ResolvedDamagePartInput[] {
   const result: ResolvedDamagePartInput[] = [];
 
-  for (const { formula: rawFormula, conditionGate } of formulas) {
-    const branches: { gate?: TargetHpGate; formula: string }[] = [];
+  const hasSingleTarget = targetIsFull !== undefined;
 
-    if (!rawFormula.includes('@target')) {
-      branches.push({ formula: rawFormula });
-    } else if (targetIsFull !== undefined) {
-      branches.push({
-        formula: applyTargetConditionals(rawFormula, targetIsFull),
-      });
-    } else {
-      branches.push(
-        { gate: 'full', formula: applyTargetConditionals(rawFormula, true) },
-        {
-          gate: 'notFull',
-          formula: applyTargetConditionals(rawFormula, false),
-        },
-      );
+  for (const {
+    formula: rawFormula,
+    conditionGate,
+    conditionTypeGate,
+  } of formulas) {
+    // Состояние бросающего бонус-урону известно так же, как основному броску
+    // Вид блоков — до ветвления, как в `expandDamageParts`
+    const typedFormula = spreadKindTokens(rawFormula, Boolean(defaultType));
+
+    const hpBranches = buildTargetHpBranches(
+      applyStatusConditionals(typedFormula, 'self', selfHasStatus),
+      targetIsFull,
+    );
+
+    const branches: {
+      gate?: TargetHpGate;
+      typeGate?: CreatureCategory;
+      statusGate?: string;
+      formula: string;
+    }[] = [];
+
+    for (const hpBranch of hpBranches) {
+      for (const statusBranch of splitByTargetStatus(hpBranch.formula)) {
+        if (hasSingleTarget) {
+          branches.push({
+            gate: hpBranch.gate,
+            statusGate: statusBranch.status,
+            formula: applyTargetTypeConditionals(
+              statusBranch.formula,
+              targetType,
+            ),
+          });
+
+          continue;
+        }
+
+        for (const typeBranch of splitByTargetTypeGate(statusBranch.formula)) {
+          branches.push({
+            gate: hpBranch.gate,
+            typeGate: typeBranch.typeGate,
+            statusGate: statusBranch.status,
+            formula: typeBranch.formula,
+          });
+        }
+      }
     }
 
     for (const branch of branches) {
@@ -1375,6 +2494,15 @@ export function resolveBonusDamageParts(
       const combined = combineTargetGates(conditionGate, branch.gate);
 
       if (combined === null) {
+        continue;
+      }
+
+      const combinedType = combineTargetTypeGates(
+        conditionTypeGate,
+        branch.typeGate,
+      );
+
+      if (combinedType === null) {
         continue;
       }
 
@@ -1392,11 +2520,14 @@ export function resolveBonusDamageParts(
           formula: resolved,
           type: segment.healing ? undefined : segment.type,
           types: segment.healing ? undefined : segment.types,
+          ...(segment.typeChoice ? { typeChoice: segment.typeChoice } : {}),
           isHealing: segment.healing !== undefined,
           healTemp: segment.healing === 'temp' || undefined,
           target: 'selected',
           requiresDamage: false,
           targetGate: combined.gate,
+          targetTypeGate: combinedType.typeGate,
+          ...(branch.statusGate ? { targetStatusGate: branch.statusGate } : {}),
           applySlotScaling: false,
         });
       }
@@ -1481,78 +2612,47 @@ export function scaleDamageFormula(
 
 // ── Маппинг AoE ──────────────────────────────────────────────
 
-/**
- * Маппит область заклинания на параметры MeasurementTemplate.
- *
- * @param spell - заклинание с областью воздействия
- * @returns параметры шаблона или null если нет области
- */
-export function mapSpellAreaToTemplate(
-  spell: Spell,
-): { type: MeasurementTemplateType; size: number } | null {
-  if (!spell.areaOfEffect) {
-    return null;
-  }
-
-  return { type: spell.areaOfEffect.shape, size: spell.areaOfEffect.size };
-}
-
 // ── Лейблы для чата ──────────────────────────────────────────
 
 /**
- * Формирует лейбл для каста заклинания в чате.
+ * Состояние, которого спасбросок от заклинания позволяет избежать.
  *
- * @param spellName - название заклинания
- * @param castLevel - круг, из которого кастуется
- * @param spellLevel - базовый круг заклинания
- * @returns текст лейбла
+ * Берётся у первого эффекта заклинания, который состояние накладывает:
+ * спасбросок один, и «преимущество против отравления» с «преимуществом против
+ * страха» на нём всё равно не сложить. Заклинание без состояния отдаёт
+ * `undefined` — тогда бросок считается только по характеристике и магии.
+ *
+ * @param spell - заклинание
+ * @returns ключ состояния либо `undefined`
  */
-export function buildSpellCastLabel(
-  spellName: string,
-  castLevel: number,
-  spellLevel: number,
-): string {
-  let label = `Заклинание\u00A0—\u00A0${spellName}`;
+export function getSpellSaveCondition(spell: Spell): ConditionRef | undefined {
+  const carrier = (spell.activeEffects ?? []).find(
+    (effect) => effect.conditionKey,
+  );
 
-  if (castLevel > spellLevel) {
-    label += `\u00A0(${castLevel}-й круг)`;
-  }
-
-  return label;
+  return carrier?.conditionKey;
 }
 
 /**
- * Формирует лейбл для урона заклинания с результатом применения.
+ * Заклинания листа с одним потраченным зарядом заклинания: у заклинания с
+ * откатом (врождённого, расового) заряд уменьшается, ниже нуля не уходит.
+ * Список не меняется — возвращается новый. Один расчёт на лист персонажа,
+ * горячую панель и заклинания существа.
  *
- * @param spellName - название заклинания
- * @param applyResult - результат применения урона (может отсутствовать)
- * @returns текст лейбла
+ * @param spells - заклинания листа
+ * @param spellId - потраченное заклинание
+ * @returns новый список заклинаний
  */
-export function buildSpellDamageLabel(
-  spellName: string,
-  applyResult?: { actorName: string; hpBefore: number; hpAfter: number } | null,
-): string {
-  let label = `Урон\u00A0—\u00A0${spellName}`;
-
-  if (applyResult) {
-    label += `\u00A0→\u00A0${applyResult.actorName}:\u00A0-${applyResult.hpBefore - applyResult.hpAfter}\u00A0HP`;
-  }
-
-  return label;
-}
-
-/**
- * Формирует лейбл для спасброска от заклинания.
- *
- * @param spellName - название заклинания
- * @param saveAbility - характеристика спасброска
- * @param saveDC - сложность спасброска
- * @returns текст лейбла
- */
-export function buildSpellSaveLabel(
-  spellName: string,
-  saveAbility: string,
-  saveDC: number,
-): string {
-  return `${spellName}\u00A0—\u00A0Спасбросок\u00A0${saveAbility}\u00A0(DC\u00A0${saveDC})`;
+export function withSpentSpellUse(
+  spells: readonly Spell[],
+  spellId: string,
+): Spell[] {
+  return spells.map((entry) =>
+    entry.id === spellId && entry.uses
+      ? {
+          ...entry,
+          uses: { ...entry.uses, current: Math.max(0, entry.uses.current - 1) },
+        }
+      : entry,
+  );
 }

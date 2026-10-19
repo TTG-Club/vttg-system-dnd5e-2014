@@ -1,79 +1,217 @@
-﻿import type {
-  CompendiumValueFormatter,
-  DiceRollData,
-  HealthCondition,
-} from '@vtt/shared';
 import type {
+  BaseActiveEffect,
   BaseActor,
   BaseCreature,
+  BaseGameItem,
+  CompendiumValueFormatter,
+  ConditionDefinition,
   CustomArea,
+  DiceRollData,
   Feature,
   GridSettings,
+  HealthCondition,
   MeasurementTemplate,
+  MovementRange,
   SceneEntity,
+  ServerRollRequester,
+  SystemClientEventContext,
+  SystemCombatStateResult,
+  SystemDeferredTrigger,
+  SystemDeferredTriggerResult,
+  SystemRelatedTriggerResult,
+  SystemRollResult,
+  SystemTokenMovement,
+  SystemTriggerContext,
   Token,
+  VttSystem,
 } from '@vtt/shared';
-import type { BaseActiveEffect } from '@vtt/shared';
-import type { ConditionDefinition } from '@vtt/shared';
-import type { SystemRollResult, VttSystem } from '@vtt/shared';
-import type { ActiveEffect, EffectOrigin } from './activeEffectTypes.js';
+
+import type { ActiveEffect, EffectSaveTiming } from './activeEffectTypes.js';
 import type { BackgroundDefinition } from './backgroundTypes.js';
-import type { ConditionKey } from './consts.js';
+import type { DndCombatState } from './damageApplication.js';
+import type { DamageHit } from './damageHits.js';
 import type { DamageApplyResult } from './damageUtils.js';
 import type {
-  DnDActor,
-  DnDSceneEntity,
-  GameItem,
-  Spell,
-} from './dndEntities.js';
+  DeferredEffectOutcome,
+  EngineDeferredTrigger,
+} from './deferredEffectSaves.js';
+import type { DnDGameItem, DnDSceneEntity, Spell } from './dndEntities.js';
+import type {
+  DamageEventsResult,
+  TriggerEventOptions,
+} from './effectDamageEvents.js';
+import type { TriggerSourcePreparer } from './effectPay.js';
 import type { IncomingAttackContext } from './effectPipeline.js';
+import type {
+  DeferredTurnTrigger,
+  EffectTriggerSourceKind,
+} from './effectTriggerRunner.js';
+import type { EffectTriggerArea } from './effectTriggerTypes.js';
+import type { DndEntityLight } from './entityLight.js';
+import type { DndEntityVision } from './entityVision.js';
+import type { AreaEffectsSyncResult } from './positionalEffects.js';
+import type { SceneSight } from './sceneSight.js';
+import type { SystemClientEvent } from './systemClientEvents.js';
+import type {
+  EntryEffectOptions,
+  SceneMoveOptions,
+  TurnDamageOutcome,
+  TurnHealingOutcome,
+} from './turnEffects.js';
 
-import { getHealthCondition, HEALTH_CONDITIONS } from '@vtt/shared';
-import { isRecord } from '@vtt/shared';
-import { ActiveEffectsArraySchema } from './activeEffectTypes.js';
+import { getHealthCondition, HEALTH_CONDITIONS, isRecord } from '@vtt/shared';
+
+import {
+  isTurnMovementSpent,
+  listBlockedConcentrationCasts,
+  recordActionSpend,
+} from './actionRestrictions.js';
+import {
+  ActiveEffectsArraySchema,
+  isActiveEffect,
+  isDnDEffect,
+  isEffectOrigin,
+} from './activeEffectTypes.js';
 import {
   normalizeActorData as normalizeDndActorData,
   validateActorData as validateDndActorData,
 } from './actorValidation.js';
+import { shapeAuraCondition } from './auraCondition.js';
 import {
   collectAllAuraEffects,
   calculateAmbientAuras as computeAmbientAuras,
+  findEntitiesInArea,
 } from './auraMath.js';
+import { syncAutoAppliedConditions } from './autoConditions.js';
 import { normalizeActor, normalizeCreature } from './calculations.js';
+import { resolveClassLabel } from './classLabels.js';
 import { CLASS_KEY_OPTIONS } from './classTypes.js';
-import { buildConditionActiveEffect } from './conditionTemplates.js';
-import { CONDITIONS, CREATURE_CATEGORIES, DEFAULT_ACTOR } from './consts.js';
+import { recordCombatBaseline } from './combatEffectChanges.js';
 import {
+  listConcentrationEffects,
+  withoutCastEffects,
+} from './concentration.js';
+import {
+  buildConditionActiveEffect,
+  getConditionEntry,
+  isOwnConditionEffect,
+  listConditions,
+  resolveEffectConditionKey,
+} from './conditionTemplates.js';
+import {
+  BASE_UNARMORED_AC,
+  CREATURE_CATEGORIES,
+  CREATURE_SIZE_LABELS,
+  DEFAULT_ACTOR,
+  RARITY_LABELS,
+} from './consts.js';
+import {
+  applyCombatState as applyCombatStateImpl,
   applyEffectsToEntity as applyEffectsToEntityImpl,
   applyTargetDamage as applyTargetDamageImpl,
   getEntityActiveFlags as getEntityActiveFlagsImpl,
   getEntityArmorClass as getEntityArmorClassImpl,
+  pickCombatState as pickCombatStateImpl,
+  writeCombatState,
 } from './damageApplication.js';
+import {
+  clampDamageHits,
+  parseDamageHits,
+  toDamageHits,
+} from './damageHits.js';
 import { getSpellDamageParts } from './damageParts.js';
+import {
+  closeDeathSavesAboveZeroHp,
+  formatDeathSaveSummary,
+  settleDeathSaveDamage,
+  syncDeathSavesWithHp,
+} from './deathSaves.js';
+import { syncCreatureDeathCondition } from './deathState.js';
+import {
+  formatDeferredEffectsSummary,
+  requestTriggerAsk,
+  requestTriggerChoice,
+  requestTurnTriggerSave,
+} from './deferredEffectSaves.js';
 import { rollDamageFormula as rollDamageFormulaImpl } from './diceFormula.js';
-import { collectActiveEffects, resolveActorStats } from './effectPipeline.js';
+import { SELF_TRIGGER_SUMMARY_LABEL } from './effectActivation.js';
+import {
+  settleAllyHurtEvents,
+  settleAppliedEvents,
+  settleAttackRollTriggers,
+  settleConditionLostEvents,
+  settleDamageEvents,
+  settleDownedOtherEvents,
+  settleEffectActionEvents,
+  settleHealingEvents,
+  settleMovementEvents,
+} from './effectDamageEvents.js';
+import {
+  collectActiveEffects,
+  isDiceFormulaValue,
+  resolveActorStats,
+  resolveTotalMovementSpeed,
+} from './effectPipeline.js';
+import {
+  formatEffectRequesterLabel,
+  shouldRequestEffectSave,
+} from './effectSaveAcquisition.js';
+import {
+  buildTriggerSources,
+  EFFECT_TRIGGER_SOURCE_KINDS,
+  processTurnEffects,
+} from './effectTriggerRunner.js';
+import { isLegacyTrigger, listEffectEventTriggers } from './effectTriggers.js';
+import { isDndSceneEntity } from './entityGuards.js';
+import { resolveEntityLight as resolveEntityLightImpl } from './entityLight.js';
+import { resolveEntityVision as resolveEntityVisionImpl } from './entityVision.js';
 import { buildFeatGrantsSummary } from './featGrantsSummary.js';
 import { validateFormula } from './formulaParser.js';
+import {
+  resolveEntityCurrentHp,
+  resolveEntityMaxHp,
+  resolveEntityTempHp,
+} from './hitPoints.js';
 import { validateGameItem } from './itemSchemas.js';
+import { transferItem } from './itemTransfer.js';
 import {
   applyAuraTriggerEffects as computeAuraTriggerEffects,
+  runPresenceTriggerSources,
   syncActorAreaEffects,
 } from './positionalEffects.js';
+import {
+  reconcileScenePresence,
+  releaseOffSceneEffects,
+} from './scenePresence.js';
+import { createContextSightSource, createSceneSight } from './sceneSight.js';
+import { SPELL_SCHOOL_LABELS } from './spellTypes.js';
 import { damagePartIsHealing } from './spellUtils.js';
+import { parseSystemClientEvent } from './systemClientEvents.js';
+import { SYSTEM_ID } from './systemId.js';
 import { isPointInTemplate as isPointInTemplateGeometry } from './templateGeometry.js';
 import {
+  entityIgnoresTerrainCost as entityIgnoresTerrainCostImpl,
+  resolveAreaTerrainCost,
+} from './terrainCost.js';
+import { listChoiceCandidates } from './triggerChoice.js';
+import {
+  appendEffectsSummaryNotes,
+  buildEffectDiceRolls,
   decrementActorEffectDurations,
   expireTurnEffects as expireEntityTurnEffects,
+  expireOutsiderTurnEffects,
   formatEffectsSummary,
+  formatEntrySaveStatus,
+  formatRecurringSaveStatus,
   formatTurnEffectsMessage,
-  processTurnEffects,
+  resolveTurnSummaryLabel,
 } from './turnEffects.js';
 
 /**
- * Type-guard: Р·РЅР°С‡РµРЅРёРµ вЂ” РІР°Р»РёРґРЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ Р·РґРѕСЂРѕРІСЊСЏ (`HealthCondition`).
+ * Type-guard: значение — валидное состояние здоровья (`HealthCondition`).
  *
- * @param value - РїСЂРѕРІРµСЂСЏРµРјС‹Р№ СЌР»РµРјРµРЅС‚
- * @returns true, РµСЃР»Рё value РёРјРµРµС‚ С„РѕСЂРјСѓ HealthCondition
+ * @param value - проверяемый элемент
+ * @returns true, если value имеет форму HealthCondition
  */
 function isHealthCondition(value: unknown): value is HealthCondition {
   return (
@@ -86,33 +224,1187 @@ function isHealthCondition(value: unknown): value is HealthCondition {
 }
 
 /**
- * Type-guard: Р·РЅР°С‡РµРЅРёРµ вЂ” РјР°СЃСЃРёРІ РІР°Р»РёРґРЅС‹С… СЃРѕСЃС‚РѕСЏРЅРёР№ Р·РґРѕСЂРѕРІСЊСЏ.
- * Р’РЅРµС€РЅРёРµ `customConditions` РїСЂРёС…РѕРґСЏС‚ РєР°Рє `unknown[]` (РєРѕРЅС‚СЂР°РєС‚ VttSystem)
- * Рё РІР°Р»РёРґРёСЂСѓСЋС‚СЃСЏ Р·РґРµСЃСЊ РїРµСЂРµРґ РїРµСЂРµРґР°С‡РµР№ РІ С‚РёРїРёР·РёСЂРѕРІР°РЅРЅС‹Р№ СЂР°СЃС‡С‘С‚.
+ * Type-guard: значение — массив валидных состояний здоровья.
+ * Внешние `customConditions` приходят как `unknown[]` (контракт VttSystem)
+ * и валидируются здесь перед передачей в типизированный расчёт.
  *
- * @param value - РїСЂРѕРІРµСЂСЏРµРјРѕРµ Р·РЅР°С‡РµРЅРёРµ
- * @returns true, РµСЃР»Рё value вЂ” РјР°СЃСЃРёРІ HealthCondition
+ * @param value - проверяемое значение
+ * @returns true, если value — массив HealthCondition
  */
 function isHealthConditionArray(value: unknown): value is HealthCondition[] {
   return Array.isArray(value) && value.every(isHealthCondition);
 }
 
-/** РџРѕРґРїРёСЃРё С‚РёРїРѕРІ СЃСѓС‰РµСЃС‚РІ РїРѕ РєР»СЋС‡Сѓ (РґР»СЏ С„РѕСЂРјР°С‚С‚РµСЂР° РєРѕРјРїРµРЅРґРёСѓРјР°) */
-const CREATURE_TYPE_LABELS: Record<string, string> = CREATURE_CATEGORIES;
+/** Подпись момента в сводке сработавших зон */
+const AREA_SUMMARY_LABEL = 'область';
 
-/** РџРѕРґРїРёСЃРё РєР»Р°СЃСЃРѕРІ РїРѕ РєР»СЋС‡Сѓ (РґР»СЏ С„РѕСЂРјР°С‚С‚РµСЂР° РєРѕРјРїРµРЅРґРёСѓРјР°) */
-const CLASS_LABELS: Record<string, string> = Object.fromEntries(
-  CLASS_KEY_OPTIONS.map((option) => [option.value, option.label]),
-);
+/** Подпись момента в сводке сработавших аур */
+const AURA_SUMMARY_LABEL = 'аура';
+
+/** Подпись момента в сводке срабатываний пути носителя */
+const MOVEMENT_SUMMARY_LABEL = 'путь';
 
 /**
- * РџР°СЂСЃРёС‚ РїРѕРєР°Р·Р°С‚РµР»СЊ РѕРїР°СЃРЅРѕСЃС‚Рё (РџРћ) РІ С‡РёСЃР»Рѕ РґР»СЏ СЃРѕСЂС‚РёСЂРѕРІРєРё.
- * РџСѓСЃС‚Рѕ/В«вЂ”В» в†’ -1 (РёРґСѓС‚ РїРµСЂРІС‹РјРё); РїРѕРґРґРµСЂР¶РёРІР°РµС‚ РґСЂРѕР±Рё В«1/8В», В«1/4В», В«1/2В».
+ * Метка ожидания спасброска против урона каждый ход: у эффекта с уроном и
+ * повторным спасброском на одной границе хода висят два разных запроса.
+ */
+const TURN_DAMAGE_SAVE_KEY = 'damage';
+
+/**
+ * Хвост метки ожидания по этапу срабатывания хода. Прежний ключ этапа
+ * наложений пуст: старые ожидания не должны сдвинуться.
+ */
+const TURN_STAGE_KEYS = {
+  damage: `:${TURN_DAMAGE_SAVE_KEY}`,
+  effects: '',
+  choice: ':choice',
+  ask: ':ask',
+} as const;
+
+/**
+ * Метка ожидания спасброска на ходу наложившего: один эффект срабатывает и на
+ * своём ходу, и на ходу наложившего — ответы ждутся порознь.
+ */
+const SOURCE_TURN_SAVE_KEY = 'source';
+
+/** Подпись момента в сводке событий урона */
+const DAMAGE_EVENTS_SUMMARY_LABEL = 'от урона';
+
+/** Подпись момента в сводке срабатываний «при наложении» */
+const APPLIED_EVENTS_SUMMARY_LABEL = 'при наложении';
+
+/** Подпись момента в сводке срабатываний «когда носителя вылечили» */
+const HEALING_EVENTS_SUMMARY_LABEL = 'от лечения';
+
+/** Подпись момента в сводке срабатываний «состояние снялось» */
+const CONDITION_LOST_SUMMARY_LABEL = 'при снятии состояния';
+
+/** Подпись момента в сводке срабатываний «носитель свалил цель» */
+const DOWNED_OTHER_SUMMARY_LABEL = 'когда цель свалена';
+
+/** Подпись сводки события «на глазах носителя ранили союзника» */
+const ALLY_HURT_SUMMARY_LABEL = 'когда ранили союзника на глазах';
+
+/**
+ * Состояния, снятые снимком: те, чьих эффектов в новом списке не стало.
  *
- * @param cr - СЃС‚СЂРѕРєРѕРІРѕРµ Р·РЅР°С‡РµРЅРёРµ challengeRating
+ * @param before - эффекты до снимка
+ * @param after - эффекты после
+ * @returns ключи снятых состояний без повторов
+ */
+function listLostConditions(
+  before: readonly ActiveEffect[],
+  after: readonly ActiveEffect[],
+): string[] {
+  const kept = new Set(after.map((effect) => effect.id));
+
+  return [
+    ...new Set(
+      before.flatMap((effect) =>
+        !kept.has(effect.id) && effect.conditionKey
+          ? [effect.conditionKey]
+          : [],
+      ),
+    ),
+  ];
+}
+
+/**
+ * Кубики эффектов сущности полем исхода для ядра: без бросков поля нет.
+ *
+ * @param entityName - имя сущности
+ * @param damageOutcomes - исходы урона
+ * @param healingOutcomes - исходы лечения
+ * @returns поле бросков для исхода
+ */
+function effectRollsField(
+  entityName: string,
+  damageOutcomes: readonly TurnDamageOutcome[],
+  healingOutcomes: readonly TurnHealingOutcome[],
+): Pick<SystemDeferredTriggerResult, 'chatRolls'> {
+  const chatRolls = buildEffectDiceRolls(
+    entityName,
+    damageOutcomes,
+    healingOutcomes,
+  );
+
+  return chatRolls.length > 0 ? { chatRolls } : {};
+}
+
+/** Отказ в записи боевого снимка: ядро ничего не фиксирует */
+const REJECTED_COMBAT_STATE: SystemCombatStateResult = {
+  accepted: false,
+  changed: false,
+  chatSummary: null,
+};
+
+/**
+ * Сводка отложенного исхода зоны, ауры или события для чата.
+ *
+ * @param label - подпись момента («область», «аура»)
+ * @returns функция: сущность и исход → сводка
+ */
+function formatEntryDeferredSummary(
+  label: string,
+): (entity: DnDSceneEntity, outcome: DeferredEffectOutcome) => string | null {
+  return (entity, outcome) =>
+    formatDeferredEffectsSummary(
+      entity.name,
+      label,
+      outcome,
+      formatEntrySaveStatus,
+    );
+}
+
+/**
+ * Поиск сущности ядра в форме D&D: сущность без данных системы — как не
+ * найденная, применять к ней правила D&D нечего.
+ *
+ * @param getEntity - поиск сущности ядра; старое ядро его не даёт
+ * @returns функция: id → сущность D&D
+ */
+function toDndEntityResolver(
+  getEntity: ((entityId: string) => SceneEntity | undefined) | undefined,
+): (entityId: string) => DnDSceneEntity | undefined {
+  return (entityId) => {
+    const found = getEntity?.(entityId);
+
+    return found && isDndSceneEntity(found) ? found : undefined;
+  };
+}
+
+/**
+ * Переводит срабатывания движка, ждущие ответа игрока, в контракт ядра:
+ * функция применения получает нейтральную сущность и отдаёт флаг изменения,
+ * готовую сводку для чата и новые ожидания.
+ *
+ * Урон, нанесённый по ответу (урон на ходу, вход в зону), будит события урона,
+ * если передан контекст. Ответы самих событий урона его не передают: их урон
+ * новых событий не порождает.
+ *
+ * @param triggers - срабатывания движка
+ * @param formatSummary - сводка исхода для чата
+ * @param damageEventsContext - контекст событий урона от урона по ответу
+ * @returns срабатывания для ядра либо `undefined`, если ждать нечего
+ */
+function toSystemDeferredTriggers(
+  triggers: readonly EngineDeferredTrigger[],
+  formatSummary: (
+    entity: DnDSceneEntity,
+    outcome: DeferredEffectOutcome,
+  ) => string | null,
+  damageEventsContext?: SystemTriggerContext,
+): SystemDeferredTrigger[] | undefined {
+  if (triggers.length === 0) {
+    return undefined;
+  }
+
+  return triggers.map((trigger) => ({
+    entityId: trigger.entityId,
+    blocksMovement: trigger.blocksMovement,
+    resolution: trigger.resolution.then((apply) =>
+      apply
+        ? (entity: SceneEntity): SystemDeferredTriggerResult => {
+            // Ядро отдаёт живую сущность нейтральной формы: без данных системы
+            // применять правила D&D не к чему
+            if (!isDndSceneEntity(entity)) {
+              return { changed: false, chatSummary: null };
+            }
+
+            const hpBefore = resolveEntityCurrentHp(entity);
+            const outcome = apply(entity);
+
+            const applied: SystemDeferredTriggerResult = {
+              changed: outcome.changed,
+              chatSummary: formatSummary(entity, outcome),
+              ...effectRollsField(
+                entity.name,
+                outcome.damageOutcomes,
+                outcome.healingOutcomes,
+              ),
+              deferred: toSystemDeferredTriggers(
+                outcome.deferred ?? [],
+                formatSummary,
+              ),
+            };
+
+            return damageEventsContext
+              ? withDamageEvents(
+                  entity,
+                  hpBefore,
+                  toDamageHits(outcome.damageOutcomes),
+                  damageEventsContext,
+                  applied,
+                )
+              : applied;
+          }
+        : null,
+    ),
+  }));
+}
+
+/**
+ * Складывает два исхода одной сущности: изменения, сводки, ожидания и другие
+ * сущности.
+ *
+ * @param base - основной исход
+ * @param extra - добавочный исход
+ * @returns общий исход
+ */
+function mergeTriggerResults(
+  base: SystemDeferredTriggerResult,
+  extra: SystemDeferredTriggerResult,
+): SystemDeferredTriggerResult {
+  const chatSummary =
+    [base.chatSummary, extra.chatSummary]
+      .filter((summary) => summary !== null)
+      .join('\n') || null;
+
+  const deferred = [...(base.deferred ?? []), ...(extra.deferred ?? [])];
+  const related = [...(base.related ?? []), ...(extra.related ?? [])];
+  const chatRolls = [...(base.chatRolls ?? []), ...(extra.chatRolls ?? [])];
+
+  return {
+    changed: base.changed || extra.changed,
+    chatSummary,
+    ...(chatRolls.length > 0 ? { chatRolls } : {}),
+    ...(deferred.length > 0 ? { deferred } : {}),
+    ...(related.length > 0 ? { related } : {}),
+  };
+}
+
+/**
+ * Сверяет фишку сущности с её эффектами после срабатывания правил: эффект с
+ * флагом «убран со сцены» наложили — фишка уходит, сняли — возвращается.
+ *
+ * Стоит на выходе хуков, которые накладывают и снимают эффекты: боевой
+ * снимок, ход, срок, конец каста, событие клиента. В хуках зон, аур и пути её
+ * нет намеренно: уход фишки сам выводит её из зоны, и зона, которая убирает
+ * стоящих в ней, гоняла бы фишку туда-обратно.
+ *
+ * @param entity - сущность, чьи эффекты могли измениться
+ * @param context - возможности ядра
+ * @param result - исход срабатывания
+ * @returns тот же исход; со строкой в чат, если фишка вернулась поверх другой
+ */
+function withScenePresence<Result extends SystemDeferredTriggerResult>(
+  entity: SceneEntity,
+  context: SystemTriggerContext | undefined,
+  result: Result,
+): Result {
+  const note = isDndSceneEntity(entity)
+    ? reconcileScenePresence(entity, context)
+    : null;
+
+  if (!note) {
+    return result;
+  }
+
+  return {
+    ...result,
+    chatSummary: result.chatSummary ? `${result.chatSummary}\n${note}` : note,
+  };
+}
+
+/**
+ * Итог событий урона или наложения в контракте ядра: сводка и кубики
+ * субъекта, ожидания ответа и другие стороны, которым достались действия.
+ *
+ * @param entity - субъект
+ * @param events - итог событий
+ * @param label - подпись момента в сводке
+ * @returns исход для ядра
+ */
+function toDamageEventsTriggerResult(
+  entity: DnDSceneEntity,
+  events: DamageEventsResult,
+  label: string = DAMAGE_EVENTS_SUMMARY_LABEL,
+): SystemDeferredTriggerResult {
+  const related: SystemRelatedTriggerResult[] = events.related.map(
+    (outcome) => ({
+      entity: outcome.entity,
+      changed: outcome.changed,
+      chatSummary: appendEffectsSummaryNotes(
+        formatEffectsSummary(
+          outcome.entity.name,
+          label,
+          outcome.damageOutcomes,
+          outcome.saveOutcomes,
+          formatEntrySaveStatus,
+          outcome.healingOutcomes,
+        ),
+        outcome.entity.name,
+        label,
+        outcome.notes,
+      ),
+      ...effectRollsField(
+        outcome.entity.name,
+        outcome.damageOutcomes,
+        outcome.healingOutcomes,
+      ),
+    }),
+  );
+
+  return {
+    changed: events.changed,
+    chatSummary: appendEffectsSummaryNotes(
+      formatEffectsSummary(
+        entity.name,
+        label,
+        events.damageOutcomes,
+        events.saveOutcomes,
+        formatEntrySaveStatus,
+        events.healingOutcomes,
+      ),
+      entity.name,
+      label,
+      events.notes,
+    ),
+    ...effectRollsField(
+      entity.name,
+      events.damageOutcomes,
+      events.healingOutcomes,
+    ),
+    deferred: toSystemDeferredTriggers(
+      events.deferred,
+      formatEntryDeferredSummary(label),
+    ),
+    ...(related.length > 0 ? { related } : {}),
+  };
+}
+
+/**
+ * Прогоняет события урона у сущности, в которую уже записан урон, и добавляет
+ * их исход к исходу того, что урон нанесло.
+ *
+ * @param entity - субъект с записанным уроном
+ * @param hpBefore - хиты до урона
+ * @param hits - удары
+ * @param context - возможности ядра
+ * @param base - исход того, что нанесло урон
+ * @param newEffectIds - эффекты, наложенные вместе с уроном: его они не слышат
+ * @param deathSaveHits - удары для спасбросков от смерти — до среза по потере
+ *   хитов: у лежащего на нуле потеря всегда ноль
+ * @returns общий исход
+ */
+function withDamageEvents(
+  entity: DnDSceneEntity,
+  hpBefore: number,
+  hits: readonly DamageHit[],
+  context: SystemTriggerContext | undefined,
+  base: SystemDeferredTriggerResult,
+  newEffectIds?: ReadonlySet<string>,
+  deathSaveHits: readonly DamageHit[] = hits,
+): SystemDeferredTriggerResult {
+  // Урон по лежащему на нуле — провалы спасбросков от смерти
+  const deathSave = settleDeathSaveDamage(entity, hpBefore, deathSaveHits);
+
+  const withDeathSave = deathSave
+    ? mergeTriggerResults(base, {
+        changed: true,
+        chatSummary: formatDeathSaveSummary(entity.name, deathSave, 'damage'),
+      })
+    : base;
+
+  if (hits.length === 0) {
+    return withDeathSave;
+  }
+
+  const events = settleDamageEvents(entity, hits, {
+    ...buildTriggerEventOptions(entity, context),
+    hpBefore,
+    newEffectIds,
+  });
+
+  return mergeTriggerResults(
+    withDeathSave,
+    toDamageEventsTriggerResult(entity, events),
+  );
+}
+
+/**
+ * Сцена и перемещения ядра для срабатываний сущности: по ним считаются толчок
+ * фишки и сдвиг зоны.
+ *
+ * @param entity - субъект
+ * @param context - возможности ядра
+ * @returns сцена вокруг субъекта и перемещения
+ */
+function toSceneMoveOptions(
+  entity: DnDSceneEntity,
+  context: SystemTriggerContext | undefined,
+): SceneMoveOptions {
+  return {
+    surroundings: context?.getSceneSurroundings?.(entity) ?? null,
+    moveToken: context?.moveToken,
+    moveArea: context?.moveArea,
+  };
+}
+
+/**
+ * С чем прогоняются события урона и наложения у сущности.
+ *
+ * @param entity - субъект
+ * @param context - возможности ядра
+ * @returns опции событий
+ */
+function buildTriggerEventOptions(
+  entity: DnDSceneEntity,
+  context: SystemTriggerContext | undefined,
+): TriggerEventOptions {
+  return {
+    requestRoll: context?.requestRoll,
+    ambientEffects: toAmbientResolver(context)(entity),
+    inCombat: context?.isInCombat?.(entity) ?? false,
+    activeTurnActorId: context?.getActiveTurnActorId?.() ?? null,
+    combatRound: toCombatRound(context),
+    sight: toSceneSight(context),
+    getEntity: toDndEntityResolver(context?.getEntity),
+    endCast: toCastEnder(context, entity.id),
+    listEntitiesInArea: toAreaLister(context),
+    ...toSceneMoveOptions(entity, context),
+  };
+}
+
+/**
+ * Поиск соседей по сцене: им пользуются и «всем в радиусе», и отбор кандидатов
+ * выбора. Соседей даёт ядро; старое ядро их не знает — в радиусе никого.
+ *
+ * @param context - возможности ядра
+ * @returns поиск существ в радиусе от субъекта
+ */
+function toAreaLister(
+  context: SystemTriggerContext | undefined,
+): (subject: DnDSceneEntity, area: EffectTriggerArea) => DnDSceneEntity[] {
+  return (subject, area) =>
+    findEntitiesInArea(context?.getSceneSurroundings?.(subject), area, subject);
+}
+
+/**
+ * Запрос выбора цели у срабатывания границы хода: кандидаты берутся со сцены,
+ * вопрос уходит выбирающему.
+ *
+ * @param entity - субъект срабатывания
+ * @param turnTrigger - отложенное срабатывание границы хода
+ * @param requestRoll - запрос от ядра
+ * @param listEntitiesInArea - поиск соседей по сцене
+ * @param answerOptions - опции наложения этой границы хода
+ * @param prepare - подготовка срабатывания по ответу (оплата цены)
+ * @returns отложенное срабатывание; `null`, если выбирать не из кого
+ */
+function requestTurnTriggerChoice(
+  entity: DnDSceneEntity,
+  turnTrigger: DeferredTurnTrigger,
+  requestRoll: ServerRollRequester,
+  listEntitiesInArea: (
+    subject: DnDSceneEntity,
+    area: EffectTriggerArea,
+  ) => DnDSceneEntity[],
+  answerOptions: EntryEffectOptions,
+  prepare?: TriggerSourcePreparer,
+): EngineDeferredTrigger | null {
+  const { choice } = turnTrigger.trigger;
+
+  if (!choice) {
+    return null;
+  }
+
+  return requestTriggerChoice(
+    entity,
+    turnTrigger,
+    listChoiceCandidates(entity, choice, { listEntitiesInArea }),
+    choice,
+    requestRoll,
+    formatEffectRequesterLabel(turnTrigger.effect.name),
+    answerOptions,
+    prepare,
+  );
+}
+
+/**
+ * Проверка «наложивший эффект в пределах N футов»: ищет его среди соседей по
+ * сцене. Старое ядро соседей не отдаёт — тогда расстояние неизвестно и часть
+ * условия о нём не выполняется.
+ *
+ * @param subject - субъект срабатывания
+ * @param context - возможности ядра
+ * @returns проверка расстояния либо `undefined`, если сцены нет
+ */
+function toSourceProximityResolver(
+  subject: DnDSceneEntity,
+  context: SystemTriggerContext | undefined,
+): ((sourceId: string, feet: number) => boolean) | undefined {
+  if (!context?.getSceneSurroundings) {
+    return undefined;
+  }
+
+  return (sourceId, feet) =>
+    findEntitiesInArea(context.getSceneSurroundings?.(subject), {
+      radius: feet,
+    }).some((entity) => entity.id === sourceId);
+}
+
+/**
+ * Видимость и свет сцены из контекста ядра: правило D&D поверх его фактов
+ * (`sceneSight.ts`). Ядро старше 0.9.700 фактов не отдаёт — тогда условия
+ * «вижу / не вижу» и «на свету / в темноте» молчат.
+ *
+ * @param context - контекст срабатывания от ядра
+ * @returns видимость и свет либо `undefined`
+ */
+function toSceneSight(
+  context: SystemTriggerContext | undefined,
+): SceneSight | undefined {
+  return createSceneSight(createContextSightSource(context));
+}
+
+/**
+ * Номер идущего раунда из контекста ядра. Старое ядро номера не отдаёт, вне
+ * боя его нет — тогда расписание «на раунде N» молчит.
+ *
+ * @param context - контекст срабатывания от ядра
+ * @returns номер раунда либо `undefined`
+ */
+function toCombatRound(
+  context: SystemTriggerContext | undefined,
+): number | undefined {
+  return context?.getCombatRound?.() ?? undefined;
+}
+
+/**
+ * Ауры чужих токенов из контекста ядра в форме D&D. Старое ядро аур не отдаёт —
+ * тогда их нет.
+ *
+ * @param context - контекст срабатывания от ядра
+ * @returns функция: сущность → её ауры
+ */
+function toAmbientResolver(
+  context: SystemTriggerContext | undefined,
+): (entity: SceneEntity) => ActiveEffect[] {
+  return (entity) =>
+    (context?.resolveAmbientEffects?.(entity) ?? []).filter(isDnDEffect);
+}
+
+/**
+ * Конец каста эффекта через ядро: каст закончит заклинатель, наложивший
+ * эффект. Старое ядро касты не заканчивает — тогда снимается только сам эффект.
+ *
+ * @param context - контекст срабатывания от ядра
+ * @param carrierId - носитель эффекта: заклинатель, если наложивший неизвестен
+ * @returns функция: эффект → закончить его каст
+ */
+function toCastEnder(
+  context: SystemTriggerContext | undefined,
+  carrierId: string,
+): ((effect: ActiveEffect) => void) | undefined {
+  const endCasts = context?.endCasts;
+
+  if (!endCasts) {
+    return undefined;
+  }
+
+  return (effect) => {
+    if (effect.castId) {
+      endCasts(effect.sourceActorId ?? carrierId, [effect.castId]);
+    }
+  };
+}
+
+/**
+ * Снимает истёкшие эффекты и заканчивает касты меток концентрации, которые
+ * истекли вместе с ними. Состояние, кончившееся по сроку, запускает
+ * срабатывания «когда с носителя снимается состояние» — их исход уходит ядру
+ * целиком.
+ *
+ * @param entity - сущность
+ * @param context - контекст срабатывания от ядра
+ * @param expire - снятие истёкших эффектов
+ * @returns исход для ядра: изменилась ли сущность и что сделали срабатывания
+ */
+function expireWithConcentration(
+  entity: DnDSceneEntity,
+  context: SystemTriggerContext | undefined,
+  expire: (entity: DnDSceneEntity) => boolean,
+): SystemDeferredTriggerResult {
+  const before = listConcentrationEffects(entity.activeEffects);
+  const effectsBefore = entity.activeEffects ?? [];
+  const changed = expire(entity);
+
+  const remaining = new Set(
+    listConcentrationEffects(entity.activeEffects).map((effect) => effect.id),
+  );
+
+  const endCast = toCastEnder(context, entity.id);
+
+  for (const effect of before) {
+    if (!remaining.has(effect.id)) {
+      endCast?.(effect);
+    }
+  }
+
+  if (!changed) {
+    return { changed: false, chatSummary: null };
+  }
+
+  // «Состояние снялось» — и когда оно кончилось по сроку: «после окончания
+  // испуга невосприимчив к Ужасающему облику на 24 часа». Граница срока отдаёт
+  // ядру полный исход, как остальные срабатывания: строка в чат, спасбросок по
+  // запросу владельцу и действия другим сторонам («урон тому, кто наложил»)
+  const events = settleConditionLostEvents(
+    entity,
+    listLostConditions(effectsBefore, entity.activeEffects ?? []),
+    buildTriggerEventOptions(entity, context),
+  );
+
+  return mergeTriggerResults(
+    { changed: true, chatSummary: null },
+    toDamageEventsTriggerResult(entity, events, CONDITION_LOST_SUMMARY_LABEL),
+  );
+}
+
+/**
+ * Исход срабатываний одной сущности в контракте ядра: сводка, ожидания ответа и
+ * события урона от нанесённого урона.
+ *
+ * @param entity - сущность
+ * @param outcome - что изменили срабатывания
+ * @param hpBefore - хиты до срабатываний
+ * @param label - подпись момента («область», «аура»)
+ * @param context - возможности ядра
+ * @returns исход для ядра
+ */
+function toEntityTriggerResult(
+  entity: DnDSceneEntity,
+  outcome: AreaEffectsSyncResult,
+  hpBefore: number,
+  label: string,
+  context: SystemTriggerContext | undefined,
+): SystemDeferredTriggerResult {
+  return withDamageEvents(
+    entity,
+    hpBefore,
+    toDamageHits(outcome.damageOutcomes),
+    context,
+    {
+      changed: outcome.changed,
+      chatSummary: appendEffectsSummaryNotes(
+        formatEffectsSummary(
+          entity.name,
+          label,
+          outcome.damageOutcomes,
+          outcome.saveOutcomes,
+          formatEntrySaveStatus,
+          outcome.healingOutcomes,
+        ),
+        entity.name,
+        label,
+        outcome.notes,
+      ),
+      ...effectRollsField(
+        entity.name,
+        outcome.damageOutcomes,
+        outcome.healingOutcomes,
+      ),
+      deferred: toSystemDeferredTriggers(
+        outcome.deferred,
+        formatEntryDeferredSummary(label),
+        context,
+      ),
+    },
+  );
+}
+
+/** Подпись момента в сводке срабатываний конца каста */
+const CAST_END_SUMMARY_LABEL = 'конец заклинания';
+
+/** Кто просит спасбросок срабатывания конца каста */
+const CAST_END_REQUESTER_LABEL = 'Конец заклинания';
+
+/**
+ * Эффект снят вместе с кастом — снимать его срабатывание уже нечего, а счётчик
+ * лимита общий с эффектом на сущности.
+ */
+const REMOVED_CAST_EFFECT_SOURCE_KIND: EffectTriggerSourceKind = {
+  ...EFFECT_TRIGGER_SOURCE_KINDS.instance,
+  instance: false,
+};
+
+/**
+ * Срабатывания «когда заклинание заканчивается» у снятых эффектов каста:
+ * наложенное ими переживает каст («Ускорение» — вялость после конца).
+ *
+ * @param entity - сущность, с которой сняты эффекты
+ * @param removed - снятые эффекты каста
+ * @param hpBefore - хиты до срабатываний
+ * @param context - возможности ядра
+ * @returns исход для ядра
+ */
+function runCastEndTriggers(
+  entity: DnDSceneEntity,
+  removed: readonly ActiveEffect[],
+  hpBefore: number,
+  context: SystemTriggerContext | undefined,
+): SystemDeferredTriggerResult {
+  const sources = buildTriggerSources(
+    removed,
+    REMOVED_CAST_EFFECT_SOURCE_KIND,
+    (effect) => listEffectEventTriggers(effect, 'castEnd'),
+  );
+
+  if (sources.length === 0) {
+    return { changed: false, chatSummary: null };
+  }
+
+  const outcome = runPresenceTriggerSources(entity, sources, {
+    requestRoll: context?.requestRoll,
+    inCombat: context?.isInCombat?.(entity) ?? false,
+    combatRound: toCombatRound(context),
+    requesterLabel: CAST_END_REQUESTER_LABEL,
+    effectOptions: {
+      ambientEffects: toAmbientResolver(context)(entity),
+      activeTurnActorId: context?.getActiveTurnActorId?.() ?? null,
+      detachFromCast: true,
+    },
+  });
+
+  return toEntityTriggerResult(
+    entity,
+    outcome,
+    hpBefore,
+    CAST_END_SUMMARY_LABEL,
+    context,
+  );
+}
+
+/** Подпись момента в сводке срабатываний броска атаки */
+const ATTACK_ROLL_SUMMARY_LABEL = 'атака';
+
+/** Что изменили срабатывания броска атаки у одной сущности */
+interface AttackRollEntityOutcome extends AreaEffectsSyncResult {
+  entity: DnDSceneEntity;
+}
+
+/**
+ * Бросок атаки от клиента: срабатывания атакующего и целей, которые не
+ * выполнил клиент, — со спасброском, уроном, концом каста и действиями другой
+ * стороне. Событие шлёт тот, кто управляет атакующим; урон самой атаки к этому
+ * времени уже записан — сокет сохраняет порядок сообщений.
+ *
+ * @param event - событие броска атаки
+ * @param context - возможности ядра и права отправителя
+ * @returns исход по каждой изменённой сущности
+ */
+function settleAttackRollEvent(
+  event: Extract<SystemClientEvent, { type: 'attackRoll' }>,
+  context: SystemClientEventContext,
+): SystemRelatedTriggerResult[] {
+  const resolve = toDndEntityResolver(context.getEntity);
+  const attacker = resolve(event.attackerId);
+
+  if (!attacker || !context.canControl(attacker)) {
+    return [];
+  }
+
+  const targets = event.targetIds.flatMap((targetId) => {
+    const target = resolve(targetId);
+
+    return target ? [target] : [];
+  });
+
+  const hpBefore = new Map(
+    [attacker, ...targets].map((entity) => [
+      entity.id,
+      resolveEntityCurrentHp(entity),
+    ]),
+  );
+
+  const outcomes = new Map<string, AttackRollEntityOutcome>();
+
+  const outcomeOf = (entity: DnDSceneEntity): AttackRollEntityOutcome => {
+    const existing = outcomes.get(entity.id);
+
+    if (existing) {
+      return existing;
+    }
+
+    const created: AttackRollEntityOutcome = {
+      entity,
+      changed: false,
+      damageOutcomes: [],
+      healingOutcomes: [],
+      saveOutcomes: [],
+      deferred: [],
+      notes: [],
+    };
+
+    outcomes.set(entity.id, created);
+
+    return created;
+  };
+
+  // Другая сторона атакующего однозначна только при одной цели
+  const sides = [
+    {
+      subject: attacker,
+      role: 'attacker' as const,
+      other: targets.length === 1 ? targets[0] : undefined,
+    },
+    ...targets.map((target) => ({
+      subject: target,
+      role: 'target' as const,
+      other: attacker,
+    })),
+  ];
+
+  for (const side of sides) {
+    // Те же возможности ядра, что у остальных событий: сцена нужна толчку и
+    // сдвигу зоны, соседи — получателю «всем в радиусе»
+    const events = settleAttackRollTriggers(side.subject, side.role, {
+      ...buildTriggerEventOptions(side.subject, context),
+      other: side.other,
+      roll: {
+        hasAdvantage: event.rollMode === 'advantage',
+        hasDisadvantage: event.rollMode === 'disadvantage',
+      },
+      ...(event.landed === undefined ? {} : { landed: event.landed }),
+      ...(event.critical === true ? { critical: true } : {}),
+    });
+
+    const subject = outcomeOf(side.subject);
+
+    subject.changed ||= events.changed;
+    subject.damageOutcomes.push(...events.damageOutcomes);
+    subject.healingOutcomes.push(...events.healingOutcomes);
+    subject.saveOutcomes.push(...events.saveOutcomes);
+    subject.deferred.push(...events.deferred);
+    subject.notes.push(...events.notes);
+
+    for (const related of events.related) {
+      const other = outcomeOf(related.entity);
+
+      other.changed ||= related.changed;
+      other.damageOutcomes.push(...related.damageOutcomes);
+      other.healingOutcomes.push(...related.healingOutcomes);
+      other.saveOutcomes.push(...related.saveOutcomes);
+      other.notes.push(...related.notes);
+    }
+  }
+
+  return [...outcomes.values()]
+    .filter(
+      (outcome) =>
+        outcome.changed
+        || outcome.deferred.length > 0
+        || outcome.saveOutcomes.length > 0
+        || outcome.notes.length > 0,
+    )
+    .map((outcome) => ({
+      entity: outcome.entity,
+      ...toEntityTriggerResult(
+        outcome.entity,
+        outcome,
+        hpBefore.get(outcome.entity.id) ?? 0,
+        ATTACK_ROLL_SUMMARY_LABEL,
+        context,
+      ),
+    }));
+}
+
+/**
+ * Кнопка «При действии» с действиями другим: нажать её вправе только тот, кто
+ * управляет носителем. Получатели — те, кого накрыл шаблон нажавшего (список
+ * прислал клиент), либо соседи по радиусу, которых сцена знает сама; отбор
+ * «союзники / враги» в обоих случаях делает сервер.
+ *
+ * @param event - событие кнопки
+ * @param context - возможности ядра и права отправителя
+ * @returns исход по носителю и по каждому задетому
+ */
+function settleEffectActionEvent(
+  event: Extract<SystemClientEvent, { type: 'effectAction' }>,
+  context: SystemClientEventContext,
+): SystemRelatedTriggerResult[] {
+  const subject = toDndEntityResolver(context.getEntity)(event.entityId);
+
+  if (!subject || !context.canControl(subject)) {
+    return [];
+  }
+
+  const options = buildTriggerEventOptions(subject, context);
+  const covered = event.targetIds ? new Set(event.targetIds) : undefined;
+  const hpBefore = resolveEntityCurrentHp(subject);
+
+  const events = settleEffectActionEvents(subject, event.effectId, {
+    ...options,
+    listEntitiesInArea: (entity, area) => {
+      // Без шаблона — обычный радиус от фишки носителя
+      if (!area.template || !covered) {
+        return options.listEntitiesInArea?.(entity, area) ?? [];
+      }
+
+      // Под шаблоном: отношение считается по всей сцене, а круг получателей
+      // — тот, что прислал нажавший
+      return findEntitiesInArea(
+        context.getSceneSurroundings?.(entity),
+        { ...area, radius: Number.POSITIVE_INFINITY },
+        entity,
+      ).filter((found) => covered.has(found.id));
+    },
+  });
+
+  const own = toEntityTriggerResult(
+    subject,
+    events,
+    hpBefore,
+    SELF_TRIGGER_SUMMARY_LABEL,
+    context,
+  );
+
+  const { related } = toDamageEventsTriggerResult(
+    subject,
+    events,
+    SELF_TRIGGER_SUMMARY_LABEL,
+  );
+
+  return [{ entity: subject, ...own }, ...(related ?? [])];
+}
+
+/** Подпись снятых эффектов закончившегося каста в чате */
+const CAST_ENDED_SUMMARY_PREFIX = 'Каст закончился — сняты: ';
+
+/**
+ * Участие наложившего в бою из контекста ядра. Старое ядро не знает ни
+ * сущностей, ни боя — тогда наложивший «не в бою», и срабатывание «ход
+ * наложившего» идёт на ходу носителя.
+ *
+ * @param context - контекст срабатывания от ядра
+ * @returns функция: id наложившего → участвует ли он в бою
+ */
+function toSourceInCombatResolver(
+  context: SystemTriggerContext | undefined,
+): (sourceId: string) => boolean {
+  return (sourceId) => {
+    const source = context?.getEntity?.(sourceId);
+
+    return source !== undefined && context?.isInCombat?.(source) === true;
+  };
+}
+
+/**
+ * Прогоняет срабатывания хода сущности и спрашивает у игрока отложенные
+ * спасброски. Общее тело хода носителя и хода наложившего: разные у них только
+ * отбор срабатываний, подпись в чате и ключ ожидания ответа.
+ *
+ * @param entity - сущность, чьи эффекты проверяются
+ * @param timing - начало или конец хода
+ * @param context - возможности ядра
+ * @param pendingKeys - спасброски, уже ждущие ответа игрока
+ * @param sourceTurnActorId - чей ход, если это ход наложившего
+ * @returns изменения, сводка и отложенные срабатывания
+ */
+function settleTurnEffects(
+  entity: SceneEntity,
+  timing: EffectSaveTiming,
+  context: SystemTriggerContext | undefined,
+  pendingKeys: Set<string>,
+  sourceTurnActorId?: string,
+): SystemDeferredTriggerResult {
+  if (!isDndSceneEntity(entity)) {
+    return { changed: false, chatSummary: null };
+  }
+
+  const requestRoll = context?.requestRoll;
+  const askOwner = shouldRequestEffectSave(entity, requestRoll);
+  const turnOf = sourceTurnActorId === undefined ? 'subject' : 'source';
+  const hpBefore = resolveEntityCurrentHp(entity);
+  const ambientEffects = toAmbientResolver(context)(entity);
+  const endCast = toCastEnder(context, entity.id);
+
+  const result = processTurnEffects(entity, timing, {
+    deferRecurringSave: () => askOwner,
+    deferRecurringDamageSave: () => askOwner,
+    ambientEffects,
+    sourceTurnActorId,
+    isSourceInCombat: toSourceInCombatResolver(context),
+    isSourceWithin: toSourceProximityResolver(entity, context),
+    combatRound: toCombatRound(context),
+    sight: toSceneSight(context),
+    endCast,
+    ...toSceneMoveOptions(entity, context),
+  });
+
+  // Ответ игрока накладывает и заканчивает каст так же, как бросок сервера
+  const answerOptions: EntryEffectOptions = {
+    ambientEffects,
+    activeTurnActorId: sourceTurnActorId ?? entity.id,
+    endCast,
+    ...toSceneMoveOptions(entity, context),
+  };
+
+  const chatSummary = formatTurnEffectsMessage(
+    entity.name,
+    timing,
+    result,
+    turnOf,
+  );
+
+  const hits = toDamageHits(result.damageOutcomes);
+
+  const rolls = effectRollsField(
+    entity.name,
+    result.damageOutcomes,
+    result.healingOutcomes,
+  );
+
+  const choiceTriggers = result.deferredTriggers.filter(
+    (turnTrigger) => turnTrigger.stage === 'choice',
+  );
+
+  const askTriggers = result.deferredTriggers.filter(
+    (turnTrigger) => turnTrigger.stage === 'ask',
+  );
+
+  // «Авто-спасброски» про броски, а не про согласие и выбор: пускать ли
+  // срабатывание в ход и кого задеть, всё равно решает человек. Без запроса от
+  // ядра спросить некого — срабатывание молчит
+  if (
+    requestRoll === undefined
+    || (!askOwner && choiceTriggers.length === 0 && askTriggers.length === 0)
+  ) {
+    return withDamageEvents(entity, hpBefore, hits, context, {
+      changed: result.changed,
+      chatSummary,
+      ...rolls,
+    });
+  }
+
+  const listEntitiesInArea = toAreaLister(context);
+
+  // Один эффект срабатывает и на своём ходу, и на ходу наложившего — ответы
+  // этих границ ждутся порознь
+  const turnKey =
+    sourceTurnActorId === undefined
+      ? timing
+      : `${timing}:${SOURCE_TURN_SAVE_KEY}:${sourceTurnActorId}`;
+
+  const deferred: EngineDeferredTrigger[] = [];
+
+  // Урон каждый ход идёт раньше повторного спасброска — в том же порядке, что
+  // и при броске на сервере. Ключ ожидания старых полей прежний; явным
+  // срабатываниям нужен и id срабатывания — их у эффекта может быть несколько
+  const requests = [
+    ...result.deferredTriggers.filter(
+      (turnTrigger) => turnTrigger.stage === 'damage' && !turnTrigger.ambient,
+    ),
+    ...result.deferredTriggers.filter(
+      (turnTrigger) => turnTrigger.stage === 'damage' && turnTrigger.ambient,
+    ),
+    ...result.deferredTriggers.filter(
+      (turnTrigger) => turnTrigger.stage === 'effects',
+    ),
+    ...choiceTriggers,
+    ...askTriggers,
+  ].map((turnTrigger) => {
+    const stageSuffix = TURN_STAGE_KEYS[turnTrigger.stage];
+
+    const stageKey = `${entity.id}:${turnTrigger.effect.id}:${turnKey}${stageSuffix}`;
+
+    return {
+      pendingKey: isLegacyTrigger(turnTrigger.trigger)
+        ? stageKey
+        : `${stageKey}:${turnTrigger.trigger.id}`,
+      request: () => {
+        if (turnTrigger.stage === 'ask') {
+          return requestTriggerAsk(
+            entity,
+            turnTrigger,
+            requestRoll,
+            formatEffectRequesterLabel(turnTrigger.effect.name),
+            {
+              effectOptions: answerOptions,
+              buildChoiceRequest: (prepare) =>
+                requestTurnTriggerChoice(
+                  entity,
+                  turnTrigger,
+                  requestRoll,
+                  listEntitiesInArea,
+                  answerOptions,
+                  prepare,
+                ),
+            },
+          );
+        }
+
+        return turnTrigger.stage === 'choice'
+          ? requestTurnTriggerChoice(
+              entity,
+              turnTrigger,
+              requestRoll,
+              listEntitiesInArea,
+              answerOptions,
+            )
+          : requestTurnTriggerSave(
+              entity,
+              turnTrigger,
+              timing,
+              requestRoll,
+              answerOptions,
+            );
+      },
+    };
+  });
+
+  for (const { pendingKey, request } of requests) {
+    if (pendingKeys.has(pendingKey)) {
+      continue;
+    }
+
+    const trigger = request();
+
+    if (!trigger) {
+      continue;
+    }
+
+    pendingKeys.add(pendingKey);
+
+    // Ответ пришёл (или запрос завершился иначе) — следующий спасбросок этого
+    // эффекта снова можно спрашивать
+    void trigger.resolution.finally(() => {
+      pendingKeys.delete(pendingKey);
+    });
+
+    deferred.push(trigger);
+  }
+
+  return withDamageEvents(entity, hpBefore, hits, context, {
+    changed: result.changed,
+    chatSummary,
+    ...rolls,
+    deferred: toSystemDeferredTriggers(
+      deferred,
+      (outcomeEntity, outcome) =>
+        formatDeferredEffectsSummary(
+          outcomeEntity.name,
+          resolveTurnSummaryLabel(timing, turnOf),
+          outcome,
+          formatRecurringSaveStatus,
+        ),
+      context,
+    ),
+  });
+}
+
+/** Подписи типов существ по ключу (для форматтера компендиума) */
+const CREATURE_TYPE_LABELS: Record<string, string> = CREATURE_CATEGORIES;
+
+/**
+ * Парсит показатель опасности (ПО) в число для сортировки.
+ * Пусто/«—» → -1 (идут первыми); поддерживает дроби «1/8», «1/4», «1/2».
+ *
+ * @param cr - строковое значение challengeRating
  */
 function parseChallengeRating(cr: string): number {
-  if (!cr || cr === 'вЂ”') {
+  if (!cr || cr === '—') {
     return -1;
   }
 
@@ -131,14 +1423,83 @@ function parseChallengeRating(cr: string): number {
 }
 
 /**
- * Р¤РѕСЂРјР°С‚С‚РµСЂС‹ Р·РЅР°С‡РµРЅРёР№ РєРѕРјРїРµРЅРґРёСѓРјР° D&D РїРѕ РёРјРµРЅРё С„РѕСЂРјР°С‚Р°. РЈРїСЂР°РІР»СЏСЋС‚ РїРѕРґРїРёСЃСЊСЋ
- * Рё СЃРѕСЂС‚РёСЂРѕРІРєРѕР№ РѕРїС†РёР№ С„РёР»СЊС‚СЂРѕРІ Рё Р·Р°РіРѕР»РѕРІРєРѕРІ СЂР°Р·РґРµР»РѕРІ РІ РѕР±РѕР±С‰С‘РЅРЅРѕРј РґРІРёР¶РєРµ
- * РѕС‚РѕР±СЂР°Р¶РµРЅРёСЏ (`useCompendiumView`).
+ * Сужает эффекты аур к D&D-форме: контракт отдаёт их нейтральной базой, а
+ * считать по ним скорость может только движок своей системы.
+ *
+ * @param ambientEffects - эффекты аур в нейтральной форме ядра
+ * @returns эффекты, которые движок узнаёт
+ */
+function collectDndAmbientEffects(
+  ambientEffects: readonly BaseActiveEffect[],
+): ActiveEffect[] {
+  return ambientEffects.filter(isDnDEffect);
+}
+
+/**
+ * Сущности, о которых уже пожаловались: предупреждение нужно один раз на
+ * сущность, а гейт движения спрашивают на каждом захвате токена мышью.
+ */
+const unreadableEntityIds = new Set<string>();
+
+/**
+ * Жалуется на сущность, которую движок не узнаёт.
+ *
+ * Для реквизита и декораций это норма и молчание правильно, но лист с
+ * характеристиками не числами выглядит целым, а токен его не двигается вовсе —
+ * и понять это без подсказки неоткуда.
+ *
+ * @param entity - сущность сцены
+ */
+function warnUnreadableEntity(entity: SceneEntity): void {
+  if (entity.entityType !== 'actor' && entity.entityType !== 'creature') {
+    return;
+  }
+
+  if (unreadableEntityIds.has(entity.id)) {
+    return;
+  }
+
+  unreadableEntityIds.add(entity.id);
+
+  console.warn(
+    `[dnd5e] Лист «${entity.name}» (${entity.id}) не читается как D&D: `
+      + 'шесть характеристик должны быть числами. Токен такого листа ядро не '
+      + 'двигает — скорость посчитать не по чему',
+  );
+}
+
+/**
+ * Форматтер значений, у которых есть словарь подписей. Порядок вариантов —
+ * порядок словаря: размеры идут от крошечного к громадному, редкость — от
+ * обычной к артефакту, а не по алфавиту подписей.
+ *
+ * @param labels - подписи значений в порядке показа
+ * @returns форматтер для фильтров и разделителей списка
+ */
+function buildLabelFormatter(
+  labels: Readonly<Record<string, string>>,
+): CompendiumValueFormatter {
+  const order = Object.keys(labels);
+
+  return {
+    label: (value) => labels[String(value)] ?? String(value),
+    sortKey: (value) => {
+      const index = order.indexOf(String(value));
+
+      return index === -1 ? order.length : index;
+    },
+  };
+}
+
+/**
+ * Форматтеры значений компендиума D&D по имени формата. Управляют подписью
+ * и сортировкой опций фильтров и заголовков разделов в обобщённом движке
+ * отображения (`useCompendiumView`).
  */
 const COMPENDIUM_VALUE_FORMATTERS: Record<string, CompendiumValueFormatter> = {
   spellLevel: {
     label: (value) =>
-      Number(value) === 0 ? 'Р—Р°РіРѕРІРѕСЂС‹' : `${Number(value)} РєСЂСѓРі`,
+      Number(value) === 0 ? 'Заговоры' : `${Number(value)} круг`,
     shortLabel: (value) => String(Number(value)),
     sortKey: (value) => Number(value),
   },
@@ -146,12 +1507,12 @@ const COMPENDIUM_VALUE_FORMATTERS: Record<string, CompendiumValueFormatter> = {
     label: (value) => {
       const cr = String(value ?? '');
 
-      return !cr || cr === 'вЂ”' ? 'РџРћ вЂ” (Р±РµР· СѓСЂРѕРІРЅСЏ РѕРїР°СЃРЅРѕСЃС‚Рё)' : `РџРћ ${cr}`;
+      return !cr || cr === '—' ? 'ПО — (без уровня опасности)' : `ПО ${cr}`;
     },
     shortLabel: (value) => {
       const cr = String(value ?? '');
 
-      return cr && cr !== 'вЂ”' ? cr : 'вЂ”';
+      return cr && cr !== '—' ? cr : '—';
     },
     sortKey: (value) => parseChallengeRating(String(value ?? '')),
   },
@@ -160,23 +1521,66 @@ const COMPENDIUM_VALUE_FORMATTERS: Record<string, CompendiumValueFormatter> = {
     sortKey: (value) => CREATURE_TYPE_LABELS[String(value)] ?? String(value),
   },
   spellClass: {
-    label: (value) => CLASS_LABELS[String(value)] ?? String(value),
-    sortKey: (value) => CLASS_LABELS[String(value)] ?? String(value),
+    label: (value) => resolveClassLabel(String(value)),
+    sortKey: (value) => resolveClassLabel(String(value)),
   },
+  spellSchool: buildLabelFormatter(SPELL_SCHOOL_LABELS),
+  creatureSize: buildLabelFormatter(CREATURE_SIZE_LABELS),
+  itemRarity: buildLabelFormatter(RARITY_LABELS),
 };
 
 /**
- * Type-guard: Р·Р°РїРёСЃСЊ РєРѕРјРїРµРЅРґРёСѓРјР° вЂ” Р·Р°РєР»РёРЅР°РЅРёРµ (РґР»СЏ РїСЂРµРґРёРєР°С‚Р° Р»РµС‡РµРЅРёСЏ).
+ * Проверяет, что значение — запись, по которой строится сводка механических
+ * даров (черта, предмет-черта или предыстория). Все три формы адресуются по
+ * названию, а остальные поля `buildFeatGrantsSummary` читает защитно.
  *
- * @param entry - РїСЂРѕРІРµСЂСЏРµРјР°СЏ Р·Р°РїРёСЃСЊ
+ * @param value - запись из контракта ядра
+ * @returns `true`, если по записи можно строить сводку
+ */
+function isFeatSummarySource(
+  value: unknown,
+): value is Feature | DnDGameItem | BackgroundDefinition {
+  return isRecord(value) && typeof value.name === 'string';
+}
+
+/**
+ * Разбирает контекст входящей атаки, приходящий от ядра непрозрачным
+ * значением: КД цели зависит от вида атаки (условные бонусы «+2 против
+ * дальнобойных»), а чужой вид атаки такой бонус молча включил бы.
+ *
+ * @param value - контекст атаки из контракта ядра
+ * @returns контекст атаки либо `undefined`, если вида атаки в нём нет
+ */
+function parseAttackContext(value: unknown): IncomingAttackContext | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const { attackType } = value;
+
+  if (
+    attackType === 'melee'
+    || attackType === 'ranged'
+    || attackType === 'spell'
+  ) {
+    return { attackType };
+  }
+
+  return undefined;
+}
+
+/**
+ * Type-guard: запись компендиума — заклинание (для предиката лечения).
+ *
+ * @param entry - проверяемая запись
  */
 function isSpellEntry(entry: unknown): entry is Spell {
   return isRecord(entry) && entry.type === 'spell';
 }
 
 /**
- * РџСЂРѕРёР·РІРѕРґРЅС‹Рµ Р±СѓР»РµРІС‹ РїСЂРµРґРёРєР°С‚С‹ РєРѕРјРїРµРЅРґРёСѓРјР° РїРѕ РєР»СЋС‡Сѓ вЂ” РґР»СЏ С„РёР»СЊС‚СЂРѕРІ, РєРѕС‚РѕСЂС‹Рµ
- * РЅРµР»СЊР·СЏ РІС‹СЂР°Р·РёС‚СЊ РѕРґРЅРёРј РїРѕР»РµРј (Р»РµС‡РµРЅРёРµ РѕРїСЂРµРґРµР»СЏРµС‚СЃСЏ РїРѕ С‡Р°СЃС‚СЏРј СѓСЂРѕРЅР°).
+ * Производные булевы предикаты компендиума по ключу — для фильтров, которые
+ * нельзя выразить одним полем (лечение определяется по частям урона).
  */
 const COMPENDIUM_PREDICATES: Record<string, (entry: unknown) => boolean> = {
   spellHealing: (entry) =>
@@ -184,97 +1588,208 @@ const COMPENDIUM_PREDICATES: Record<string, (entry: unknown) => boolean> = {
     && getSpellDamageParts(entry).some((part) => damagePartIsHealing(part)),
 };
 
+/** Что снимок изменил у сущности — вход серии событий после его записи */
+interface SnapshotEventsInput {
+  /** Хиты до записи снимка */
+  hpBefore: number;
+  /** Удары снимка */
+  hits: readonly DamageHit[];
+  /** Эффекты, наложенные этим снимком */
+  newEffectIds: ReadonlySet<string>;
+  /** Эффекты до записи снимка: по ним видно снятые состояния */
+  effectsBefore: readonly ActiveEffect[];
+  /** С чем прогоняются события */
+  options: TriggerEventOptions;
+}
+
 /**
- * РРіСЂРѕРІР°СЏ СЃРёСЃС‚РµРјР° D&D 5e (РЇРґСЂРѕ РїСЂР°РІРёР»).
- * РџСЂРµРґРѕСЃС‚Р°РІР»СЏРµС‚ РЇРґСЂСѓ (Core VTT) Р°Р±СЃС‚СЂР°РіРёСЂРѕРІР°РЅРЅС‹Рµ РјРµС‚РѕРґС‹ РґР»СЏ СЂР°Р±РѕС‚С‹
- * СЃ РРЅРёС†РёР°С‚РёРІРѕР№, Р‘РѕРµРІРєРѕР№ Рё С‚.Рґ.
+ * События, которые видит боевой снимок после записи: наложение, лечение,
+ * снятие состояния и «носитель свалил цель».
+ *
+ * Вынесены из `settleCombatState` отдельной ступенью: сам метод отвечает за
+ * приём снимка, а эта — за то, что из него следует по правилам.
+ *
+ * @param entity - сущность с записанным снимком (мутируется)
+ * @param damageResult - итог событий урона: к нему добавляются остальные
+ * @param input - что снимок изменил
+ * @returns общий итог для ядра
+ */
+function settleSnapshotEvents(
+  entity: DnDSceneEntity,
+  damageResult: SystemDeferredTriggerResult,
+  input: SnapshotEventsInput,
+): SystemDeferredTriggerResult {
+  const { hpBefore, hits, newEffectIds, effectsBefore, options } = input;
+  const hpAfter = resolveEntityCurrentHp(entity);
+
+  // «Носитель свалил цель» идёт на эффектах свалившего, а не поверженного
+  const downed =
+    hpAfter === 0 && hpBefore > 0
+      ? settleDownedOtherEvents(entity, hits, options)
+      : null;
+
+  // Свалившего в списке нет, если никого не свалили: объявленный тип даёт паре
+  // контекст, без него выводится широкий массив
+  const downedExtra: Array<[DamageEventsResult, string]> = downed
+    ? [[downed, DOWNED_OTHER_SUMMARY_LABEL]]
+    : [];
+
+  const extras: Array<[DamageEventsResult, string]> = [
+    [
+      settleAppliedEvents(entity, newEffectIds, hits, options),
+      APPLIED_EVENTS_SUMMARY_LABEL,
+    ],
+    [
+      // Временные хиты лечением не считаются: правила их отделяют
+      settleHealingEvents(entity, Math.max(0, hpAfter - hpBefore), options),
+      HEALING_EVENTS_SUMMARY_LABEL,
+    ],
+    [
+      settleConditionLostEvents(
+        entity,
+        listLostConditions(effectsBefore, entity.activeEffects ?? []),
+        options,
+      ),
+      CONDITION_LOST_SUMMARY_LABEL,
+    ],
+    // Идёт на эффектах свидетелей: раненый для них — другая сторона
+    [settleAllyHurtEvents(entity, hits, options), ALLY_HURT_SUMMARY_LABEL],
+    ...downedExtra,
+  ];
+
+  return extras.reduce(
+    (merged, [events, label]) =>
+      mergeTriggerResults(
+        merged,
+        toDamageEventsTriggerResult(entity, events, label),
+      ),
+    damageResult,
+  );
+}
+
+/**
+ * Игровая система D&D 5e (Ядро правил).
+ * Предоставляет Ядру (Core VTT) абстрагированные методы для работы
+ * с Инициативой, Боевкой и т.д.
  */
 export class Dnd5eVttSystem implements VttSystem {
-  readonly id = 'dnd5e-2014';
+  readonly id = SYSTEM_ID;
 
   readonly name = 'Dungeons & Dragons 5th Edition';
 
-  readonly version = '1.0.0';
+  readonly version = '0.8.318';
 
   /**
-   * Р’С‹РїРѕР»РЅСЏРµС‚ РІР°Р»РёРґР°С†РёСЋ РґР°РЅРЅС‹С… Р°РєС‚РµСЂР° РїРѕ РїСЂР°РІРёР»Р°Рј СЃРёСЃС‚РµРјС‹ D&D 5e.
+   * Выполняет валидацию данных актера по правилам системы D&D 5e.
    *
-   * @param actor РћР±СЉРµРєС‚ Р°РєС‚РµСЂР° РґР»СЏ РІР°Р»РёРґР°С†РёРё
+   * Строение списка эффектов разбирает схема, и её отказ отвергает сохранение
+   * целиком. Нечитаемое значение строки — не повод для отказа: такие строки
+   * встречаются в старых записях, и запрет их сохранять запер бы весь лист.
+   * Движок такую строку просто не применяет, а здесь она попадает в лог мира —
+   * иначе о ней не узнать ниоткуда.
+   *
+   * @param actor Объект актера для валидации
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   validateActor(actor: BaseActor): void {
-    const dndActor = actor as DnDActor;
+    if (!Array.isArray(actor.activeEffects)) {
+      return;
+    }
 
-    if ('activeEffects' in dndActor && Array.isArray(dndActor.activeEffects)) {
-      ActiveEffectsArraySchema.parse(dndActor.activeEffects);
+    // Схема и разбирает список, и типизирует его: дальше `changes` читаются
+    // из её результата, а не из непрозрачной нейтральной базы
+    const effects = ActiveEffectsArraySchema.parse(actor.activeEffects);
 
-      for (const effect of dndActor.activeEffects) {
-        for (const change of effect.changes) {
-          validateFormula(change.value);
+    for (const effect of effects) {
+      for (const change of effect.changes) {
+        // Строка без выбранного ключа заведена ради условия — значения у неё
+        // ещё нет, и ругаться на него рано
+        if (change.key === '') {
+          continue;
+        }
+
+        // Кость-формулы бонус-урона («1к6») числом не считаются вовсе: их
+        // катает бросок, и разбор формулы им не указ — как и в самом пайплайне
+        if (isDiceFormulaValue(change.value)) {
+          continue;
+        }
+
+        const result = validateFormula(change.value);
+
+        if (!result.valid) {
+          console.warn(
+            `[dnd5e] Лист «${actor.name}» (${actor.id}), эффект «${effect.name}», `
+              + `модификатор «${change.key}»: значение "${change.value}" не читается `
+              + `(${result.error}) — строка не применяется`,
+          );
         }
       }
     }
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ С€Р°Р±Р»РѕРЅ РЅРѕРІРѕРіРѕ Р°РєС‚С‘СЂР° D&D 5e РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ (Р±РµР· `id`).
+   * Возвращает шаблон нового актёра D&D 5e по умолчанию (без `id`).
+   *
+   * Копия глубокая: при мелкой вложенные `system`/`token`/массивы остались бы
+   * общими с константой-шаблоном, и правки одного созданного актёра меняли бы
+   * и шаблон, и всех созданных по нему следом.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   createDefaultActor(): Partial<BaseActor> {
-    return { ...DEFAULT_ACTOR };
+    return structuredClone(DEFAULT_ACTOR);
   }
 
   /**
-   * Р’Р°Р»РёРґРёСЂСѓРµС‚ РґР°РЅРЅС‹Рµ Р°РєС‚С‘СЂР° D&D 5e РґР»СЏ С„РѕСЂРјС‹ СЃРѕР·РґР°РЅРёСЏ/СЂРµРґР°РєС‚РёСЂРѕРІР°РЅРёСЏ.
+   * Валидирует данные актёра D&D 5e для формы создания/редактирования.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   validateActorData(actor: Partial<BaseActor>): void {
-    validateDndActorData(actor as Partial<DnDActor>);
+    validateDndActorData(actor);
   }
 
   /**
-   * РќРѕСЂРјР°Р»РёР·СѓРµС‚ С‡Р°СЃС‚РёС‡РЅС‹Рµ РґР°РЅРЅС‹Рµ Р°РєС‚С‘СЂР° D&D 5e (Р·Р°Р¶РёРјР°РµС‚ Р·РЅР°С‡РµРЅРёСЏ РІ РіСЂР°РЅРёС†С‹).
+   * Нормализует частичные данные актёра D&D 5e (зажимает значения в границы).
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   normalizeActorData(actor: Partial<BaseActor>): Partial<BaseActor> {
-    return normalizeDndActorData(actor as Partial<DnDActor>);
+    return normalizeDndActorData(actor);
   }
 
   /**
-   * РЎС‚СЂСѓРєС‚СѓСЂРЅРѕ РІР°Р»РёРґРёСЂСѓРµС‚ РґР°РЅРЅС‹Рµ РїСЂРµРґРјРµС‚Р° D&D 5e С‡РµСЂРµР· Zod-СЃС…РµРјСѓ (РѕР±РѕР±С‰С‘РЅРЅС‹Р№
-   * РєРѕРЅРІРµСЂС‚ + Р»РµРЅРёРІРѕ РїРѕ С‚РёРїСѓ). Р‘СЂРѕСЃР°РµС‚ `Error` РїСЂРё РЅР°СЂСѓС€РµРЅРёРё.
+   * Структурно валидирует данные предмета D&D 5e через Zod-схему (обобщённый
+   * конверт + лениво по типу). Бросает `Error` при нарушении.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   validateItemData(item: unknown): void {
     validateGameItem(item);
   }
 
   /**
-   * РЎС‚СЂРѕРёС‚ Markdown-СЃРІРѕРґРєСѓ РјРµС…Р°РЅРёС‡РµСЃРєРёС… РґР°СЂРѕРІ С‡РµСЂС‚С‹/РїСЂРµРґРјРµС‚Р°/РїСЂРµРґС‹СЃС‚РѕСЂРёРё D&D 5e.
+   * Строит Markdown-сводку механических даров черты/предмета/предыстории D&D 5e.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getFeatGrantsSummary(feat: unknown): string {
-    return buildFeatGrantsSummary(
-      feat as Feature | GameItem | BackgroundDefinition,
-    );
+    return isFeatSummarySource(feat) ? buildFeatGrantsSummary(feat) : '';
   }
 
   /**
-   * Р’С‹С‡РёСЃР»СЏРµС‚ РјРѕРґРёС„РёРєР°С‚РѕСЂ РёРЅРёС†РёР°С‚РёРІС‹ РґР»СЏ D&D 5e СЃ СѓС‡РµС‚РѕРј Р±Р°С„С„РѕРІ Рё РґРµР±Р°С„С„РѕРІ (Active Effects).
+   * Вычисляет модификатор инициативы для D&D 5e с учетом баффов и дебаффов (Active Effects).
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getInitiativeModifier(actor: BaseActor): number {
-    // Р’ D&D СЃРёСЃС‚РµРјРµ РјС‹ С‚РѕС‡РЅРѕ Р·РЅР°РµРј, С‡С‚Рѕ BaseActor РёРјРµРµС‚ СЃС‚СЂСѓРєС‚СѓСЂСѓ DnDActor
-    const dndActor = actor as DnDActor;
+    // Актёр без данных системы в инициативу не вступает: считать её не по чему
+    if (!isDndSceneEntity(actor)) {
+      return 0;
+    }
 
-    // Р’С‹Р·С‹РІР°РµРј РїРѕР»РЅС‹Р№ РїР°Р№РїР»Р°Р№РЅ Р°РєС‚РёРІРЅС‹С… СЌС„С„РµРєС‚РѕРІ, С‡С‚РѕР±С‹ РїРѕР»СѓС‡РёС‚СЊ РёС‚РѕРіРѕРІРѕРµ Р·РЅР°С‡РµРЅРёРµ РёРЅРёС†РёР°С‚РёРІС‹
-    const resolvedStats = resolveActorStats(dndActor);
+    // Вызываем полный пайплайн активных эффектов, чтобы получить итоговое значение инициативы
+    const resolvedStats = resolveActorStats(actor);
 
     return resolvedStats.initiative;
   }
 
   /**
-   * РЎРѕРІРµСЂС€Р°РµС‚ Р±СЂРѕСЃРѕРє РёРЅРёС†РёР°С‚РёРІС‹ (1Рє20 + РјРѕРґРёС„РёРєР°С‚РѕСЂ)
+   * Совершает бросок инициативы (1к20 + модификатор)
    */
   rollInitiative(
     actor: BaseActor,
@@ -283,18 +1798,18 @@ export class Dnd5eVttSystem implements VttSystem {
     const modifier = this.getInitiativeModifier(actor);
 
     if (rollFn) {
-      // РљР»РёРµРЅС‚: Р”РµР»Р°РµРј Р±СЂРѕСЃРѕРє С‡РµСЂРµР· СЃС‚РѕСЂ (DiceRoller)
-      const rollData = rollFn('1Рє20');
+      // Клиент: Делаем бросок через стор (DiceRoller)
+      const rollData = rollFn('1к20');
 
       return {
-        roll: rollData.total, // Р­С‚Рѕ С‡РёСЃС‚РѕРµ Р·РЅР°С‡РµРЅРёРµ РєСѓР±РёРєР° РѕС‚ 1 РґРѕ 20
+        roll: rollData.total, // Это чистое значение кубика от 1 до 20
         modifier,
         total: rollData.total + modifier,
         rollData,
       };
     }
 
-    // РЎРµСЂРІРµСЂ (РёР»Рё РµСЃР»Рё rollFn РЅРµ РїРµСЂРµРґР°РЅ): РђРІС‚РѕРјР°С‚РёС‡РµСЃРєРёР№ РјР°С‚РµРјР°С‚РёС‡РµСЃРєРёР№ Р±СЂРѕСЃРѕРє
+    // Сервер (или если rollFn не передан): Автоматический математический бросок
     const roll = Math.floor(Math.random() * 20) + 1;
 
     return {
@@ -305,135 +1820,469 @@ export class Dnd5eVttSystem implements VttSystem {
   }
 
   /**
-   * РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ СЃРёСЃС‚РµРјС‹ (СЃРµСЂРІРµСЂРЅС‹Р№ lifecycle).
-   * РџСѓСЃС‚Р°СЏ СЂРµР°Р»РёР·Р°С†РёСЏ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ вЂ” РїРµСЂРµРѕРїСЂРµРґРµР»СЏРµС‚СЃСЏ СЃРµСЂРІРµСЂРЅС‹Рј РїРѕРґРєР»Р°СЃСЃРѕРј.
+   * Инициализация системы (серверный lifecycle).
+   * Пустая реализация по умолчанию — переопределяется серверным подклассом.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   init(_api: unknown): void {
-    // РџСѓСЃС‚Р°СЏ СЂРµР°Р»РёР·Р°С†РёСЏ вЂ” override РІ СЃРµСЂРІРµСЂРЅРѕРј РїРѕРґРєР»Р°СЃСЃРµ
+    // Пустая реализация — override в серверном подклассе
   }
 
   /**
-   * РЈРЅРёС‡С‚РѕР¶РµРЅРёРµ СЃРёСЃС‚РµРјС‹ (СЃРµСЂРІРµСЂРЅС‹Р№ lifecycle).
-   * РџСѓСЃС‚Р°СЏ СЂРµР°Р»РёР·Р°С†РёСЏ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ вЂ” РїРµСЂРµРѕРїСЂРµРґРµР»СЏРµС‚СЃСЏ СЃРµСЂРІРµСЂРЅС‹Рј РїРѕРґРєР»Р°СЃСЃРѕРј.
+   * Повторные спасброски хода, ждущие ответа игрока: сущность, эффект и момент
+   * хода. Пока ответа нет, тот же спасбросок на следующей такой же границе
+   * хода не спрашивается второй раз.
    */
-  // eslint-disable-next-line class-methods-use-this
+  private readonly pendingTurnSaveKeys = new Set<string>();
+
+  /**
+   * Разносит ли ядро границы ходов и сущностям вне боя. Пока нет — все их
+   * turn-эффекты истекают по границе раунда (`decrementEffectDurations`); когда
+   * да — только те, чей ход не наступит (свой или наложившего вне боя)
+   */
+  private outsidersGetTurnBoundaries = false;
+
+  /**
+   * Уничтожение системы (серверный lifecycle): ожидания ответов остановленного
+   * мира забываются.
+   */
   destroy(): void {
-    // РџСѓСЃС‚Р°СЏ СЂРµР°Р»РёР·Р°С†РёСЏ вЂ” override РІ СЃРµСЂРІРµСЂРЅРѕРј РїРѕРґРєР»Р°СЃСЃРµ
+    this.pendingTurnSaveKeys.clear();
   }
 
   /**
-   * РџСЂРѕРіРѕРЅСЏРµС‚ РїРµСЂРёРѕРґРёС‡РµСЃРєРёРµ СЌС„С„РµРєС‚С‹ СЃСѓС‰РЅРѕСЃС‚Рё РЅР° РіСЂР°РЅРёС†Рµ С…РѕРґР° (DoT-СѓСЂРѕРЅ +
-   * РїРѕРІС‚РѕСЂРЅС‹Рµ СЃРїР°СЃР±СЂРѕСЃРєРё D&D 5e) Рё РІРѕР·РІСЂР°С‰Р°РµС‚ С„Р»Р°Рі РёР·РјРµРЅРµРЅРёСЏ Рё СЃРІРѕРґРєСѓ РґР»СЏ С‡Р°С‚Р°.
+   * Прогоняет периодические эффекты сущности на границе хода (DoT-урон +
+   * повторные спасброски D&D 5e) и возвращает флаг изменения и сводку для чата.
+   *
+   * Повторный спасбросок сущности без авто-спасбросков спрашивается у игрока:
+   * ход не ждёт, исход приходит отложенным срабатыванием.
    */
-  // eslint-disable-next-line class-methods-use-this
   runTurnEffects(
     entity: SceneEntity,
     timing: 'startOfTurn' | 'endOfTurn',
-  ): { changed: boolean; chatSummary: string | null } {
-    const result = processTurnEffects(entity as DnDSceneEntity, timing);
-    const chatSummary = formatTurnEffectsMessage(entity.name, timing, result);
-
-    return { changed: result.changed, chatSummary };
-  }
-
-  /**
-   * РЎРЅРёРјР°РµС‚ С‚РѕС‡РЅС‹Рµ `turn`-СЌС„С„РµРєС‚С‹ РЅР° РіСЂР°РЅРёС†Рµ С…РѕРґР° СѓС‡Р°СЃС‚РЅРёРєР° `turnActorId`.
-   */
-  // eslint-disable-next-line class-methods-use-this
-  expireTurnEffects(
-    entity: SceneEntity,
-    turnActorId: string,
-    timing: 'start' | 'end',
-  ): boolean {
-    return expireEntityTurnEffects(
-      entity as DnDSceneEntity,
-      turnActorId,
-      timing,
+    context?: SystemTriggerContext,
+  ): SystemDeferredTriggerResult {
+    return withScenePresence(
+      entity,
+      context,
+      settleTurnEffects(entity, timing, context, this.pendingTurnSaveKeys),
     );
   }
 
   /**
-   * РЈРјРµРЅСЊС€Р°РµС‚ РґР»РёС‚РµР»СЊРЅРѕСЃС‚СЊ (РІ СЂР°СѓРЅРґР°С…) РІСЃРµС… СЌС„С„РµРєС‚РѕРІ РЅР° СЃСѓС‰РЅРѕСЃС‚Рё, СЃРЅРёРјР°СЏ РёСЃС‚С‘РєС€РёРµ.
+   * Прогоняет срабатывания «ход наложившего» у эффектов сущности, наложенных
+   * участником `turnActorId`: «повторный спасбросок в конце хода заклинателя».
+   * Спасбросок бросает носитель — у игрока его спрашивают так же, как на его
+   * собственном ходу.
    */
-  // eslint-disable-next-line class-methods-use-this
-  decrementEffectDurations(entity: SceneEntity): boolean {
-    return decrementActorEffectDurations(entity as DnDSceneEntity);
+  runSourceTurnEffects(
+    entity: SceneEntity,
+    turnActorId: string,
+    timing: 'startOfTurn' | 'endOfTurn',
+    context?: SystemTriggerContext,
+  ): SystemDeferredTriggerResult {
+    return withScenePresence(
+      entity,
+      context,
+      settleTurnEffects(
+        entity,
+        timing,
+        context,
+        this.pendingTurnSaveKeys,
+        turnActorId,
+      ),
+    );
   }
 
   /**
-   * РЎРёРЅС…СЂРѕРЅРёР·РёСЂСѓРµС‚ СЌС„С„РµРєС‚С‹ Р·РѕРЅ РїСЂРё РїРµСЂРµРјРµС‰РµРЅРёРё С‚РѕРєРµРЅР° Рё С„РѕСЂРјР°С‚РёСЂСѓРµС‚ СЃРІРѕРґРєСѓ
-   * СЃСЂР°Р±РѕС‚Р°РІС€РёС… С‚СЂРёРіРіРµСЂРѕРІ РґР»СЏ С‡Р°С‚Р° (РјРµС‚РєР° В«РѕР±Р»Р°СЃС‚СЊВ»).
+   * Снимает точные `turn`-эффекты на границе хода участника `turnActorId`.
+   *
+   * Состав боя нужен, чтобы отличить достижимый якорь-источник от недостижимого:
+   * эффект «до конца хода кастера», которого нет в трекере инициативы, ждал бы
+   * хода, который не наступит, — такой якорь деградирует к носителю.
    */
-  // eslint-disable-next-line class-methods-use-this
+  expireTurnEffects(
+    entity: SceneEntity,
+    turnActorId: string,
+    timing: 'start' | 'end',
+    participantIds: ReadonlySet<string>,
+    context?: SystemTriggerContext,
+  ): SystemDeferredTriggerResult {
+    if (!isDndSceneEntity(entity)) {
+      return { changed: false, chatSummary: null };
+    }
+
+    // Ядро принесло границу хода сущности вне боя — значит, разносит их всем:
+    // эффект, который ждёт хода участника, истекает точно, и раунд его больше
+    // не трогает (иначе срок шёл бы дважды)
+    if (!participantIds.has(entity.id)) {
+      this.outsidersGetTurnBoundaries = true;
+    }
+
+    return withScenePresence(
+      entity,
+      context,
+      expireWithConcentration(entity, context, (carrier) =>
+        expireEntityTurnEffects(carrier, turnActorId, timing, participantIds),
+      ),
+    );
+  }
+
+  /**
+   * Уменьшает длительность (в раундах) всех эффектов на сущности, снимая
+   * истёкшие. Истёкшая метка концентрации заканчивает свой каст.
+   *
+   * У сущности вне боя новый раунд служит и границей хода: своего хода у неё
+   * нет, и эффект «до конца следующего хода» на ней иначе не истёк бы никогда.
+   * Эффект, который ждёт хода наложившего-участника, раунд не трогает, если
+   * ядро приносит границы ходов и сущностям вне боя: он истекает точно.
+   */
+  decrementEffectDurations(
+    entity: SceneEntity,
+    context?: SystemTriggerContext,
+  ): SystemDeferredTriggerResult {
+    if (!isDndSceneEntity(entity)) {
+      return { changed: false, chatSummary: null };
+    }
+
+    // Без ответа ядра «в бою ли сущность» границу раунда за ход не считаем:
+    // участнику боя его ходы придут сами
+    const isOutsider =
+      context?.isInCombat !== undefined && !context.isInCombat(entity);
+
+    /**
+     * В бою ли сущность с таким id — по живой записи мира.
+     *
+     * @param entityId - id сущности
+     * @returns `true`, если она участник идущего боя
+     */
+    const isCombatantId = (entityId: string): boolean => {
+      const other = context?.getEntity?.(entityId);
+
+      return other !== undefined && context?.isInCombat?.(other) === true;
+    };
+
+    return withScenePresence(
+      entity,
+      context,
+      expireWithConcentration(entity, context, (carrier) => {
+        const roundsChanged = decrementActorEffectDurations(carrier);
+
+        const turnsChanged = isOutsider
+          ? expireOutsiderTurnEffects(
+              carrier,
+              this.outsidersGetTurnBoundaries ? isCombatantId : undefined,
+            )
+          : false;
+
+        return roundsChanged || turnsChanged;
+      }),
+    );
+  }
+
+  /**
+   * Снимает с сущности эффекты закончившихся кастов заклинателя: наложенные им
+   * и с `castId` из списка. Эффекты других заклинателей не трогаются.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  removeCastEffects(
+    entity: SceneEntity,
+    casterId: string,
+    castIds: ReadonlySet<string>,
+    context?: SystemTriggerContext,
+  ): SystemDeferredTriggerResult {
+    if (!isDndSceneEntity(entity)) {
+      return { changed: false, chatSummary: null };
+    }
+
+    const effects = entity.activeEffects ?? [];
+    const kept = withoutCastEffects(effects, casterId, castIds);
+
+    if (kept.length === effects.length) {
+      return { changed: false, chatSummary: null };
+    }
+
+    const removed = effects.filter((effect) => !kept.includes(effect));
+    const hpBefore = resolveEntityCurrentHp(entity);
+
+    entity.activeEffects = kept;
+
+    const removal: SystemDeferredTriggerResult = {
+      changed: true,
+      chatSummary: `${entity.name}: ${CAST_ENDED_SUMMARY_PREFIX}${removed.map((effect) => effect.name).join(', ')}`,
+    };
+
+    return withScenePresence(
+      entity,
+      context,
+      mergeTriggerResults(
+        removal,
+        runCastEndTriggers(entity, removed, hpBefore, context),
+      ),
+    );
+  }
+
+  /**
+   * Сущность записана — и правкой листа тоже: эффект «убран со сцены» вписали
+   * руками или стёрли. Других хуков с возможностями ядра правка листа не будит,
+   * а фишка должна уйти или вернуться сразу. Сама сущность здесь не меняется.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  settleEntityChange(
+    entity: SceneEntity,
+    context?: SystemTriggerContext,
+  ): SystemDeferredTriggerResult {
+    return withScenePresence(entity, context, {
+      changed: false,
+      chatSummary: null,
+    });
+  }
+
+  /**
+   * Мастер возвращает убранную фишку меткой на сцене: снимает с существа
+   * эффекты «убран со сцены». Иначе они остались бы, и фишка ушла бы снова.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  releaseOffSceneToken(entity: SceneEntity): SystemDeferredTriggerResult {
+    const note = isDndSceneEntity(entity)
+      ? releaseOffSceneEffects(entity)
+      : null;
+
+    return { changed: note !== null, chatSummary: note };
+  }
+
+  /**
+   * Событие правил от клиента: «прервать концентрацию» — закончить каст может
+   * только тот, кто управляет заклинателем; бросок атаки и кнопка «При
+   * действии» — срабатывания, которые выполняет сервер.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  handleClientEvent(
+    payload: unknown,
+    context: SystemClientEventContext,
+  ): SystemRelatedTriggerResult[] {
+    const event = parseSystemClientEvent(payload);
+
+    if (!event) {
+      return [];
+    }
+
+    if (event.type === 'attackRoll') {
+      return settleAttackRollEvent(event, context).map((outcome) =>
+        withScenePresence(outcome.entity, context, outcome),
+      );
+    }
+
+    if (event.type === 'effectAction') {
+      return settleEffectActionEvent(event, context).map((outcome) =>
+        withScenePresence(outcome.entity, context, outcome),
+      );
+    }
+
+    const caster = context.getEntity(event.casterId);
+
+    if (caster && context.canControl(caster)) {
+      context.endCasts?.(event.casterId, event.castIds);
+    }
+
+    return [];
+  }
+
+  /**
+   * Разбирает эффекты зоны, которую прислал игрок (зона заклинания на месте
+   * шаблона). Негодный список целиком отвергается: зона с «потерянными»
+   * эффектами молча делала бы не то, что заклинание.
+   *
+   * @param raw - эффекты из черновика области
+   * @returns проверенные эффекты или `null`
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  parseAreaEffects(raw: unknown): ActiveEffect[] | null {
+    const parsed = ActiveEffectsArraySchema.safeParse(raw);
+
+    return parsed.success ? parsed.data : null;
+  }
+
+  /**
+   * Синхронизирует эффекты зон при перемещении токена и форматирует сводку
+   * сработавших триггеров для чата (метка «область»).
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   syncAreaEffects(
     entity: SceneEntity,
     previousAreaIds: ReadonlySet<string>,
     currentAreaIds: ReadonlySet<string>,
     areas: CustomArea[],
-    options?: { triggerOneShots?: boolean },
-  ): { changed: boolean; chatSummary: string | null } {
+    options?: SystemTriggerContext & {
+      triggerOneShots?: boolean;
+      alreadyEnteredAreaIds?: ReadonlySet<string>;
+    },
+  ): SystemDeferredTriggerResult {
+    if (!isDndSceneEntity(entity)) {
+      return { changed: false, chatSummary: null };
+    }
+
+    const hpBefore = resolveEntityCurrentHp(entity);
+
     const result = syncActorAreaEffects(
-      entity as DnDSceneEntity,
+      entity,
       previousAreaIds,
       currentAreaIds,
       areas,
+      {
+        ...options,
+        resolveAmbientEffects: toAmbientResolver(options),
+        listEntitiesInArea: toAreaLister(options),
+        sight: toSceneSight(options),
+        ...toSceneMoveOptions(entity, options),
+      },
+    );
+
+    return toEntityTriggerResult(
+      entity,
+      result,
+      hpBefore,
+      AREA_SUMMARY_LABEL,
       options,
     );
-
-    const chatSummary = formatEffectsSummary(
-      entity.name,
-      'РѕР±Р»Р°СЃС‚СЊ',
-      result.damageOutcomes,
-      result.saveOutcomes,
-      (save) => (save.passed ? 'вњ“ СЃРїР°СЃ' : 'вњ— РїСЂРѕРІР°Р»'),
-    );
-
-    return { changed: result.changed, chatSummary };
   }
 
   /**
-   * РћР±СЂР°Р±Р°С‚С‹РІР°РµС‚ СЂР°Р·РѕРІС‹Рµ С‚СЂРёРіРіРµСЂ-Р°СѓСЂС‹ РїСЂРё РїРµСЂРµРјРµС‰РµРЅРёРё С‚РѕРєРµРЅР° Рё С„РѕСЂРјР°С‚РёСЂСѓРµС‚ РїРѕ
-   * РєР°Р¶РґРѕР№ Р·Р°С‚СЂРѕРЅСѓС‚РѕР№ СЃСѓС‰РЅРѕСЃС‚Рё СЃРІРѕРґРєСѓ РґР»СЏ С‡Р°С‚Р° (РјРµС‚РєР° В«Р°СѓСЂР°В»).
+   * Обрабатывает разовые триггер-ауры при перемещении токена и форматирует по
+   * каждой затронутой сущности сводку для чата (метка «аура»).
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   applyAuraTriggerEffects(
     scene: { tokens?: Token[]; gridSettings?: GridSettings },
     movedToken: Token,
     movedEntity: SceneEntity,
     previousToken: Token | undefined,
     getEntity: (actorId: string) => SceneEntity | undefined,
-  ): Array<{
-    entity: SceneEntity;
-    changed: boolean;
-    chatSummary: string | null;
-  }> {
+    context?: SystemTriggerContext & { alreadyEnteredAuraKeys?: Set<string> },
+  ): Array<SystemDeferredTriggerResult & { entity: SceneEntity }> {
+    if (!isDndSceneEntity(movedEntity)) {
+      return [];
+    }
+
+    const resolveEntity = toDndEntityResolver(getEntity);
+
+    // Хиты до срабатываний у всех, кого аура может задеть: «хиты упали до 0»
+    // знает только сравнение с ними
+    const hpBefore = new Map(
+      [
+        movedEntity,
+        ...(scene.tokens ?? []).map((token) => resolveEntity(token.actorId)),
+      ]
+        .filter((entity): entity is DnDSceneEntity => entity !== undefined)
+        .map((entity) => [entity.id, resolveEntityCurrentHp(entity)]),
+    );
+
     const outcomes = computeAuraTriggerEffects(
       scene,
       movedToken,
-      movedEntity as DnDSceneEntity,
+      movedEntity,
       previousToken,
-      (actorId) => getEntity(actorId) as DnDSceneEntity | undefined,
+      resolveEntity,
+      {
+        requestRoll: context?.requestRoll,
+        resolveAmbientEffects: toAmbientResolver(context),
+        isInCombat: context?.isInCombat,
+        getActiveTurnActorId: context?.getActiveTurnActorId,
+        getCombatRound: context?.getCombatRound,
+        sight: toSceneSight(context),
+        alreadyEnteredAuraKeys: context?.alreadyEnteredAuraKeys,
+        listEntitiesInArea: toAreaLister(context),
+      },
     );
 
     return outcomes.map((outcome) => ({
       entity: outcome.entity,
-      changed: outcome.changed,
-      chatSummary: formatEffectsSummary(
-        outcome.entity.name,
-        'Р°СѓСЂР°',
-        outcome.damageOutcomes,
-        outcome.saveOutcomes,
-        (save) => (save.passed ? 'вњ“ СЃРїР°СЃ' : 'вњ— РїСЂРѕРІР°Р»'),
+      ...toEntityTriggerResult(
+        outcome.entity,
+        outcome,
+        hpBefore.get(outcome.entity.id) ?? 0,
+        AURA_SUMMARY_LABEL,
+        context,
       ),
     }));
   }
 
   /**
-   * РџСЂРѕРІРµСЂСЏРµС‚ РїРѕРїР°РґР°РЅРёРµ С‚РѕС‡РєРё РІ РѕР±Р»Р°СЃС‚СЊ С€Р°Р±Р»РѕРЅР° РёР·РјРµСЂРµРЅРёСЏ РїРѕ РіРµРѕРјРµС‚СЂРёРё D&D 5e
-   * (РєСЂСѓРі/РєРѕРЅСѓСЃ/РєСѓР±/Р»РёРЅРёСЏ).
+   * Срабатывания «прошёл N футов» за одно перемещение фишки: длину пути уже
+   * измерило ядро. Урон, который носитель получил на ходу, будит его события
+   * урона так же, как урон зоны.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  applyMovementEffects(
+    entity: SceneEntity,
+    movement: SystemTokenMovement,
+    context?: SystemTriggerContext,
+  ): SystemDeferredTriggerResult {
+    if (!isDndSceneEntity(entity)) {
+      return { changed: false, chatSummary: null };
+    }
+
+    const hpBefore = resolveEntityCurrentHp(entity);
+    const options = buildTriggerEventOptions(entity, context);
+
+    // «За ход одно из трёх»: своё перемещение в свой ход — трата хода, после
+    // него действие и бонусное действие недоступны. Толчок и телепорт
+    // правилами — не оно
+    const moveSpend =
+      !movement.forced
+      && movement.distance > 0
+      && options.inCombat
+      && options.activeTurnActorId === entity.id
+        ? recordActionSpend(entity, 'move', {
+            ambientEffects: options.ambientEffects,
+          })
+        : undefined;
+
+    if (moveSpend) {
+      entity.system.effectUsage = moveSpend;
+    }
+
+    const events = settleMovementEvents(
+      entity,
+      {
+        distance: movement.distance,
+        forced: movement.forced,
+        offset: {
+          dx: movement.to.x - movement.from.x,
+          dy: movement.to.y - movement.from.y,
+        },
+      },
+      options,
+    );
+
+    const settled = toEntityTriggerResult(
+      entity,
+      events,
+      hpBefore,
+      MOVEMENT_SUMMARY_LABEL,
+      context,
+    );
+
+    const own = moveSpend ? { ...settled, changed: true } : settled;
+
+    // Действия, отданные другим («урон тому, кто рядом»), уходят в мир
+    // другими сторонами — снимок пишет только перемещённая сущность
+    const { related } = toDamageEventsTriggerResult(
+      entity,
+      events,
+      MOVEMENT_SUMMARY_LABEL,
+    );
+
+    return related && related.length > 0
+      ? { ...own, related: [...(own.related ?? []), ...related] }
+      : own;
+  }
+
+  /**
+   * Проверяет попадание точки в область шаблона измерения по геометрии D&D 5e
+   * (круг/конус/куб/линия).
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   isPointInTemplate(
     pointX: number,
     pointY: number,
@@ -444,163 +2293,482 @@ export class Dnd5eVttSystem implements VttSystem {
   }
 
   /**
-   * РњРёРЅРёРјР°Р»СЊРЅС‹Р№ Р±СЂРѕСЃРѕРє РєСѓР±РёРєРѕРІРѕР№ С„РѕСЂРјСѓР»С‹ СѓСЂРѕРЅР° D&D (СЃСѓРјРјР° + РІС‹РїР°РІС€РёРµ Р·РЅР°С‡РµРЅРёСЏ).
+   * Минимальный бросок кубиковой формулы урона D&D (сумма + выпавшие значения).
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   rollDamageFormula(formula: string): { total: number; values: number[] } {
     return rollDamageFormulaImpl(formula);
   }
 
   /**
-   * РЎРѕР±РёСЂР°РµС‚ РІСЃРµ Р°СѓСЂР°-СЌС„С„РµРєС‚С‹ СЃСѓС‰РЅРѕСЃС‚Рё (РЅР° СЃР°РјРѕР№ СЃСѓС‰РЅРѕСЃС‚Рё + СЃ СЌРєРёРїРёСЂРѕРІРєРё).
+   * Последнее слово системы о форме условия ауры (VTTG 0.9.601+): ядро кладёт
+   * накрытому эффект ауры целиком, а действовать у него должны только числа,
+   * флаги и их условия — остальное система берёт из списка аур, и по обоим
+   * спискам оно сработало бы дважды. Старое ядро хук не зовёт и кладёт
+   * урезанную запись, как раньше.
+   *
+   * @param condition - условие, собранное ядром из эффекта ауры
+   * @returns условие для `activeEffects` накрытого
    */
-  // eslint-disable-next-line class-methods-use-this
-  collectAuraEffects(entity: SceneEntity): BaseActiveEffect[] {
-    return collectAllAuraEffects(entity as DnDSceneEntity);
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  shapeAuraCondition(condition: BaseActiveEffect): BaseActiveEffect {
+    return isDnDEffect(condition) ? shapeAuraCondition(condition) : condition;
   }
 
   /**
-   * Р’С‹С‡РёСЃР»СЏРµС‚ РІРЅРµС€РЅРёРµ (ambient) Р°СѓСЂР°-СЌС„С„РµРєС‚С‹, РЅР°РєСЂС‹РІР°СЋС‰РёРµ С†РµР»РµРІРѕР№ С‚РѕРєРµРЅ.
+   * Собирает все аура-эффекты сущности (на самой сущности + с экипировки).
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  collectAuraEffects(entity: SceneEntity): BaseActiveEffect[] {
+    return isDndSceneEntity(entity) ? collectAllAuraEffects(entity) : [];
+  }
+
+  /**
+   * Вычисляет внешние (ambient) аура-эффекты, накрывающие целевой токен.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   calculateAmbientAuras(
     targetToken: Token,
     sources: Array<{ token: Token; effects: BaseActiveEffect[] }>,
     gridSettings: GridSettings,
   ): BaseActiveEffect[] {
-    // Р“СЂР°РЅРёС†С‹ СЃРёСЃС‚РµРјС‹ D&D: РЅРµР№С‚СЂР°Р»СЊРЅС‹Рµ СЌС„С„РµРєС‚С‹ РєРѕРЅС‚СЂР°РєС‚Р° вЂ” СЌС‚Рѕ D&D-СЌС„С„РµРєС‚С‹
-    // (С‚Р° Р¶Рµ РґРѕРІРµСЂРµРЅРЅРѕСЃС‚СЊ, С‡С‚Рѕ Рё `entity as DnDSceneEntity` РІС‹С€Рµ).
-    return computeAmbientAuras(
-      targetToken,
-      sources as Array<{ token: Token; effects: ActiveEffect[] }>,
-      gridSettings,
-    );
+    // Границы системы D&D: нейтральные эффекты контракта — это D&D-эффекты
+    // (`isDnDEffect` — доверенный шов системы к своим же данным).
+    const dndSources = sources.map((source) => ({
+      token: source.token,
+      effects: source.effects.filter(isDnDEffect),
+    }));
+
+    return computeAmbientAuras(targetToken, dndSources, gridSettings);
   }
 
   /**
-   * РЎСѓРјРјР°СЂРЅР°СЏ СЃРєРѕСЂРѕСЃС‚СЊ СЃСѓС‰РЅРѕСЃС‚Рё РїРѕ РІСЃРµРј СЂРµР¶РёРјР°Рј РґРІРёР¶РµРЅРёСЏ СЃ СѓС‡С‘С‚РѕРј СЌС„С„РµРєС‚РѕРІ вЂ”
-   * СЏРґСЂРѕ РёСЃРїРѕР»СЊР·СѓРµС‚ РµС‘ РєР°Рє РіРµР№С‚ В«РјРѕР¶РµС‚ Р»Рё С‚РѕРєРµРЅ РґРІРёРіР°С‚СЊСЃСЏВ» (0 вЂ” РЅРµР»СЊР·СЏ).
+   * Суммарная скорость сущности по всем режимам движения с учётом эффектов —
+   * ядро использует её как гейт «может ли токен двигаться» (0 — нельзя).
+   *
+   * Ауры с карты приходят отдельным списком: своими они сущности не являются, и
+   * без них гейт считает не то же, что показывает лист, — аура, дающая скорость
+   * неходячему, на листе видна, а токен ею не двинется.
+   *
+   * Хост передаёт их с VTTG 0.9.637 — и клиент (из своего стора аур), и
+   * сервер. На
+   * хосте старше аргумент не приходит, и гейт считает по одной сущности.
+   *
+   * @param entity - сущность токена
+   * @param ambientEffects - эффекты аур, накрывающих токен
    */
-  // eslint-disable-next-line class-methods-use-this
-  getTotalMovementSpeed(entity: SceneEntity): number {
-    const dndEntity = entity as DnDSceneEntity;
-    const activeEffects = collectActiveEffects(dndEntity);
-    const { movement } = resolveActorStats(dndEntity, activeEffects);
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  getTotalMovementSpeed(
+    entity: SceneEntity,
+    ambientEffects: readonly BaseActiveEffect[] = [],
+  ): number {
+    // Сущность без данных системы правилами D&D не двигается: считать её
+    // скорость не по чему, и ядро получит 0 вместо ошибки в обработчике хода.
+    // У реквизита и декораций это норма, а вот лист с характеристиками не
+    // числами так замирает молча — поэтому он и назван в предупреждении
+    if (!isDndSceneEntity(entity)) {
+      warnUnreadableEntity(entity);
 
-    return (
-      (movement.walk || 0)
-      + (movement.fly || 0)
-      + (movement.swim || 0)
-      + (movement.climb || 0)
-      + (movement.burrow || 0)
+      return 0;
+    }
+
+    const stats = resolveActorStats(
+      entity,
+      collectDndAmbientEffects(ambientEffects),
     );
+
+    // «За ход одно из трёх»: после действия или бонусного действия
+    // перемещаться в этот ход уже нельзя
+    return isTurnMovementSpent(entity, stats.activeFlags)
+      ? 0
+      : resolveTotalMovementSpeed(stats);
   }
 
   /**
-   * РџСЂРёРјРµРЅСЏРµС‚ СѓСЂРѕРЅ/Р»РµС‡РµРЅРёРµ Рє СЃСѓС‰РЅРѕСЃС‚Рё D&D 5e (РјСѓС‚РёСЂСѓРµС‚ РҐРџ СЃ СѓС‡С‘С‚РѕРј Р·Р°С‰РёС‚ Рё
-   * РІСЂРµРјРµРЅРЅС‹С… РҐРџ) Рё РІРѕР·РІСЂР°С‰Р°РµС‚ СЃРІРѕРґРєСѓ РёР·РјРµРЅРµРЅРёСЏ.
+   * Дальность хода сущности за один ход — ядро красит по ней маршрут токена.
+   *
+   * Скорость по правилам D&D 2024 — это Скорость ходьбы. Существо, которое
+   * ходить не умеет (парящее, плавающее, роющее), перемещается своим режимом,
+   * поэтому при нулевой ходьбе берётся самый быстрый из остальных: иначе у
+   * дракона в полёте зона хода схлопнулась бы в точку.
+   *
+   * «Рывок» даёт прибавку, равную Скорости, — отсюда удвоение предела.
+   *
+   * Ауры с карты приходят отдельным списком по той же причине, что и у
+   * {@link getTotalMovementSpeed}; хост передаёт их с VTTG 0.9.637.
+   *
+   * @param entity - сущность токена
+   * @param ambientEffects - эффекты аур, накрывающих токен
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  getMovementRange(
+    entity: SceneEntity,
+    ambientEffects: readonly BaseActiveEffect[] = [],
+  ): MovementRange | null {
+    // Сущность без данных системы считать не по чему
+    if (!isDndSceneEntity(entity)) {
+      return null;
+    }
+
+    const { movement, activeFlags } = resolveActorStats(
+      entity,
+      collectDndAmbientEffects(ambientEffects),
+    );
+
+    // Ход потрачен на действие под «одним из трёх» — запаса хода нет
+    if (isTurnMovementSpent(entity, activeFlags)) {
+      return { base: 0, extended: 0 };
+    }
+
+    const base =
+      movement.walk
+      || Math.max(
+        movement.fly || 0,
+        movement.swim || 0,
+        movement.climb || 0,
+        movement.burrow || 0,
+      );
+
+    if (base <= 0) {
+      return { base: 0, extended: 0 };
+    }
+
+    return { base, extended: base * 2 };
+  }
+
+  /**
+   * Множитель цены клетки внутри зоны — труднопроходимая местность.
+   *
+   * Правило мастер задаёт строкой модификатора `terrain.movementCost` в
+   * эффектах зоны, поэтому читается оно отсюда, а не из полей самой зоны.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  getAreaMovementCost(area: CustomArea): number {
+    return resolveAreaTerrainCost(area);
+  }
+
+  /**
+   * Не смотрит ли сущность на труднопроходимость вовсе (флаг
+   * `terrain.ignoreDifficult` — сапоги, черта, форма движения).
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  entityIgnoresTerrainCost(entity: SceneEntity): boolean {
+    // Сущность без данных системы правилами D&D не описана: считать её
+    // игнорирующей нельзя, иначе болото перестало бы работать на всех подряд
+    if (!isDndSceneEntity(entity)) {
+      return false;
+    }
+
+    return entityIgnoresTerrainCostImpl(entity);
+  }
+
+  /**
+   * Зрение сущности по правилам D&D — хук сцены приложения: тёмное зрение от
+   * эффектов, предметов и умений поверх настроек токена. Ядро, которое хука
+   * ещё не знает, его просто не зовёт — сцена тогда видит только токен.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  resolveEntityVision(entity: SceneEntity): DndEntityVision | undefined {
+    return isDndSceneEntity(entity)
+      ? resolveEntityVisionImpl(entity)
+      : undefined;
+  }
+
+  /**
+   * Свет сущности по правилам D&D — самый сильный свет действующих эффектов
+   * поверх света фишки. Хук для сцены приложения по образцу
+   * `resolveEntityVision`: ядро зовёт его при расчёте света фишки с VTTG 0.9.580;
+   * на хосте старше сцена видит только
+   * свет фишки.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук для ядра: вызывается на экземпляре системы
+  resolveEntityLight(entity: SceneEntity): DndEntityLight | undefined {
+    return isDndSceneEntity(entity)
+      ? resolveEntityLightImpl(entity)
+      : undefined;
+  }
+
+  /**
+   * Снимает боевое состояние сущности D&D 5e (ХП и активные эффекты) для
+   * отправки на сервер узким каналом `entity:apply-combat-state`.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  pickCombatState(entity: SceneEntity): DndCombatState | undefined {
+    // Снимок сущности без данных системы не собрать, а выдумывать его нельзя —
+    // он уходит на сервер и записывается в мир. `undefined` — штатный ответ
+    // контракта: ядро откатится на полную замену сущности.
+    return isDndSceneEntity(entity) ? pickCombatStateImpl(entity) : undefined;
+  }
+
+  /**
+   * Записывает боевое состояние в сущность D&D 5e на сервере, проверив
+   * пришедший от клиента снимок.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  applyCombatState(entity: SceneEntity, state: unknown): boolean {
+    return isDndSceneEntity(entity)
+      ? applyCombatStateImpl(entity, state)
+      : false;
+  }
+
+  /**
+   * Записывает боевой снимок и прогоняет события урона по его ударам. Удары
+   * урезаются до того, что сущность действительно потеряла: снимок пришёл от
+   * клиента.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  settleCombatState(
+    entity: SceneEntity,
+    state: unknown,
+    context?: SystemTriggerContext,
+  ): SystemCombatStateResult {
+    if (!isDndSceneEntity(entity)) {
+      return REJECTED_COMBAT_STATE;
+    }
+
+    const hpBefore = resolveEntityCurrentHp(entity);
+    const totalBefore = hpBefore + resolveEntityTempHp(entity);
+
+    const effectsBefore = [...(entity.activeEffects ?? [])];
+
+    const effectIdsBefore = new Set(effectsBefore.map((effect) => effect.id));
+
+    const written = writeCombatState(entity, state);
+
+    // Причину отказа называем ядру (VTTG 0.9.643): «менять нечего» оно
+    // пропускает молча, о негодном снимке предупреждает
+    if (written !== 'applied') {
+      return { ...REJECTED_COMBAT_STATE, rejection: written };
+    }
+
+    // Подъём хитов закрывает серию спасбросков от смерти, падение — начинает
+    syncDeathSavesWithHp(entity, hpBefore);
+
+    // Запрет концентрации начал действовать («Ярость» включилась) — текущая
+    // концентрация прерывается сразу, а не на следующем уроне
+    const blockedCasts = listBlockedConcentrationCasts(entity);
+
+    if (blockedCasts.length > 0) {
+      context?.endCasts?.(entity.id, blockedCasts);
+    }
+
+    const newEffectIds = new Set(
+      (entity.activeEffects ?? [])
+        .map((effect) => effect.id)
+        .filter((effectId) => !effectIdsBefore.has(effectId)),
+    );
+
+    const loss =
+      totalBefore
+      - resolveEntityCurrentHp(entity)
+      - resolveEntityTempHp(entity);
+
+    const rawHits = isRecord(state) ? parseDamageHits(state.damage) : [];
+    const hits = clampDamageHits(rawHits, loss);
+
+    const damageResult = withDamageEvents(
+      entity,
+      hpBefore,
+      hits,
+      context,
+      { changed: true, chatSummary: null },
+      newEffectIds,
+      rawHits,
+    );
+
+    const settled = settleSnapshotEvents(entity, damageResult, {
+      hpBefore,
+      hits,
+      newEffectIds,
+      effectsBefore,
+      options: buildTriggerEventOptions(entity, context),
+    });
+
+    return withScenePresence(entity, context, { accepted: true, ...settled });
+  }
+
+  /**
+   * Применяет урон/лечение к сущности D&D 5e (мутирует ХП с учётом защит и
+   * временных ХП) и возвращает сводку изменения.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   applyDamageToEntity(
     entity: SceneEntity,
     amount: number,
     isHealing: boolean,
     damageType?: string,
+    details?: unknown,
   ): DamageApplyResult {
+    // Сущность без данных системы урона не получает: её запас хитов неизвестен,
+    // и выдуманное «после» ушло бы в метку и в чат как настоящее
+    if (!isDndSceneEntity(entity)) {
+      return { actorName: entity.name, hpBefore: 0, hpAfter: 0 };
+    }
+
+    // Ядро правит здесь свою копию цели и шлёт её боевым снимком: основа
+    // копии превращает снимок в разницу эффектов и журнала, и конец каста,
+    // снявший эффекты после копии, не откатывается
+    recordCombatBaseline(entity, entity);
+
     return applyTargetDamageImpl(
-      entity as DnDSceneEntity,
+      entity,
       amount,
       isHealing,
       damageType,
+      details,
     );
   }
 
   /**
-   * РќР°РєР»Р°РґС‹РІР°РµС‚ СЌС„С„РµРєС‚С‹ РЅР° СЃСѓС‰РЅРѕСЃС‚СЊ D&D 5e (РёРјРјСѓРЅРёС‚РµС‚С‹, condition-СЃР±РѕСЂРєР°,
-   * СЃР»РёСЏРЅРёРµ) Рё РІРѕР·РІСЂР°С‰Р°РµС‚ РѕР±РЅРѕРІР»С‘РЅРЅС‹Р№ СЃРїРёСЃРѕРє `activeEffects`.
+   * Накладывает эффекты на сущность D&D 5e (иммунитеты, condition-сборка,
+   * слияние) и возвращает обновлённый список `activeEffects`.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   applyEffectsToEntity(
     entity: SceneEntity,
     effects: BaseActiveEffect[],
     origin: string,
   ): BaseActiveEffect[] {
+    if (!isDndSceneEntity(entity) || !isEffectOrigin(origin)) {
+      return entity.activeEffects ?? [];
+    }
+
+    // Основа — до правки списка: ядро присвоит копии итог и пошлёт её снимком
+    recordCombatBaseline(entity, entity);
+
     return applyEffectsToEntityImpl(
-      entity as DnDSceneEntity,
-      effects as ActiveEffect[],
-      origin as EffectOrigin,
+      entity,
+      effects.filter(isDnDEffect),
+      origin,
     );
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ РёС‚РѕРіРѕРІС‹Р№ РљР” СЃСѓС‰РЅРѕСЃС‚Рё D&D 5e СЃ СѓС‡С‘С‚РѕРј РєРѕРЅС‚РµРєСЃС‚Р° РІС…РѕРґСЏС‰РµР№ Р°С‚Р°РєРё.
+   * Возвращает итоговый КД сущности D&D 5e с учётом контекста входящей атаки.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getEntityArmorClass(entity: SceneEntity, attackContext?: unknown): number {
-    return getEntityArmorClassImpl(
-      entity as DnDSceneEntity,
-      attackContext as IncomingAttackContext | undefined,
-    );
+    if (!isDndSceneEntity(entity)) {
+      return BASE_UNARMORED_AC;
+    }
+
+    return getEntityArmorClassImpl(entity, parseAttackContext(attackContext));
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ РЅР°Р±РѕСЂ Р°РєС‚РёРІРЅС‹С… Р±РѕРµРІС‹С… С„Р»Р°РіРѕРІ СЃСѓС‰РЅРѕСЃС‚Рё D&D 5e.
+   * Возвращает набор активных боевых флагов сущности D&D 5e.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getEntityActiveFlags(entity: SceneEntity): ReadonlySet<string> {
-    return getEntityActiveFlagsImpl(entity as DnDSceneEntity);
+    return isDndSceneEntity(entity)
+      ? getEntityActiveFlagsImpl(entity)
+      : new Set<string>();
   }
 
   /**
-   * Р’С‹С‡РёСЃР»СЏРµС‚ РёС‚РѕРіРѕРІС‹Рµ С…Р°СЂР°РєС‚РµСЂРёСЃС‚РёРєРё Р°РєС‚РµСЂР° СЃ СѓС‡РµС‚РѕРј Р°РєС‚РёРІРЅС‹С… СЌС„С„РµРєС‚РѕРІ.
+   * Переносит предмет из инвентаря отправителя в инвентарь получателя.
+   *
+   * Правило переноса живёт в движке ({@link transferItem}) и одно на все пути:
+   * этот метод контракта зовёт ядро при перетаскивании токена на токен, а тот
+   * же расчёт вызывает лист, на который предмет бросили мышью. Стороны — любые
+   * сущности с инвентарём, а не только актёры.
+   *
+   * Права на перенос (владелец или ГМ) проверяет ядро — это правило VTT, а не
+   * D&D, поэтому здесь их нет.
+   *
+   * @param source - сущность-отправитель
+   * @param target - сущность-получатель
+   * @param item - переносимый предмет
+   * @returns обновлённые копии обеих сущностей либо `null`, если перенос невозможен
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  transferItemBetweenEntities(
+    source: SceneEntity,
+    target: SceneEntity,
+    item: BaseGameItem,
+  ): { source: SceneEntity; target: SceneEntity } | null {
+    return transferItem(source, target, item);
+  }
+
+  /**
+   * Вычисляет итоговые характеристики актера с учетом активных эффектов.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   resolveActorStats(
     actor: BaseActor,
     effects?: readonly unknown[],
   ): Record<string, unknown> {
-    return resolveActorStats(
-      actor as DnDActor,
-      effects as ActiveEffect[],
-    ) as unknown as Record<string, unknown>;
+    if (!isDndSceneEntity(actor)) {
+      return {};
+    }
+
+    const dndEffects = effects?.filter(isActiveEffect);
+
+    // Копией, а не приведением: контракт ядра объявляет итог свободной записью,
+    // а `ResolvedActorStats` — интерфейс без индексной сигнатуры, и структурно
+    // он такой записи не соответствует. Тот же приём, что и в ядре для
+    // `BaseGameItem`: туда, где ждут свободную форму, значение идёт копией.
+    return { ...resolveActorStats(actor, dndEffects) };
   }
 
   /**
-   * РЎРѕР±РёСЂР°РµС‚ РІСЃРµ Р°РєС‚РёРІРЅС‹Рµ СЌС„С„РµРєС‚С‹, РїСЂРёРІСЏР·Р°РЅРЅС‹Рµ Рє Р°РєС‚РµСЂСѓ.
+   * Собирает все активные эффекты, привязанные к актеру.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   collectActiveEffects(actor: BaseActor): readonly unknown[] {
-    return collectActiveEffects(actor as DnDActor);
+    return isDndSceneEntity(actor) ? collectActiveEffects(actor) : [];
   }
 
   /**
-   * РќРѕСЂРјР°Р»РёР·СѓРµС‚ РїРѕР»РЅРѕРіРѕ Р°РєС‚С‘СЂР° D&D РЅР° РјРµСЃС‚Рµ РїСЂРё Р·Р°РіСЂСѓР·РєРµ (РјРёРіСЂР°С†РёСЏ С„РѕСЂРјР°С‚Р°).
+   * Нормализует полного актёра D&D на месте при загрузке (миграция формата).
+   *
+   * Здесь же пересчитываются состояния с правилом «вешать автоматически»
+   * (`autoConditions.ts`): Ядро прогоняет персонажа через этот метод на каждой
+   * записи, и значки сверяются с сущностью, каким бы путём она ни поменялась.
+   * По той же причине здесь закрывается серия спасбросков от смерти у
+   * персонажа с хитами выше нуля: окно хитов и отдых пишут мимо боевого снимка.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   normalizeActor(actor: BaseActor): void {
-    normalizeActor(actor as DnDActor);
+    normalizeActor(actor);
+
+    if (isDndSceneEntity(actor)) {
+      syncAutoAppliedConditions(actor);
+      closeDeathSavesAboveZeroHp(actor);
+    }
   }
 
   /**
-   * Р’С‹РїРѕР»РЅСЏРµС‚ РЅРѕСЂРјР°Р»РёР·Р°С†РёСЋ РґР°РЅРЅС‹С… СЃСѓС‰РµСЃС‚РІР°.
+   * Выполняет нормализацию данных существа.
+   *
+   * Здесь же пересчитываются метка смерти и состояния с правилом «вешать
+   * автоматически» (`autoConditions.ts`): Ядро
+   * прогоняет существо через этот метод при каждом изменении (создание и
+   * обновление на клиенте, загрузка мира на сервере), поэтому значки на токене
+   * появляются и снимаются одинаково, какой бы путь ни поменял хиты.
    */
-  // eslint-disable-next-line class-methods-use-this
-  normalizeCreature(creature: any): void {
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  normalizeCreature(creature: BaseCreature): void {
     normalizeCreature(creature);
+    syncCreatureDeathCondition(creature);
+
+    if (isDndSceneEntity(creature)) {
+      syncAutoAppliedConditions(creature);
+    }
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРїРёСЃРѕРє РґРѕСЃС‚СѓРїРЅС‹С… РєР»Р°СЃСЃРѕРІ РІ СЃРёСЃС‚РµРјРµ РґР»СЏ РєРѕРјРїРµРЅРґРёСѓРјР°.
+   * Возвращает список доступных классов в системе для компендиума.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getClassKeyOptions(): Array<{ value: string; label: string }> {
     return [...CLASS_KEY_OPTIONS];
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ С„РѕСЂРјР°С‚С‚РµСЂ Р·РЅР°С‡РµРЅРёР№ РєРѕРјРїРµРЅРґРёСѓРјР° РїРѕ РёРјРµРЅРё С„РѕСЂРјР°С‚Р°.
+   * Возвращает форматтер значений компендиума по имени формата.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getCompendiumValueFormatter(
     format: string,
   ): CompendiumValueFormatter | undefined {
@@ -608,9 +2776,9 @@ export class Dnd5eVttSystem implements VttSystem {
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ РїСЂРѕРёР·РІРѕРґРЅС‹Р№ Р±СѓР»РµРІ РїСЂРµРґРёРєР°С‚ РєРѕРјРїРµРЅРґРёСѓРјР° РїРѕ РєР»СЋС‡Сѓ.
+   * Возвращает производный булев предикат компендиума по ключу.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getCompendiumPredicate(
     key: string,
   ): ((entry: unknown) => boolean) | undefined {
@@ -618,30 +2786,20 @@ export class Dnd5eVttSystem implements VttSystem {
   }
 
   /**
-   * РџСЂРѕРІРµСЂСЏРµС‚, Р°РєС‚РёРІРЅРѕ Р»Рё РєРѕРЅРєСЂРµС‚РЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ Сѓ Р°РєС‚РѕСЂР°.
+   * Проверяет, активно ли конкретное состояние у актора.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   isConditionActive(
     activeEffects: readonly unknown[],
     conditionKey: string,
   ): boolean {
-    const condition = CONDITIONS.find((entry) => entry.key === conditionKey);
-
-    if (!condition) {
-      return false;
-    }
-
-    return (activeEffects as ActiveEffect[]).some(
-      (effect) =>
-        effect.origin === 'condition'
-        && !(effect.aura && !effect.aura.applyToSelf)
-        && (effect.name === condition.nameRu
-          || effect.name === condition.nameEn),
-    );
+    return activeEffects
+      .filter(isActiveEffect)
+      .some((effect) => isOwnConditionEffect(effect, conditionKey));
   }
 
   /**
-   * РџРµСЂРµРєР»СЋС‡Р°РµС‚ (РґРѕР±Р°РІР»СЏРµС‚/СѓРґР°Р»СЏРµС‚) СЃРѕСЃС‚РѕСЏРЅРёРµ РІ СЃРїРёСЃРєРµ СЌС„С„РµРєС‚РѕРІ Р°РєС‚РѕСЂР°.
+   * Переключает (добавляет/удаляет) состояние в списке эффектов актора.
    */
 
   toggleCondition(
@@ -649,28 +2807,24 @@ export class Dnd5eVttSystem implements VttSystem {
     conditionKey: string,
     generateIdFn: (prefix: string) => string,
   ): unknown[] {
-    const condition = CONDITIONS.find((entry) => entry.key === conditionKey);
+    const condition = getConditionEntry(conditionKey);
 
     if (!condition) {
-      return activeEffects as unknown[];
+      return [...activeEffects];
     }
 
-    const effects = activeEffects as ActiveEffect[];
-    const key = conditionKey as ConditionKey;
+    const effects = activeEffects.filter(isActiveEffect);
 
     if (this.isConditionActive(effects, conditionKey)) {
       return effects.filter(
-        (effect) =>
-          !(
-            effect.origin === 'condition'
-            && (effect.name === condition.nameRu
-              || effect.name === condition.nameEn)
-          ),
+        (effect) => resolveEffectConditionKey(effect) !== conditionKey,
       );
     } else {
-      // Р•РґРёРЅС‹Р№ РёСЃС‚РѕС‡РЅРёРє РїСЂР°РІРґС‹: builder РїСЂРѕСЃС‚Р°РІР»СЏРµС‚ conditionKey,
-      // conditionImmunities Рё РґРёРЅР°РјРёС‡РµСЃРєРёРµ changes РСЃС‚РѕС‰РµРЅРёСЏ.
-      const newEffect = buildConditionActiveEffect(key);
+      // Единый источник правды: builder проставляет conditionKey,
+      // conditionImmunities и динамические changes Истощения.
+      // Ключ берётся у найденного состояния, а не у входной строки: он уже
+      // типизирован справочником, и лишняя проверка не нужна
+      const newEffect = buildConditionActiveEffect(condition.key);
 
       if (!newEffect) {
         return [...effects];
@@ -683,17 +2837,16 @@ export class Dnd5eVttSystem implements VttSystem {
   }
 
   /**
-   * РћРїСЂРµРґРµР»СЏРµС‚ СЃРѕСЃС‚РѕСЏРЅРёРµ Р·РґРѕСЂРѕРІСЊСЏ РїРѕ С‚РµРєСѓС‰РёРј Рё РјР°РєСЃРёРјР°Р»СЊРЅС‹Рј РҐРџ РїРѕ РїСЂР°РІРёР»Р°Рј СЃРёСЃС‚РµРјС‹.
+   * Определяет состояние здоровья по текущим и максимальным ХП по правилам системы.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getHealthCondition(
     currentHp: number,
     maxHp: number,
     isActor?: boolean,
     customConditions?: unknown[],
   ):
-    | { key: string; nameEn: string; nameRu: string; color: string }
-    | undefined {
+    { key: string; nameEn: string; nameRu: string; color: string } | undefined {
     return getHealthCondition(
       currentHp,
       maxHp,
@@ -703,19 +2856,24 @@ export class Dnd5eVttSystem implements VttSystem {
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ С‚Р°Р±Р»РёС†Сѓ СЃРѕСЃС‚РѕСЏРЅРёР№ Р·РґРѕСЂРѕРІСЊСЏ D&D 5e РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ (РїРѕСЂРѕРіРё %РҐРџ).
+   * Возвращает таблицу состояний здоровья D&D 5e по умолчанию (пороги %ХП).
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getDefaultHealthConditions(): readonly HealthCondition[] {
     return HEALTH_CONDITIONS;
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРІРѕРґРєСѓ РҐРџ Р°РєС‚С‘СЂР° РґР»СЏ HUD РІС‹Р±СЂР°РЅРЅРѕРіРѕ С‚РѕРєРµРЅР° (РїР°РЅРµР»СЊ РЅР°Рґ СЃС†РµРЅРѕР№).
-   * Р§РёС‚Р°РµС‚ `system.hitPoints` Р·Р°С‰РёС‚РЅРѕ РёР· РЅРµР№С‚СЂР°Р»СЊРЅРѕРіРѕ Р±Р»РѕР±Р° вЂ” СЏРґСЂРѕ РЅРµ Р·РЅР°РµС‚
-   * РёРјС‘РЅ D&D-РїРѕР»РµР№.
+   * Возвращает сводку ХП актёра для HUD выбранного токена (панель над сценой).
+   * Читает `system.hitPoints` защитно из нейтрального блоба — ядро не знает
+   * имён D&D-полей.
+   *
+   * Максимум берётся с учётом эффектов (ключ `hitPoints.max`) — тем же
+   * расчётом, что у плитки хитов листа и у ограничения текущих хитов сверху.
+   * Иначе после «Ложной жизни» HUD показывал бы 25/20: текущие хиты выше
+   * собственного максимума.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getActorHudSummary(actor: BaseActor): {
     hp: { current: number; max: number; temp: number };
   } {
@@ -723,50 +2881,87 @@ export class Dnd5eVttSystem implements VttSystem {
       ? actor.system.hitPoints
       : undefined;
 
+    const baseMax = typeof hitPoints?.max === 'number' ? hitPoints.max : 0;
+
     return {
       hp: {
         current: typeof hitPoints?.current === 'number' ? hitPoints.current : 0,
-        max: typeof hitPoints?.max === 'number' ? hitPoints.max : 0,
+        max: isDndSceneEntity(actor) ? resolveEntityMaxHp(actor) : baseMax,
         temp: typeof hitPoints?.temp === 'number' ? hitPoints.temp : 0,
       },
     };
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ Р±РµР№РґР¶ В«РџРћ XВ» (РїРѕРєР°Р·Р°С‚РµР»СЊ РѕРїР°СЃРЅРѕСЃС‚Рё) РґР»СЏ СЃСѓС‰РµСЃС‚РІР° РІ СЃРїРёСЃРєР°С… СЏРґСЂР°.
-   * `undefined` вЂ” Сѓ СЃСѓС‰РµСЃС‚РІР° РЅРµС‚ РїРѕРєР°Р·Р°С‚РµР»СЏ РѕРїР°СЃРЅРѕСЃС‚Рё.
+   * Возвращает хиты сущности для полосы и подписи НАД ТОКЕНОМ на сцене.
+   *
+   * Ядро читало `system.hitPoints` непрозрачным блобом и брало поле `max`, где
+   * записан исходный запас листа. Но записанный максимум — не весь максимум:
+   * эффект с ключом `hitPoints.max` («Помощь») поднимает потолок, и вылеченная
+   * до 25 сущность с `max: 20` рисовалась над токеном как «25/20» — полоса
+   * упиралась в край и спорила с листом.
+   *
+   * Поэтому максимум считается тем же `resolveEntityMaxHp`, что и плитка хитов
+   * листа, лечение и ограничение текущих хитов сверху: разнобой не должен
+   * вернуться с другой стороны. Текущие хиты — `resolveEntityCurrentHp`: у
+   * существа без явного `current` это полный запас ЛИСТА (см. `hitPoints.ts`).
+   *
+   * Сущность не в форме D&D — `undefined`, ядро откатится на чтение блоба само.
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
+  getEntityHitPoints(
+    entity: SceneEntity,
+  ): { current: number; max: number; temp: number } | undefined {
+    if (!isDndSceneEntity(entity)) {
+      return undefined;
+    }
+
+    return {
+      current: resolveEntityCurrentHp(entity),
+      max: resolveEntityMaxHp(entity),
+      // Временные хиты необязательны у обоих видов сущностей — читаем защитно,
+      // как это делает `getActorHudSummary`
+      temp: resolveEntityTempHp(entity),
+    };
+  }
+
+  /**
+   * Возвращает бейдж «ПО X» (показатель опасности) для существа в списках ядра.
+   * `undefined` — у существа нет показателя опасности.
+   */
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getEntityListBadge(creature: BaseCreature): string | undefined {
     const challengeRating = creature.system.challengeRating;
 
-    // РџРћ С…СЂР°РЅРёС‚СЃСЏ СЃС‚СЂРѕРєРѕР№ ('1/4'), РЅРѕ РІ СЃС‚Р°СЂС‹С… РјРёСЂР°С…/РёРјРїРѕСЂС‚Р°С… РІСЃС‚СЂРµС‡Р°РµС‚СЃСЏ Рё
-    // С‡РёСЃР»РѕРј (normalizeCreature РµРіРѕ Рє СЃС‚СЂРѕРєРµ РЅРµ РєРѕСЌСЂСЃРёС‚) вЂ” Р±РµР№РґР¶ РѕР±СЏР·Р°РЅ
-    // РїРѕРєР°Р·С‹РІР°С‚СЊСЃСЏ РІ РѕР±РѕРёС… СЃР»СѓС‡Р°СЏС…, РєР°Рє РІ UI РґРѕ СЂР°СЃС€РёРІРєРё СЏРґСЂР°.
+    // ПО хранится строкой ('1/4'), но в старых мирах/импортах встречается и
+    // числом (normalizeCreature его к строке не коэрсит) — бейдж обязан
+    // показываться в обоих случаях, как в UI до расшивки ядра.
     if (typeof challengeRating === 'number') {
-      return `РџРћ ${challengeRating}`;
+      return `ПО ${challengeRating}`;
     }
 
     return typeof challengeRating === 'string' && challengeRating.length > 0
-      ? `РџРћ ${challengeRating}`
+      ? `ПО ${challengeRating}`
       : undefined;
   }
 
   /**
-   * Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРїРёСЃРѕРє РІСЃРµС… РґРѕСЃС‚СѓРїРЅС‹С… СЃРѕСЃС‚РѕСЏРЅРёР№ (conditions) РІ D&D 5e.
+   * Возвращает список всех доступных состояний: канон PHB плюс состояния,
+   * заведённые в мире («Мастерская» → «Состояния»).
    */
-  // eslint-disable-next-line class-methods-use-this
+  // eslint-disable-next-line class-methods-use-this -- хук контракта VttSystem: ядро вызывает его на экземпляре системы
   getConditions(): ConditionDefinition[] {
-    return CONDITIONS.map((condition) => ({
+    return listConditions().map((condition) => ({
       key: condition.key,
       label: condition.nameRu,
       icon: condition.icon,
       description: condition.description,
-      systemId: 'dnd5e-2014',
+      systemId: SYSTEM_ID,
       customImage: condition.customImage,
+      overlay: condition.overlay,
     }));
   }
 }
 
-/** Р­РєР·РµРјРїР»СЏСЂ СЃРёСЃС‚РµРјС‹ D&D 5e РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ */
+/** Экземпляр системы D&D 5e по умолчанию */
 export const dnd5eSystemInstance = new Dnd5eVttSystem();

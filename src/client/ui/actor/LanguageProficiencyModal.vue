@@ -1,9 +1,15 @@
 <script setup lang="ts">
-  import { LANGUAGE_TYPES } from '@vtt/shared/system/dnd.js';
   import { computed, ref, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
+  import {
+    LANGUAGE_TYPES,
+    RARE_LANGUAGES,
+    STANDARD_LANGUAGES,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { MODAL_BUTTON_LABELS, PROFICIENCY_MODAL_LABELS } from './constants';
 
   /** Блокирующий модал — фиксированный z-index поверх остальных */
   const MODAL_Z_INDEX = Z_INDEX.MODAL_ELEVATED;
@@ -29,11 +35,15 @@
   /** Локальная копия владений */
   const localSelected = ref<Set<string>>(new Set());
 
+  /** Поле ввода своего языка */
+  const customLanguage = ref('');
+
   watch(
     () => props.open,
     (opened) => {
       if (opened) {
         localSelected.value = new Set(props.selected);
+        customLanguage.value = '';
       }
     },
   );
@@ -42,21 +52,15 @@
   const panels = computed(() => [
     {
       key: 'standard' as const,
-      title: 'Стандартные',
-      color: 'text-gold',
-      items: LANGUAGE_TYPES.slice(0, 8),
+      title: PROFICIENCY_MODAL_LABELS.languagesStandard,
+      color: 'text-primary',
+      items: STANDARD_LANGUAGES,
     },
     {
       key: 'rare' as const,
-      title: 'Редкие',
-      color: 'text-gold',
-      items: LANGUAGE_TYPES.slice(8, 16),
-    },
-    {
-      key: 'exotic' as const,
-      title: 'Экзотические',
-      color: 'text-gold',
-      items: LANGUAGE_TYPES.slice(16),
+      title: PROFICIENCY_MODAL_LABELS.languagesRare,
+      color: 'text-primary',
+      items: RARE_LANGUAGES,
     },
   ]);
 
@@ -116,6 +120,55 @@
   }
 
   /**
+   * {{ PROFICIENCY_MODAL_LABELS.languagesCustomTitle }}: всё отмеченное, чего нет в списках. Порядок — тот, в котором их
+   * заводили: `Set` держит порядок вставки, и записи не прыгают при правке.
+   */
+  const customLanguages = computed(() =>
+    [...localSelected.value].filter(
+      (language) => !LANGUAGE_TYPES.includes(language),
+    ),
+  );
+
+  /** В поле только пробелы — заводить нечего */
+  const canAddCustom = computed(() => customLanguage.value.trim().length > 0);
+
+  /**
+   * Заводит язык из поля ввода. Название, совпавшее со списочным языком (с
+   * точностью до регистра), не удваивает запись — вместо своего языка встаёт
+   * галочка в списке.
+   */
+  function addCustomLanguage(): void {
+    const name = customLanguage.value.trim();
+
+    if (!name) {
+      return;
+    }
+
+    const sameName = [...LANGUAGE_TYPES, ...localSelected.value].find(
+      (language) => language.toLowerCase() === name.toLowerCase(),
+    );
+
+    const set = new Set(localSelected.value);
+
+    set.add(sameName ?? name);
+    localSelected.value = set;
+    customLanguage.value = '';
+  }
+
+  /**
+   * Убирает свой язык. Списочные языки снимают галочкой, поэтому отдельной
+   * кнопки удаления у них нет — а свой язык вне списков снять больше нечем.
+   *
+   * @param language - название своего языка
+   */
+  function removeCustomLanguage(language: string): void {
+    const set = new Set(localSelected.value);
+
+    set.delete(language);
+    localSelected.value = set;
+  }
+
+  /**
    * Применяет выбранные владения
    */
   function applySelection(): void {
@@ -130,15 +183,15 @@
     :draggable="false"
     :resizable="false"
     :blocking="true"
-    :min-width="800"
+    :min-width="600"
     :min-height="350"
-    title="Владение языками"
+    :title="PROFICIENCY_MODAL_LABELS.languagesTitle"
     :z-index="MODAL_Z_INDEX"
   >
     <template #body>
       <div class="flex flex-col gap-3">
-        <!-- 3 панели: 3 столбца -->
-        <div class="grid grid-cols-3 gap-4">
+        <!-- 2 панели: 2 столбца -->
+        <div class="grid grid-cols-2 gap-4">
           <div
             v-for="panel in panels"
             :key="panel.key"
@@ -158,7 +211,7 @@
             >
               <span />
 
-              <UTooltip text="Владение">
+              <UTooltip :text="PROFICIENCY_MODAL_LABELS.proficient">
                 <UIcon
                   name="tabler:circle-dot"
                   class="mx-auto block h-3.5 w-3.5 text-healing"
@@ -171,7 +224,7 @@
               class="flex items-center gap-2 rounded px-1 py-0.5 transition-colors hover:bg-accented/30"
             >
               <span class="flex-1 text-sm font-semibold text-highlighted">
-                Все {{ panel.title }}
+                {{ PROFICIENCY_MODAL_LABELS.allPrefix }}{{ panel.title }}
               </span>
 
               <UCheckbox
@@ -198,6 +251,69 @@
           </div>
         </div>
 
+        <!-- {{ PROFICIENCY_MODAL_LABELS.languagesCustomTitle }}: списками мир не исчерпывается — тайное наречие стола,
+          язык из домашнего сеттинга. Заводят их прямо здесь и хранят наравне со
+          списочными, поэтому в лист они попадают обычными языками -->
+        <div class="rounded-lg border border-default/50 bg-elevated/30 p-2">
+          <div
+            class="mb-2 border-b border-default/50 pb-2 text-center text-xs font-bold tracking-wider text-primary uppercase"
+          >
+            {{ PROFICIENCY_MODAL_LABELS.languagesCustomTitle }}
+          </div>
+
+          <div class="flex items-center gap-2">
+            <UInput
+              v-model="customLanguage"
+              :placeholder="PROFICIENCY_MODAL_LABELS.languagesCustomPlaceholder"
+              size="sm"
+              class="flex-1"
+              @keydown.enter.prevent="addCustomLanguage"
+            />
+
+            <UButton
+              icon="tabler:plus"
+              color="primary"
+              variant="soft"
+              size="sm"
+              :disabled="!canAddCustom"
+              @click.left.exact.prevent="addCustomLanguage"
+            >
+              {{ MODAL_BUTTON_LABELS.add }}
+            </UButton>
+          </div>
+
+          <div
+            v-if="customLanguages.length > 0"
+            class="mt-2 grid grid-cols-3 gap-x-4"
+          >
+            <div
+              v-for="language in customLanguages"
+              :key="language"
+              class="flex items-center gap-2 rounded px-1 py-0.5 transition-colors hover:bg-accented/30"
+            >
+              <span class="flex-1 truncate text-sm text-toned">
+                {{ language }}
+              </span>
+
+              <UButton
+                icon="tabler:trash"
+                color="error"
+                variant="ghost"
+                size="xs"
+                :aria-label="`${PROFICIENCY_MODAL_LABELS.languageRemovePrefix}${language}${PROFICIENCY_MODAL_LABELS.languageRemoveSuffix}`"
+                @click.left.exact.prevent="removeCustomLanguage(language)"
+              />
+            </div>
+          </div>
+
+          <div
+            v-else
+            class="px-1 py-0.5 text-xs text-dimmed italic"
+          >
+            {{ PROFICIENCY_MODAL_LABELS.languagesCustomEmpty }}
+          </div>
+        </div>
+
         <!-- Кнопки -->
         <div class="flex justify-end gap-2 pt-1">
           <UButton
@@ -206,7 +322,7 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -214,7 +330,7 @@
             size="sm"
             @click.left.exact.prevent="applySelection"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

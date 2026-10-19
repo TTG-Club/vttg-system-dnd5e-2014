@@ -1,10 +1,25 @@
 <script setup lang="ts">
   import type { Spell } from '@vtt/shared/system/dnd.js';
 
-  import { getSpellProjectileCount } from '@vtt/shared/system/dnd.js';
-  import { computed, ref, watch } from 'vue';
+  import { computed, onBeforeUnmount, ref, watch } from 'vue';
 
+  import { HUD_PROMPT_TITLE_ATTR } from '@/shared_ui/consts';
   import { useProjectileStore } from '@/stores/projectileStore';
+  import { useWorldStore } from '@/stores/worldStore';
+  import {
+    getSpellEffectTargetCount,
+    getSpellProjectileCount,
+  } from '@vtt/shared/system/dnd.js';
+
+  import {
+    ACTOR_SPELLS_TAB_LABELS,
+    HUD_PROMPT_PANEL_CLASS,
+    HUD_PROMPTS_TELEPORT_TARGET,
+    PROJECTILE_PROMPT_LABELS,
+    SPELL_EFFECT_TARGET_LABELS,
+    SPELL_EFFECT_TARGET_MODE,
+    SPELL_LEVEL_SUFFIX,
+  } from './constants';
 
   defineOptions({
     inheritAttrs: false,
@@ -17,8 +32,19 @@
     casterLevel: number;
     availableSpellLevels: number[];
     modalId: string;
-    onConfirm: (selectedLevel: number) => void;
+    targetingSessionId: number;
+    targetMode?: typeof SPELL_EFFECT_TARGET_MODE;
+    onConfirm: (selectedLevel: number) => boolean | void;
   }>();
+
+  /**
+   * Заголовок плашки. Его же читает напоминание хоста о плашке, которую окно
+   * закрыло целиком, — чтобы назвать, какой вопрос ждёт ответа
+   */
+  const promptTitle = computed(
+    () =>
+      `${ACTOR_SPELLS_TAB_LABELS.castConfirmPrefix}${props.spell.name}${ACTOR_SPELLS_TAB_LABELS.castConfirmSuffix}`,
+  );
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
@@ -27,7 +53,60 @@
   }>();
 
   const projectileStore = useProjectileStore();
+  const worldStore = useWorldStore();
+  const initialSceneId = worldStore.currentScene?.id;
+  const targetingSessionId = props.targetingSessionId;
 
+  let confirmed = false;
+
+  const ownsTargeting = computed(
+    () =>
+      projectileStore.isActive
+      && projectileStore.sessionId === targetingSessionId,
+  );
+
+  /** Окно выбирает разные цели эффекта, а не раздаёт снаряды */
+  const isEffectTargetMode = computed(
+    () => props.targetMode === SPELL_EFFECT_TARGET_MODE,
+  );
+
+  const assignedLabel = computed(() =>
+    isEffectTargetMode.value
+      ? SPELL_EFFECT_TARGET_LABELS.assignedPrefix
+      : PROJECTILE_PROMPT_LABELS.assignedPrefix,
+  );
+
+  /** Освобождает только собственный режим: старое окно не отменяет новый каст. */
+  function releaseTargeting(): void {
+    if (!confirmed && ownsTargeting.value) {
+      projectileStore.stopTargeting();
+    }
+  }
+
+  onBeforeUnmount(releaseTargeting);
+
+  watch(
+    [() => props.open, () => worldStore.currentScene?.id, ownsTargeting],
+    () => {
+      // Подтверждённое окно закрывается само, и выбор целей переходит к
+      // следующему шагу каста. Такое закрытие — не отмена: без проверки
+      // наблюдатель принял бы его за отмену и закрыл бы окно повторно
+      if (confirmed) {
+        return;
+      }
+
+      if (
+        !props.open
+        || worldStore.currentScene?.id !== initialSceneId
+        || !ownsTargeting.value
+      ) {
+        handleCancel();
+      }
+    },
+    { immediate: true },
+  );
+
+  /** Выбирает первый доступный круг каста. */
   function resolveInitialSpellLevel(): number {
     if (props.availableSpellLevels.length > 0) {
       return props.availableSpellLevels[0];
@@ -43,29 +122,35 @@
   const selectedSpellLevel = ref(resolveInitialSpellLevel());
 
   const spellLevelItems = computed(() => {
-    return props.availableSpellLevels.map((lvl) => ({
-      label: `${lvl}-й круг`,
-      value: lvl,
+    return props.availableSpellLevels.map((level) => ({
+      label: `${level}${SPELL_LEVEL_SUFFIX}`,
+      value: level,
     }));
   });
 
   const calculatedMaxProjectiles = computed(() =>
-    getSpellProjectileCount(props.spell, {
-      slotLevel: selectedSpellLevel.value,
-      casterLevel: props.casterLevel,
-    }),
+    isEffectTargetMode.value
+      ? getSpellEffectTargetCount(props.spell, selectedSpellLevel.value)
+      : getSpellProjectileCount(props.spell, {
+          slotLevel: selectedSpellLevel.value,
+          casterLevel: props.casterLevel,
+        }),
   );
 
   /** Подсказка режима распределения (свободный режим не подписывается) */
   const distributionHint = computed(() => {
+    if (isEffectTargetMode.value) {
+      return SPELL_EFFECT_TARGET_LABELS.distinct;
+    }
+
     const distribution = props.spell.projectiles?.targetDistribution;
 
     if (distribution === 'single') {
-      return 'Все снаряды — в одну цель';
+      return PROJECTILE_PROMPT_LABELS.distributionSingle;
     }
 
     if (distribution === 'distinct') {
-      return 'Каждый снаряд — в отдельную цель';
+      return PROJECTILE_PROMPT_LABELS.distributionDistinct;
     }
 
     return null;
@@ -74,7 +159,7 @@
   watch(
     calculatedMaxProjectiles,
     (newMax) => {
-      if (projectileStore.isActive) {
+      if (ownsTargeting.value) {
         projectileStore.maxProjectiles = newMax;
 
         if (projectileStore.assignedProjectilesCount > newMax) {
@@ -85,16 +170,33 @@
     { immediate: true },
   );
 
-  function handleConfirm() {
+  /**
+   * Каст с нулём розданных снарядов применять нечему: серия бросков выходит по
+   * пустому списку целей и гаснет без единой строки в чате. Пока цели не
+   * выбраны, галочка неактивна — это единственный внятный сигнал игроку.
+   */
+  const canConfirm = computed(
+    () => ownsTargeting.value && projectileStore.assignedProjectilesCount > 0,
+  );
+
+  /** Фиксирует цели до закрытия окна; следующий шаг получает их один раз. */
+  function handleConfirm(): void {
+    if (!canConfirm.value) {
+      return;
+    }
+
+    if (props.onConfirm(selectedSpellLevel.value) === false) {
+      return;
+    }
+
+    confirmed = true;
     emit('update:open', false);
     emit('close');
-    props.onConfirm(selectedSpellLevel.value);
   }
 
-  function handleCancel() {
-    if (projectileStore.isActive) {
-      projectileStore.stopTargeting();
-    }
+  /** Отменяет выбор без расхода ресурсов заклинателя. */
+  function handleCancel(): void {
+    releaseTargeting();
 
     emit('update:open', false);
     emit('close');
@@ -102,12 +204,13 @@
 </script>
 
 <template>
-  <Teleport to="#hud-prompts-container">
+  <Teleport :to="HUD_PROMPTS_TELEPORT_TARGET">
     <!-- Имитируем внешний вид и анимации из ActionPromptList -->
     <Transition name="slide-up">
       <div
-        v-if="open && projectileStore.isActive"
-        class="pointer-events-auto flex min-w-[380px] flex-col gap-3 rounded-xl border border-default/50 bg-default/90 px-4 py-3 text-highlighted shadow-xl ring-accented backdrop-blur-sm"
+        v-if="open && ownsTargeting"
+        :class="HUD_PROMPT_PANEL_CLASS"
+        :[HUD_PROMPT_TITLE_ATTR]="promptTitle"
       >
         <div class="flex items-center gap-2 border-b border-muted/50 pb-2">
           <UIcon
@@ -115,10 +218,14 @@
             class="h-5 w-5 shrink-0 text-toned"
           />
 
-          <span class="text-sm font-medium whitespace-nowrap">
-            Применить заклинание: {{ props.spell.name }}?
+          <span class="min-w-0 text-sm font-medium break-words">
+            {{ promptTitle }}
           </span>
         </div>
+
+        <p class="text-xs text-dimmed">
+          {{ PROJECTILE_PROMPT_LABELS.targetingHint }}
+        </p>
 
         <p
           v-if="distributionHint"
@@ -137,12 +244,13 @@
               label-key="label"
               class="w-32"
               size="sm"
-              color="white"
+              color="neutral"
               variant="outline"
             />
 
             <span class="text-sm font-bold text-toned">
-              Снаряды: {{ projectileStore.assignedProjectilesCount }} /
+              {{ assignedLabel
+              }}{{ projectileStore.assignedProjectilesCount }} /
               {{ calculatedMaxProjectiles }}
             </span>
           </div>
@@ -153,6 +261,7 @@
               color="primary"
               variant="solid"
               size="sm"
+              :disabled="!canConfirm"
               @click.left.exact.prevent="handleConfirm"
             />
 
@@ -170,15 +279,4 @@
   </Teleport>
 </template>
 
-<style scoped>
-  .slide-up-enter-active,
-  .slide-up-leave-active {
-    transition: all 0.3s ease;
-  }
-
-  .slide-up-enter-from,
-  .slide-up-leave-to {
-    opacity: 0;
-    transform: translateY(20px);
-  }
-</style>
+<style scoped src="../hudPromptTransition.css"></style>

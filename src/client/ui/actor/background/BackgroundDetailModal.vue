@@ -1,17 +1,31 @@
 <script setup lang="ts">
+  import type { Feature } from '@vtt/shared';
   import type { BackgroundDefinition } from '@vtt/shared/system/dnd.js';
 
-  import {
-    buildFeatGrantsSummary,
-    SKILLS_LABELS,
-    TOOLS_LABELS,
-  } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
+  import { loadCompendiumKind } from '@/core/compendiumDataClient';
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
   import SendToChatButton from '@/shared_ui/components/SendToChatButton.vue';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
-  import { useSourceLabels } from '@/systems/dnd5e/composables/useSourceLabel';
+  import { useChatStore } from '@/stores/chatStore';
+  import {
+    buildFeatGrantsSummary,
+    SKILLS_LABELS,
+    toolProficiencyLabel,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { useFeatModal } from '../../../composables/useFeatModal';
+  import {
+    BACKGROUND_DETAIL_LABELS,
+    COPY_TO_ITEMS_LABEL,
+    GRANT_SECTION_LABELS,
+    SELECT_FOR_ACTOR_LABEL,
+  } from '../constants';
+  import EffectsBySubscriptionBadge from '../EffectsBySubscriptionBadge.vue';
+  import ItemDetailTabs from '../ItemDetailTabs.vue';
+  import ItemEffectsView from '../ItemEffectsView.vue';
+  import SourceBadge from '../SourceBadge.vue';
 
   const props = defineProps<{
     open: boolean;
@@ -20,6 +34,11 @@
     zIndex?: number;
     positionOffset?: number;
     showCopyButton?: boolean;
+    /**
+     * Показать кнопку «Выбрать» (окно открыто из выбора предыстории для
+     * персонажа)
+     */
+    showSelectButton?: boolean;
   }>();
 
   const data = computed(() => props.item ?? props.backgroundDefinition);
@@ -28,6 +47,8 @@
     'update:open': [value: boolean];
     'bring-to-front': [];
     'copy': [];
+    /** Запись выбрана для листа персонажа */
+    'select': [];
   }>();
 
   const initialPosition = computed(() =>
@@ -35,22 +56,6 @@
       ? { x: props.positionOffset, y: props.positionOffset }
       : undefined,
   );
-
-  /** Непустые таблицы характера — только те, что автор заполнил. */
-  const personalitySections = computed(() => {
-    const personality = data.value?.personality;
-
-    if (!personality) {
-      return [];
-    }
-
-    return [
-      { title: 'Черты характера', entries: personality.traits ?? [] },
-      { title: 'Идеалы', entries: personality.ideals ?? [] },
-      { title: 'Привязанности', entries: personality.bonds ?? [] },
-      { title: 'Слабости', entries: personality.flaws ?? [] },
-    ].filter((section) => section.entries.length > 0);
-  });
 
   /** Список навыков с русскими названиями */
   const skillsDisplay = computed(() => {
@@ -70,15 +75,15 @@
     }
 
     let toolsStr = (data.value.toolGrant.items || [])
-      .map((tool) => TOOLS_LABELS[tool] || tool)
+      .map((tool) => toolProficiencyLabel(tool))
       .join(', ');
 
     if (data.value.toolGrant.choices?.count) {
       if (toolsStr) {
-        toolsStr += ' и ';
+        toolsStr += BACKGROUND_DETAIL_LABELS.listAnd;
       }
 
-      toolsStr += `${data.value.toolGrant.choices.count} на выбор из списка`;
+      toolsStr += `${data.value.toolGrant.choices.count}${BACKGROUND_DETAIL_LABELS.toolChoiceSuffix}`;
     }
 
     return toolsStr;
@@ -92,14 +97,59 @@
     data.value ? buildFeatGrantsSummary(data.value) : '',
   );
 
-  const { getSourceLabel } = useSourceLabels();
+  const chatStore = useChatStore();
+  const { openFeatDescription: openFeat } = useFeatModal();
 
+  /**
+   * Проверяет, что запись компендиума — черта.
+   *
+   * @param value - запись компендиума
+   * @returns true, если запись имеет форму черты
+   */
+  function isFeatureEntry(value: unknown): value is Feature {
+    return (
+      typeof value === 'object'
+      && value !== null
+      && 'id' in value
+      && 'name' in value
+    );
+  }
+
+  async function openFeatDescription(featIdOrFallback?: string): Promise<void> {
+    if (!featIdOrFallback && !data.value?.featGrant?.featId) {
+      return;
+    }
+
+    const featId = data.value?.featGrant?.featId || featIdOrFallback;
+
+    const socket = chatStore.getSocket();
+
+    if (!socket) {
+      return;
+    }
+
+    // CompendiumEntry[] расширяем до unknown[], т.к. Feature не подтип
+    // CompendiumEntry и guard иначе не сузит при filter.
+    const entries: unknown[] = await loadCompendiumKind(socket, 'feat');
+    const feats = entries.filter(isFeatureEntry);
+
+    const feat = feats.find((entry) => entry.id === featId);
+
+    if (!feat) {
+      return;
+    }
+
+    // Через общий просмотр черты, а не своим `openModal`: черта, открытая из
+    // предыстории, — та же самая черта, и вкладки «Автоматизация»/«Эффекты» у
+    // неё должны быть те же, что и на листе.
+    openFeat(feat);
+  }
 </script>
 
 <template>
   <UDraggableModal
     :open="open"
-    :title="data ? data.name : 'Предыстория'"
+    :title="data ? data.name : BACKGROUND_DETAIL_LABELS.fallbackTitle"
     :subtitle="data?.nameEn || undefined"
     :initial-width="800"
     :initial-height="600"
@@ -112,12 +162,9 @@
     @bring-to-front="emit('bring-to-front')"
   >
     <template #header-actions>
-      <UBadge
-        v-if="getSourceLabel(data?.sourceKey)"
-        :label="getSourceLabel(data?.sourceKey)"
-        color="neutral"
-        variant="subtle"
-        size="sm"
+      <SourceBadge
+        :source-key="data?.sourceKey"
+        :source="data?.source"
       />
 
       <UBadge
@@ -128,9 +175,11 @@
         size="sm"
       />
 
+      <EffectsBySubscriptionBadge :automation="data?.automation" />
+
       <UTooltip
         v-if="showCopyButton"
-        text="Скопировать в предметы"
+        :text="COPY_TO_ITEMS_LABEL"
       >
         <UButton
           icon="tabler:copy"
@@ -138,6 +187,19 @@
           color="primary"
           variant="soft"
           @click.left.exact.prevent="emit('copy')"
+        />
+      </UTooltip>
+
+      <UTooltip
+        v-if="showSelectButton"
+        :text="SELECT_FOR_ACTOR_LABEL"
+      >
+        <UButton
+          icon="tabler:check"
+          size="xs"
+          color="primary"
+          variant="soft"
+          @click.left.exact.prevent="emit('select')"
         />
       </UTooltip>
 
@@ -150,138 +212,186 @@
     </template>
 
     <template #body>
-      <div
-        v-if="data"
-        class="flex flex-col gap-4"
-      >
-        <!-- Описание -->
-        <ItemDescriptionRenderer :content="data.description" />
+      <ItemDetailTabs v-if="data">
+        <!-- Вкладка «Основное» — описание, дары и стартовое снаряжение -->
+        <template #general>
+          <div class="flex flex-col gap-4">
+            <!-- Описание -->
+            <ItemDescriptionRenderer :content="data.description" />
 
-        <!-- Что даёт предыстория, в виде сетки -->
-        <div class="grid grid-cols-2 gap-2">
-          <!-- Навыки -->
-          <div
-            class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
-          >
-            <span
-              class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Навыки</span
-            >
-
-            <p class="mt-0.5 text-sm font-semibold text-highlighted">
-              {{ skillsDisplay }}
-            </p>
-          </div>
-
-          <!-- Инструменты -->
-          <div
-            v-if="
-              data.toolGrant?.items?.length || data.toolGrant?.choices?.count
-            "
-            class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
-          >
-            <span
-              class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-              >Инструменты</span
-            >
-
-            <p class="mt-0.5 text-sm font-semibold text-highlighted">
-              {{ toolsDisplay }}
-            </p>
-          </div>
-        </div>
-
-
-        <!-- Особенность предыстории -->
-        <div
-          v-if="data.feature"
-          class="rounded-lg border border-default/50 p-4"
-        >
-          <h3 class="mb-1 text-sm font-semibold tracking-wider text-primary">
-            ОСОБЕННОСТЬ
-          </h3>
-
-          <p class="mb-2 text-sm font-semibold text-highlighted">
-            {{ data.feature.name }}
-          </p>
-
-          <ItemDescriptionRenderer :content="data.feature.description" />
-        </div>
-
-        <!-- Таблицы характера -->
-        <div
-          v-if="personalitySections.length"
-          class="rounded-lg border border-default/50 p-4"
-        >
-          <h3 class="mb-3 text-sm font-semibold tracking-wider text-primary">
-            ХАРАКТЕР
-          </h3>
-
-          <div class="space-y-3">
-            <div
-              v-for="section in personalitySections"
-              :key="section.title"
-            >
-              <span
-                class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-                >{{ section.title }}</span
-              >
-
-              <ol class="mt-1 space-y-0.5">
-                <li
-                  v-for="(entry, idx) in section.entries"
-                  :key="idx"
-                  class="flex gap-2 text-sm text-toned"
-                >
-                  <span class="shrink-0 text-dimmed">{{ idx + 1 }}.</span>
-
-                  <span>{{ entry }}</span>
-                </li>
-              </ol>
-            </div>
-          </div>
-        </div>
-
-        <!-- Дополнительные дары (featData / activeEffects) -->
-        <div
-          v-if="grantsSummary"
-          class="rounded-lg border border-default/50 p-4"
-        >
-          <h3 class="mb-3 text-sm font-semibold tracking-wider text-primary">
-            ДОПОЛНИТЕЛЬНЫЕ ДАРЫ
-          </h3>
-
-          <ItemDescriptionRenderer :content="grantsSummary" />
-        </div>
-
-        <!-- Стартовое снаряжение -->
-        <div
-          v-if="data.equipmentOptions?.length"
-          class="rounded-lg border border-default/50 p-4"
-        >
-          <h3 class="mb-3 text-sm font-semibold tracking-wider text-primary">
-            СНАРЯЖЕНИЕ
-          </h3>
-
-          <ul class="space-y-3">
-            <li
-              v-for="(option, idx) in data.equipmentOptions"
-              :key="idx"
-              class="flex items-start gap-2"
-            >
+            <!-- Основные характеристики в виде сетки -->
+            <div class="grid grid-cols-2 gap-2">
+              <!-- Навыки -->
               <div
-                class="mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-elevated text-[10px] text-muted"
+                class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
               >
-                {{ idx === 0 ? 'А' : 'Б' }}
+                <span
+                  class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+                >
+                  {{ GRANT_SECTION_LABELS.skills }}
+                </span>
+
+                <p class="mt-0.5 text-sm font-semibold text-highlighted">
+                  {{ skillsDisplay }}
+                </p>
               </div>
 
-              <p class="text-sm text-toned">
-                <ItemDescriptionRenderer :content="option.description" />
+              <!-- Инструменты -->
+              <div
+                v-if="
+                  data.toolGrant?.items?.length
+                  || data.toolGrant?.choices?.count
+                "
+                class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
+              >
+                <span
+                  class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+                >
+                  {{ GRANT_SECTION_LABELS.tools }}
+                </span>
+
+                <p class="mt-0.5 text-sm font-semibold text-highlighted">
+                  {{ toolsDisplay }}
+                </p>
+              </div>
+            </div>
+
+            <!-- Умение предыстории (редакция 2014) -->
+            <div
+              v-if="data.feature?.name"
+              class="rounded-lg border border-default/50 p-4"
+            >
+              <h3
+                class="mb-3 text-sm font-semibold tracking-wider text-primary"
+              >
+                {{ BACKGROUND_DETAIL_LABELS.featureTitle }}
+              </h3>
+
+              <p class="mb-2 text-sm font-medium text-highlighted">
+                {{ data.feature.name }}
               </p>
-            </li>
-          </ul>
-        </div>
-      </div>
+
+              <ItemDescriptionRenderer :content="data.feature.description" />
+            </div>
+
+            <!-- Черта от предыстории -->
+            <div
+              v-if="
+                data.featGrant?.featName || data.featGrant?.featChoices?.length
+              "
+              class="rounded-lg border border-default/50 p-4"
+            >
+              <h3
+                class="mb-3 text-sm font-semibold tracking-wider text-primary"
+              >
+                {{ BACKGROUND_DETAIL_LABELS.featTitle }}
+              </h3>
+
+              <!-- Конкретная черта -->
+              <div
+                v-if="data.featGrant.featId"
+                class="flex items-center justify-between rounded bg-elevated/50 px-3 py-2 transition-colors hover:bg-elevated"
+              >
+                <span class="text-sm font-medium text-highlighted">
+                  {{ data.featGrant.featName }}
+                  <span class="text-xs text-dimmed"
+                    >({{ data.featGrant.featNameEn }})</span
+                  >
+                </span>
+
+                <UButton
+                  icon="tabler:info-circle"
+                  color="primary"
+                  variant="ghost"
+                  size="2xs"
+                  @click.left.exact.prevent="openFeatDescription()"
+                />
+              </div>
+
+              <!-- Выбор черты -->
+              <div
+                v-else-if="data.featGrant.featChoices?.length"
+                class="space-y-2"
+              >
+                <p class="text-xs text-muted">
+                  {{ BACKGROUND_DETAIL_LABELS.featChoicePrefix }}
+                </p>
+
+                <div class="flex flex-wrap gap-2">
+                  <UBadge
+                    v-for="choice in data.featGrant.featChoices"
+                    :key="choice"
+                    color="neutral"
+                    variant="soft"
+                    class="cursor-pointer transition-colors hover:bg-accented"
+                    @click.left.exact.prevent="openFeatDescription(choice)"
+                  >
+                    {{ choice }}
+                  </UBadge>
+                </div>
+              </div>
+            </div>
+
+            <!-- Дополнительные дары (featData) -->
+            <div
+              v-if="grantsSummary"
+              class="rounded-lg border border-default/50 p-4"
+            >
+              <h3
+                class="mb-3 text-sm font-semibold tracking-wider text-primary"
+              >
+                {{ BACKGROUND_DETAIL_LABELS.extraGrantsTitle }}
+              </h3>
+
+              <ItemDescriptionRenderer :content="grantsSummary" />
+            </div>
+
+            <!-- Стартовое снаряжение -->
+            <div
+              v-if="data.equipmentOptions?.length"
+              class="rounded-lg border border-default/50 p-4"
+            >
+              <h3
+                class="mb-3 text-sm font-semibold tracking-wider text-primary"
+              >
+                {{ BACKGROUND_DETAIL_LABELS.equipmentTitle }}
+              </h3>
+
+              <ul class="space-y-3">
+                <li
+                  v-for="(option, idx) in data.equipmentOptions"
+                  :key="idx"
+                  class="flex items-start gap-2"
+                >
+                  <div
+                    class="mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-elevated text-[10px] text-muted"
+                  >
+                    {{
+                      idx === 0
+                        ? BACKGROUND_DETAIL_LABELS.equipmentOptionA
+                        : BACKGROUND_DETAIL_LABELS.equipmentOptionB
+                    }}
+                  </div>
+
+                  <p class="text-sm text-toned">
+                    <ItemDescriptionRenderer :content="option.description" />
+                  </p>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </template>
+
+        <!-- Вкладка «Эффекты» — только просмотр. Вкладка стоит всегда, даже
+          пустая: предыстория эффекты носит, и по отсутствию вкладки нельзя
+          было бы понять, их нет или их тут не показывают -->
+        <template #effects>
+          <ItemEffectsView
+            :effects="data.activeEffects ?? []"
+            :owner-name="data.name"
+          />
+        </template>
+      </ItemDetailTabs>
     </template>
   </UDraggableModal>
 </template>

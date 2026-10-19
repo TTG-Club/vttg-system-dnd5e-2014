@@ -1,0 +1,76 @@
+/**
+ * Числа наложившего в эффектах «на цель»: урон и лечение эффекта считаются
+ * по тому, кто его накладывает, а не по цели.
+ *
+ * Сл спасброска формулой («8 + @prof + @mod.wis» монаха) — тоже числа
+ * наложившего.
+ *
+ * Без подстановки сервер пропускает часть урона с `@`: «Божественная искра»
+ * `1к8 + @mod.wis` не лечила бы вовсе, «Героизм» не давал бы временных хитов.
+ * Подставлять приходится на клиенте и в момент наложения — наложивший может
+ * потом уйти со сцены, а модификатор заклинания зависит от самого заклинания.
+ */
+
+import type {
+  ActiveEffect,
+  DnDSceneEntity,
+  Spell,
+} from '@vtt/shared/system/dnd.js';
+
+import {
+  bindTargetEffectsToSource,
+  buildOwnerSaveDcContext,
+  listEffectSaveDcs,
+  resolveSpellcastingAbility,
+} from '@vtt/shared/system/dnd.js';
+
+import { resolveSpellCastLevel } from './spellCasts';
+import { resolveEntityStats } from './useResolvedStats';
+import { useWorldEntities } from './useWorldEntities';
+
+/**
+ * Модификатор заклинательной характеристики наложившего для этого
+ * заклинания — токен `@mod.spell`.
+ *
+ * @param caster - наложивший
+ * @param spell - заклинание или псевдо-заклинание применения
+ * @returns модификатор характеристики
+ */
+function resolveCasterSpellMod(caster: DnDSceneEntity, spell: Spell): number {
+  return resolveEntityStats(caster).abilityMods[
+    resolveSpellcastingAbility(caster, spell)
+  ];
+}
+
+/**
+ * Подставляет числа наложившего в урон и лечение эффектов «на цель».
+ * Наложившего нет в мире — эффекты возвращаются как есть.
+ *
+ * @param effects - эффекты «на цель»
+ * @param spell - заклинание или псевдо-заклинание, которое их несёт
+ * @param casterId - кто накладывает
+ * @returns эффекты с числами наложившего
+ */
+export function bindTargetEffectsToCaster(
+  effects: readonly ActiveEffect[],
+  spell: Spell,
+  casterId: string | undefined,
+): ActiveEffect[] {
+  const caster = useWorldEntities().findCurrentDndEntity(casterId);
+
+  if (!caster) {
+    return [...effects];
+  }
+
+  // Сл формулой — по наложившему: «@spellDc» у умения — Сл его заклинаний
+  const saveDcFormulas = effects
+    .flatMap(listEffectSaveDcs)
+    .map((save) => save.dcFormula);
+
+  return bindTargetEffectsToSource(effects, caster, {
+    ...buildOwnerSaveDcContext(caster, saveDcFormulas),
+    // Круг ячейки — «Подмога» поднимает хиты цели по кругу каста
+    castLevel: resolveSpellCastLevel(caster.id, spell),
+    spellMod: resolveCasterSpellMod(caster, spell),
+  });
+}

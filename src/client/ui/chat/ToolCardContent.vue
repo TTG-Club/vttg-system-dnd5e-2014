@@ -1,13 +1,23 @@
 <script setup lang="ts">
-  import type { GameItem } from '@vtt/shared/system/dnd.js';
+  import type { DnDGameItem } from '@vtt/shared/system/dnd.js';
 
-  import { formatItemCost } from '@vtt/shared';
-  import { RARITY_COLORS, RARITY_OPTIONS } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
   import CardErrorFallback from '@/shared_ui/components/CardErrorFallback.vue';
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
+  import { formatItemCost } from '@vtt/shared';
+  import {
+    isDnDGameItem,
+    RARITY_COLORS,
+    RARITY_OPTIONS,
+  } from '@vtt/shared/system/dnd.js';
 
+  import {
+    EQUIPMENT_CARD_LABELS,
+    TOOL_CARD_LABELS,
+    WEIGHT_UNIT_LABEL,
+  } from '../actor/constants';
+  import { parseCardPayload } from './cardPayload';
   import { RARITY_BORDER_CLASSES, RARITY_BORDER_DEFAULT } from './consts';
 
   const props = defineProps<{
@@ -16,13 +26,9 @@
   }>();
 
   /** Десериализованный предмет */
-  const item = computed<GameItem | null>(() => {
-    try {
-      return JSON.parse(props.payload) as GameItem;
-    } catch {
-      return null;
-    }
-  });
+  const item = computed<DnDGameItem | null>(() =>
+    parseCardPayload(props.payload, isDnDGameItem),
+  );
 
   /** Цвет рамки карточки по редкости */
   const rarityBorderClass = computed(() => {
@@ -57,7 +63,7 @@
     <div class="flex items-center gap-2 bg-elevated/60 px-3 py-2">
       <UIcon
         name="tabler:tools"
-        class="size-4 shrink-0 text-primary-400"
+        class="size-4 shrink-0 text-primary"
       />
 
       <span
@@ -79,7 +85,7 @@
     <div class="flex flex-col gap-2 bg-default/40 px-3 py-2">
       <!-- Мета-строка: тип + редкость -->
       <div class="flex items-center gap-2 text-xs">
-        <span class="text-muted">Инструмент</span>
+        <span class="text-muted">{{ TOOL_CARD_LABELS.kind }}</span>
 
         <span
           v-if="rarityLabel"
@@ -96,7 +102,7 @@
           v-if="item.toolBonus"
           class="flex items-center gap-1"
         >
-          <span class="text-dimmed">Бонус:</span>
+          <span class="text-dimmed">{{ TOOL_CARD_LABELS.bonusPrefix }}</span>
 
           <span class="font-mono font-semibold text-info-muted">
             +{{ item.toolBonus }}
@@ -108,9 +114,11 @@
           v-if="item.cost"
           class="flex items-center gap-1"
         >
-          <span class="text-dimmed">Цена:</span>
+          <span class="text-dimmed">{{
+            EQUIPMENT_CARD_LABELS.costPrefix
+          }}</span>
 
-          <span class="text-gold">{{ formatItemCost(item.cost) }}</span>
+          <span class="text-primary">{{ formatItemCost(item.cost) }}</span>
         </div>
 
         <!-- Вес -->
@@ -118,9 +126,13 @@
           v-if="item.weight"
           class="flex items-center gap-1"
         >
-          <span class="text-dimmed">Вес:</span>
+          <span class="text-dimmed">{{
+            EQUIPMENT_CARD_LABELS.weightPrefix
+          }}</span>
 
-          <span class="text-toned">{{ item.weight }} фнт.</span>
+          <span class="text-toned"
+            >{{ item.weight }} {{ WEIGHT_UNIT_LABEL }}</span
+          >
         </div>
       </div>
 
@@ -137,6 +149,6 @@
   <!-- Fallback при ошибке десериализации -->
   <CardErrorFallback
     v-else
-    message="Ошибка отображения карточки"
+    :message="EQUIPMENT_CARD_LABELS.error"
   />
 </template>

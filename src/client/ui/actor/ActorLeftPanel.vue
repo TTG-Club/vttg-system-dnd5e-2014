@@ -1,52 +1,181 @@
 <script setup lang="ts">
   import type { AbilityType, ActorArmorClass } from '@vtt/shared';
-  import type { Actor, AttackRollMode } from '@vtt/shared/system/dnd.js';
-
-  import {
-    BASE_UNARMORED_AC,
-    calculateAbilityModifier,
-    TOOLS_LABELS,
+  import type {
+    AttackRollMode,
+    DeathSavesState,
+    DnDActor,
+    DnDCustomBonus,
+    DnDCustomBonusContext,
+    DnDProficiencySettings,
+    DnDSavingThrowSettings,
   } from '@vtt/shared/system/dnd.js';
+
+  import type { RollBonusEvaluator } from '../../composables/rollBonusEvaluator';
+  import type { CheckRollResult } from './diceRollTypes';
+
   import { computed, ref, toRef } from 'vue';
 
   import FieldsetLabel from '@/shared_ui/components/FieldsetLabel.vue';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+  import { useChatStore } from '@/stores/chatStore';
+  import {
+    BASE_UNARMORED_AC,
+    buildDeathSavePatch,
+    calculateAbilityModifier,
+    calculateProficiencyBonus,
+    DEATH_SAVE_DC,
+    DEATH_SAVE_KEY,
+    formatDeathSaveSummary,
+    getActorAbilityModifiers,
+    getCustomBonusValue,
+    getEntityExhaustionLevel,
+    getTotalLevel,
+    isActorDead,
+    isEntityAtZeroHp,
+    isItemWorn,
+    readDeathSaves,
+    resolveDeathSave,
+    resolveDeathSaveRollMode,
+    resolveEntityMaxHp,
+    resolveMaxHitPointsBreakdown,
+    resolveSavingThrowRollMode,
+    WEAPON_MASTERY_MAP,
+    withExhaustionLevel,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { buildRollBonusEvaluator } from '../../composables/rollBonusEvaluator';
+  import { refuseWhileSheetEditing } from '../../composables/sheetEditLock';
+  import { useProficiencyBonus } from '../../composables/useProficiencyBonus';
   import { useResolvedStats } from '../../composables/useResolvedStats';
+  import { useToolVocabulary } from '../../composables/useToolVocabulary';
+  import { useSystemDataStore } from '../../stores/systemDataStore';
   import ArmorClassModal from './ArmorClassModal.vue';
   import ArmorProficiencyModal from './ArmorProficiencyModal.vue';
+  import {
+    ACTOR_LEFT_PANEL_LABELS,
+    ARMOR_CALCULATION_LABELS,
+    ARMOR_CLASS_SETTINGS_LABELS,
+    CUSTOM_BONUS_LABELS,
+    DEATH_SAVES_BLOCK_LABELS,
+    DICE_ROLL_DEFAULT_BUTTON,
+    GRANT_SECTION_LABELS,
+    HIT_POINTS_LABELS,
+    PROFICIENCY_MODAL_LABELS,
+    PROFICIENCY_SETTINGS_LABELS,
+    SAVING_THROW_ABILITIES,
+    SAVING_THROW_ROLL_LABELS,
+    SAVING_THROW_SETTINGS_LABELS,
+    SHEET_SUMMARY_COMPACT_CLASSES,
+    SHEET_SUMMARY_WIDE_CLASSES,
+    SHEET_TILE_ICONS,
+    SHEET_TILE_LABELS,
+    SHEET_TILE_SHORT_LABELS,
+  } from './constants';
+  import DeathSavesPanel from './DeathSavesPanel.vue';
   import DiceRollModal from './DiceRollModal.vue';
+  import ExhaustionPanel from './ExhaustionPanel.vue';
   import HitPointsModal from './HitPointsModal.vue';
   import LanguageProficiencyModal from './LanguageProficiencyModal.vue';
+  import ProficiencyBonusModal from './ProficiencyBonusModal.vue';
+  import SavingThrowSettingsModal from './SavingThrowSettingsModal.vue';
+  import SheetSettingsGear from './SheetSettingsGear.vue';
   import ToolProficiencyModal from './ToolProficiencyModal.vue';
+  import { formatSignedNumber } from './utils/formatSignedNumber';
+  import { getSheetBlockClass } from './utils/sheetBlockClass';
   import WeaponProficiencyModal from './WeaponProficiencyModal.vue';
 
   defineOptions({ inheritAttrs: false });
 
-  const props = defineProps<Props>();
+  const props = withDefaults(defineProps<Props>(), { isCompact: false });
+
+  /** Классы раскладки блоков: колонкой на широком листе, сеткой на узком */
+  const layoutClasses = computed(() =>
+    props.isCompact
+      ? SHEET_SUMMARY_COMPACT_CLASSES
+      : SHEET_SUMMARY_WIDE_CLASSES,
+  );
 
   const emit = defineEmits<{
-    'update:actor': [updates: Partial<Actor>];
+    'update:actor': [updates: Partial<DnDActor>];
   }>();
 
   interface Props {
-    actor: Actor;
+    actor: DnDActor;
     isEditMode: boolean;
+    /**
+     * Узкий лист: панель стоит не колонкой, а растворяется в общей сетке
+     * сводки — её блоки встают туда по порядку чтения с телефона.
+     */
+    isCompact?: boolean;
   }
 
-  // Константы
-  const abilities: Array<{
-    key: AbilityType;
-    label: string;
-    shortLabel: string;
-  }> = [
-    { key: 'strength', label: 'Сила', shortLabel: 'Сил.' },
-    { key: 'intelligence', label: 'Интеллект', shortLabel: 'Инт.' },
-    { key: 'dexterity', label: 'Ловкость', shortLabel: 'Лов.' },
-    { key: 'wisdom', label: 'Мудрость', shortLabel: 'Мдр.' },
-    { key: 'constitution', label: 'Телосложение', shortLabel: 'Тел.' },
-    { key: 'charisma', label: 'Харизма', shortLabel: 'Хар.' },
-  ];
+  /**
+   * Оформление плитки, которую настраивают только в правке: там она нажимается
+   * целиком, а в просмотре лишь показывает число.
+   */
+  const editableTileClass = computed(() =>
+    getSheetBlockClass({
+      isEditMode: props.isEditMode,
+      isClickable: props.isEditMode,
+    }),
+  );
+
+  /** Оформление блока здоровья: окно хитов открывают в любом режиме */
+  const hitPointsBlockClass = computed(() =>
+    getSheetBlockClass({ isEditMode: props.isEditMode, isClickable: true }),
+  );
+
+  /**
+   * Максимум хитов с учётом эффектов: «Ложная жизнь» и подобные поднимают
+   * потолок, и плитка обязана показывать то же число, по которому лечат и
+   * ограничивают текущие хиты.
+   *
+   * Только для ПОКАЗА. В окно хитов это число идёт отдельным
+   * `resolvedMaxHitPoints`, а правится там запас листа: окно пишет свой
+   * максимум обратно, и итог с эффектами, попав в поле ввода, копил бы прибавку
+   * с каждым «Применить».
+   */
+  const maxHitPoints = computed(() => resolveEntityMaxHp(props.actor));
+
+  /** Из чего сложилась прибавка к максимуму — окно хитов называет источники */
+  const maxHitPointsSources = computed(() =>
+    resolveMaxHitPointsBreakdown(props.actor),
+  );
+
+  /** Текущая степень Истощения — её несёт эффект-состояние */
+  const exhaustionLevel = computed(() =>
+    getEntityExhaustionLevel(props.actor.activeEffects),
+  );
+
+  /**
+   * Ставит степень Истощения: движок пересобирает эффект со штрафами этой
+   * степени, нулевая — снимает состояние.
+   *
+   * @param level - выбранная степень (0–6)
+   */
+  function handleExhaustionSelect(level: number): void {
+    emit('update:actor', {
+      activeEffects: withExhaustionLevel(
+        props.actor.activeEffects ?? [],
+        level,
+      ),
+    });
+  }
+
+  /** Оформление блока, который целиком не нажимается: настройка — в шестерёнке */
+  const blockClass = computed(() =>
+    getSheetBlockClass({ isEditMode: props.isEditMode }),
+  );
+
+  /**
+   * Подпись плитки класса доспеха: в правке рядом встаёт шестерёнка, и полное
+   * название перестаёт помещаться — там подпись сокращается. Полное остаётся у
+   * скринридера и в подсказке с разбором.
+   */
+  const armorClassLabel = computed(() =>
+    props.isEditMode
+      ? SHEET_TILE_SHORT_LABELS.armorClass
+      : SHEET_TILE_LABELS.armorClass,
+  );
 
   const systemDataStore = useSystemDataStore();
 
@@ -69,10 +198,10 @@
 
   /** Категории брони для умных бэйджей */
   const ARMOR_BADGE_CATEGORIES = [
-    { key: 'light', label: 'Вся лёгкая' },
-    { key: 'medium', label: 'Вся средняя' },
-    { key: 'heavy', label: 'Вся тяжёлая' },
-    { key: 'shield', label: 'Все щиты' },
+    { key: 'light', label: ACTOR_LEFT_PANEL_LABELS.armorAllLight },
+    { key: 'medium', label: ACTOR_LEFT_PANEL_LABELS.armorAllMedium },
+    { key: 'heavy', label: ACTOR_LEFT_PANEL_LABELS.armorAllHeavy },
+    { key: 'shield', label: ACTOR_LEFT_PANEL_LABELS.armorAllShields },
   ];
 
   /**
@@ -125,21 +254,42 @@
     return map;
   });
 
+  /** Названия владений: системные плюс заведённые в мире инструменты */
+  const { labels: toolLabels } = useToolVocabulary();
+
   const toolProfBadges = computed(() => {
-    return props.actor.system.proficiencies.tools.map((key) => {
-      return TOOLS_LABELS[key] ?? key;
-    });
+    // Ключ без названия остаётся ключом: предмет мира могли удалить, а владение
+    // на листе — нет, и терять его показ из-за этого нельзя.
+    return props.actor.system.proficiencies.tools.map(
+      (key) => toolLabels.value[key] ?? key,
+    );
   });
 
   /**
+   * Приёмы, которыми персонаж владеет сам по себе — безотносительно оружия
+   * («Тактический мастер»). Отдельной плашкой от 🏅 у оружия: там приём привязан
+   * к виду оружия, здесь он сам по себе.
+   */
+  const masteryPropertyBadges = computed(() =>
+    (props.actor.system.proficiencies.masteryProperties ?? []).map(
+      (key) => WEAPON_MASTERY_MAP.get(key)?.name.ru ?? key,
+    ),
+  );
+
+  /**
    * Умные бэйджи владения оружием:
-   * - все simple/martial выбраны → «Все простые» / «Все воинские»
-   * - частичный выбор → перечисление конкретных
+   * - все simple/martial выбраны + все мастерства → «Все простые 🏅»
+   * - все simple/martial выбраны + часть мастерств → «Все простые» + конкретные с 🏅
+   * - частичный выбор → перечисление индивидуальных с пометкой мастерства
    */
   const weaponProfBadges = computed(() => {
     const selected = new Set(props.actor.system.proficiencies.weapons);
 
-    const badges: Array<{ label: string }> = [];
+    const masteries = new Set(
+      props.actor.system.proficiencies.weaponMasteries ?? [],
+    );
+
+    const badges: Array<{ label: string; hasMastery: boolean }> = [];
 
     const simpleKeys = systemDataStore.weaponBaseTypes
       .filter((bt) => bt.category === 'simple')
@@ -158,21 +308,64 @@
       && martialKeys.every((weaponKey) => selected.has(weaponKey));
 
     if (allSimple) {
-      badges.push({ label: 'Все простые' });
+      const simpleMasteries = simpleKeys.filter((weaponKey) =>
+        masteries.has(weaponKey),
+      );
+
+      const allSimpleMastery = simpleMasteries.length === simpleKeys.length;
+
+      badges.push({
+        label: ACTOR_LEFT_PANEL_LABELS.weaponsAllSimple,
+        hasMastery: allSimpleMastery,
+      });
+
+      // Если мастерство есть, но не на все — добавляем конкретные
+      if (!allSimpleMastery && simpleMasteries.length > 0) {
+        for (const key of simpleMasteries) {
+          badges.push({
+            label: weaponProfNameMap.value.get(key) ?? key,
+            hasMastery: true,
+          });
+        }
+      }
     } else {
       for (const key of simpleKeys) {
         if (selected.has(key)) {
-          badges.push({ label: weaponProfNameMap.value.get(key) ?? key });
+          badges.push({
+            label: weaponProfNameMap.value.get(key) ?? key,
+            hasMastery: masteries.has(key),
+          });
         }
       }
     }
 
     if (allMartial) {
-      badges.push({ label: 'Все воинские' });
+      const martialMasteries = martialKeys.filter((weaponKey) =>
+        masteries.has(weaponKey),
+      );
+
+      const allMartialMastery = martialMasteries.length === martialKeys.length;
+
+      badges.push({
+        label: ACTOR_LEFT_PANEL_LABELS.weaponsAllMartial,
+        hasMastery: allMartialMastery,
+      });
+
+      if (!allMartialMastery && martialMasteries.length > 0) {
+        for (const key of martialMasteries) {
+          badges.push({
+            label: weaponProfNameMap.value.get(key) ?? key,
+            hasMastery: true,
+          });
+        }
+      }
     } else {
       for (const key of martialKeys) {
         if (selected.has(key)) {
-          badges.push({ label: weaponProfNameMap.value.get(key) ?? key });
+          badges.push({
+            label: weaponProfNameMap.value.get(key) ?? key,
+            hasMastery: masteries.has(key),
+          });
         }
       }
     }
@@ -182,18 +375,50 @@
     return badges;
   });
 
-  const { resolvedStats } = useResolvedStats(toRef(() => props.actor));
+  const { resolvedStats, combinedEffects } = useResolvedStats(
+    toRef(() => props.actor),
+  );
 
-  // Вычисляемые свойства
-  const proficiencyBonus = computed(() => {
-    return resolvedStats.value?.proficiencyBonus ?? 0;
+  /**
+   * Модификаторы характеристик с учётом эффектов — по ним считаются и сами
+   * спасброски, и вклад бонусов-характеристик в окнах настройки. Без
+   * разрешённых статов модификаторы берутся прямо из значений листа.
+   */
+  const sheetAbilityMods = computed<Record<AbilityType, number>>(
+    () =>
+      resolvedStats.value?.abilityMods ?? getActorAbilityModifiers(props.actor),
+  );
+
+  /** Бонус мастерства по правилам — расчёт по суммарному уровню */
+  const ruleProficiencyBonus = computed(() =>
+    calculateProficiencyBonus(getTotalLevel(props.actor.system.classes)),
+  );
+
+  /** Подпись основы по правилам: уровень персонажа с его бонусом */
+  const proficiencyRuleTitle = computed(
+    () =>
+      `${PROFICIENCY_SETTINGS_LABELS.levelSource} ${getTotalLevel(
+        props.actor.system.classes,
+      )}`,
+  );
+
+  const {
+    settings: proficiencySettings,
+    value: proficiencyBonus,
+    tooltip: proficiencyTooltip,
+  } = useProficiencyBonus({
+    settings: () => props.actor.system.proficiencySettings,
+    ruleValue: ruleProficiencyBonus,
+    ruleTitle: proficiencyRuleTitle,
+    abilityMods: sheetAbilityMods,
+    resolvedValue: () => resolvedStats.value?.proficiencyBonus,
   });
 
-  const ARMOR_CALCULATION_LABELS: Record<string, string> = {
-    default: 'По умолчанию',
-    natural: 'Природная броня',
-    flat: 'Фиксированный',
-  };
+  /** Числа листа, от которых считается вклад своих бонусов */
+  const bonusContext = computed<DnDCustomBonusContext>(() => ({
+    abilityMods: sheetAbilityMods.value,
+    proficiencyBonus: proficiencyBonus.value,
+  }));
 
   /** Сводка по костям хитов (Hit Dice) для текущего актора */
   const hitDiceSummary = computed(() => {
@@ -229,7 +454,11 @@
     }
 
     if (diceMap.size === 0) {
-      return { totalCount: 0, availableCount: 0, tooltip: 'Нет костей хитов' };
+      return {
+        totalCount: 0,
+        availableCount: 0,
+        tooltip: ACTOR_LEFT_PANEL_LABELS.hitDiceEmpty,
+      };
     }
 
     let totalCount = 0;
@@ -245,7 +474,7 @@
       availableCount += stats.total - stats.used;
 
       tooltipParts.push(
-        `${stats.total - stats.used}к${die} / ${stats.total}к${die}`,
+        `${stats.total - stats.used}${ACTOR_LEFT_PANEL_LABELS.hitDieLetter}${die} / ${stats.total}${ACTOR_LEFT_PANEL_LABELS.hitDieLetter}${die}`,
       );
     }
 
@@ -270,10 +499,17 @@
     );
   });
 
-  const armorClassTooltip = computed(() => {
+  /**
+   * Разбор класса доспеха по правилам расчёта: без своих бонусов — они у всех
+   * веток одни и приписываются к готовой строке.
+   *
+   * @returns строка разбора
+   */
+  function buildArmorClassText(): string {
     const calculation = props.actor.system.armorClass.calculation;
 
-    const label = ARMOR_CALCULATION_LABELS[calculation] ?? 'По умолчанию';
+    const label =
+      ARMOR_CALCULATION_LABELS[calculation] ?? ARMOR_CALCULATION_LABELS.default;
 
     const effective = effectiveAC.value;
     const dexMod = dexModifier.value;
@@ -283,14 +519,14 @@
         // Ищем экипированную броню и щит для информативного тултипа
         const equipped = (props.actor.equipment ?? []).filter(
           (item) =>
-            item.equipped
+            isItemWorn(item)
             && item.baseArmorAC
             && item.equipmentCategory !== 'shield',
         );
 
         const shield = (props.actor.equipment ?? []).find(
           (item) =>
-            item.equipped
+            isItemWorn(item)
             && item.equipmentCategory === 'shield'
             && item.baseArmorAC,
         );
@@ -316,38 +552,56 @@
             ? (shield.baseArmorAC ?? 0) + (shield.magicBonus ?? 0)
             : 0;
 
-          let text = `КД ${effective} = ${armor.baseArmorAC} (${armor.name})`;
+          let text = `${ACTOR_LEFT_PANEL_LABELS.armorClassPrefix}${effective} = ${armor.baseArmorAC} (${armor.name})`;
 
           if (effectiveDex !== 0) {
-            text += ` + ${effectiveDex} Ловк.`;
+            text += ` + ${effectiveDex}${ACTOR_LEFT_PANEL_LABELS.armorClassDexPart}`;
           }
 
           if (magicBonus > 0) {
-            text += ` + ${magicBonus} маг.`;
+            text += ` + ${magicBonus}${ACTOR_LEFT_PANEL_LABELS.armorClassMagicPart}`;
           }
 
           if (shieldVal > 0) {
-            text += ` + ${shieldVal} щит`;
+            text += ` + ${shieldVal}${ACTOR_LEFT_PANEL_LABELS.armorClassShieldPart}`;
           }
 
           return text;
         }
 
-        return `КД ${effective} = ${BASE_UNARMORED_AC} + ${dexMod} Ловк. (${label})`;
+        return `${ACTOR_LEFT_PANEL_LABELS.armorClassPrefix}${effective} = ${BASE_UNARMORED_AC} + ${dexMod}${ACTOR_LEFT_PANEL_LABELS.armorClassDexPart} (${label})`;
       }
       case 'natural': {
         const baseNatural = props.actor.system.armorClass.value;
 
-        return `КД ${effective} = ${baseNatural} + ${dexMod} Ловк. (${label})`;
+        return `${ACTOR_LEFT_PANEL_LABELS.armorClassPrefix}${effective} = ${baseNatural} + ${dexMod}${ACTOR_LEFT_PANEL_LABELS.armorClassDexPart} (${label})`;
       }
       case 'flat':
-        return `КД ${effective} (${label})`;
+        return `${ACTOR_LEFT_PANEL_LABELS.armorClassPrefix}${effective} (${label})`;
       default:
-        return `КД ${effective} (${label})`;
+        return `${ACTOR_LEFT_PANEL_LABELS.armorClassPrefix}${effective} (${label})`;
     }
+  }
+
+  /** Подсказка плитки КД: разбор расчёта и свои бонусы к нему */
+  const armorClassTooltip = computed(() => {
+    const parts = [buildArmorClassText()];
+
+    for (const bonus of props.actor.system.armorClassBonuses ?? []) {
+      const label = bonus.label.trim() || CUSTOM_BONUS_LABELS.unnamed;
+
+      parts.push(
+        `${label} ${formatSignedNumber(
+          getCustomBonusValue(bonusContext.value, bonus),
+        )}`,
+      );
+    }
+
+    return parts.join(' · ');
   });
 
   // Модалки
+  const isProficiencyBonusOpen = ref(false);
   const isArmorClassOpen = ref(false);
   const isHitPointsOpen = ref(false);
   const isDiceRollOpen = ref(false);
@@ -355,15 +609,47 @@
   const isWeaponProfOpen = ref(false);
   const isToolsProfOpen = ref(false);
   const isLanguagesProfOpen = ref(false);
+  const isSavingThrowSettingsOpen = ref(false);
 
-  const diceRollConfig = ref({
+  /** Настройка окна броска: собирается перед каждым открытием */
+  interface DiceRollConfig {
+    modifier: number;
+    title: string;
+    rollLabel: string;
+    rollButtonText: string;
+    initialRollMode: AttackRollMode;
+    autoFail: boolean;
+    evaluateBonusRollFormulas?: RollBonusEvaluator;
+    /** Сложность, против которой бросок подписывается успехом или провалом */
+    targetDc?: number;
+    /** Итог броска проверки */
+    onCheckRoll?: (result: CheckRollResult) => void;
+  }
+
+  const diceRollConfig = ref<DiceRollConfig>({
     modifier: 0,
     title: '',
     rollLabel: '',
-    rollButtonText: 'Бросить',
-    initialRollMode: 'normal' as AttackRollMode,
+    rollButtonText: DICE_ROLL_DEFAULT_BUTTON,
+    initialRollMode: 'normal',
     autoFail: false,
   });
+
+  /** Открывает окно настройки бонуса мастерства */
+  function openProficiencyBonus(): void {
+    isProficiencyBonusOpen.value = true;
+  }
+
+  /**
+   * Применяет настройку бонуса мастерства из окна.
+   *
+   * @param settings - своя основа и свои бонусы
+   */
+  function onProficiencySettingsApply(settings: DnDProficiencySettings): void {
+    emit('update:actor', {
+      system: { ...props.actor.system, proficiencySettings: settings },
+    });
+  }
 
   function openArmorClass() {
     isArmorClassOpen.value = true;
@@ -381,22 +667,85 @@
    * @param config.rollLabel - подпись броска
    * @param config.rollButtonText - текст кнопки броска
    */
-  function openDiceRoll(config: {
-    modifier: number;
-    title: string;
-    rollLabel: string;
-    rollButtonText?: string;
-    initialRollMode?: AttackRollMode;
-    autoFail?: boolean;
-  }) {
+  function openDiceRoll(
+    config: Partial<DiceRollConfig>
+      & Pick<DiceRollConfig, 'modifier' | 'title' | 'rollLabel'>,
+  ) {
     diceRollConfig.value = {
       ...config,
-      rollButtonText: config.rollButtonText ?? 'Бросить',
+      rollButtonText: config.rollButtonText ?? DICE_ROLL_DEFAULT_BUTTON,
       initialRollMode: config.initialRollMode ?? 'normal',
       autoFail: config.autoFail ?? false,
     };
 
     isDiceRollOpen.value = true;
+  }
+
+  // --- Спасброски от смерти ---
+
+  /** Блок виден, пока хиты персонажа на нуле */
+  const showDeathSaves = computed(() => isEntityAtZeroHp(props.actor));
+
+  const deathSaves = computed(() => readDeathSaves(props.actor));
+  const isDead = computed(() => isActorDead(props.actor));
+
+  /**
+   * Записывает серию в персонажа.
+   *
+   * @param state - счётчики серии
+   */
+  function updateDeathSaves(state: DeathSavesState): void {
+    emit('update:actor', {
+      system: { ...props.actor.system, deathSaves: state },
+    });
+  }
+
+  /**
+   * Применяет итог броска: счётчики, 1 хит или метку смерти.
+   *
+   * @param result - итог броска проверки
+   */
+  function applyDeathSaveRoll(result: CheckRollResult): void {
+    const outcome = resolveDeathSave(
+      readDeathSaves(props.actor),
+      result.natural,
+      result.total,
+    );
+
+    emit('update:actor', buildDeathSavePatch(props.actor, outcome));
+
+    useChatStore().sendMessage(
+      formatDeathSaveSummary(props.actor.name, outcome, 'roll'),
+      'text',
+    );
+  }
+
+  /**
+   * Открывает бросок спасброска от смерти. В правке листа не бросается: итог
+   * говорится в чат сразу, а в мир попал бы только с «Сохранить» — «Отмена»
+   * оставила бы в чате бросок, которого на листе нет. Счётчики серии в правке
+   * правятся руками.
+   */
+  function rollDeathSave(): void {
+    if (refuseWhileSheetEditing(props.actor.id)) {
+      return;
+    }
+
+    openDiceRoll({
+      modifier: resolvedStats.value?.deathSaveBonus ?? 0,
+      evaluateBonusRollFormulas: buildRollBonusEvaluator(
+        () => props.actor,
+        DEATH_SAVE_KEY,
+      ),
+      title: DEATH_SAVES_BLOCK_LABELS.rollTitle,
+      rollLabel: DEATH_SAVES_BLOCK_LABELS.rollTitle,
+      rollButtonText: SAVING_THROW_ROLL_LABELS.button,
+      initialRollMode: resolveDeathSaveRollMode(
+        resolvedStats.value?.activeFlags ?? new Set(),
+      ),
+      targetDc: DEATH_SAVE_DC,
+      onCheckRoll: applyDeathSaveRoll,
+    });
   }
 
   function handleSavingThrowClick(ability: {
@@ -407,46 +756,63 @@
       return;
     }
 
-    let initialRollMode: AttackRollMode = 'normal';
     let autoFail = false;
 
     const flags = resolvedStats.value?.activeFlags ?? new Set();
 
-    const hasAdvantage =
-      flags.has(`save.advantage.${ability.key}`) || flags.has('save.advantage');
-
-    const hasDisadvantage =
-      flags.has(`save.disadvantage.${ability.key}`)
-      || flags.has('save.disadvantage');
+    // Спасбросок с панели катится по своей воле, и источник его неизвестен,
+    // поэтому `save.*.vsMagic` тут не применяется: выдать преимущество против
+    // яда по предмету «против заклинаний» хуже, чем не выдать вовсе. Когда
+    // спасбросок навязывает заклинание, его считает `useSpellSavingThrows`.
+    const initialRollMode: AttackRollMode = resolveSavingThrowRollMode({
+      flags,
+      ability: ability.key,
+    });
 
     if (flags.has(`save.autoFail.${ability.key}`)) {
       autoFail = true;
     }
 
-    if (hasAdvantage && !hasDisadvantage) {
-      initialRollMode = 'advantage';
-    }
-
-    if (!hasAdvantage && hasDisadvantage) {
-      initialRollMode = 'disadvantage';
-    }
-
     openDiceRoll({
       modifier: calculateSavingThrow(ability.key),
-      title: `Спасбросок: ${ability.label}`,
-      rollLabel: `Спасбросок ${ability.label}`,
-      rollButtonText: 'Бросить спасбросок',
+      evaluateBonusRollFormulas: buildRollBonusEvaluator(
+        () => props.actor,
+        `save.${ability.key}`,
+      ),
+      title: `${SAVING_THROW_ROLL_LABELS.titlePrefix}${ability.label}`,
+      rollLabel: `${SAVING_THROW_ROLL_LABELS.rollPrefix}${ability.label}`,
+      rollButtonText: SAVING_THROW_ROLL_LABELS.button,
       initialRollMode,
       autoFail,
     });
   }
 
-  function onArmorClassApply(armorClass: ActorArmorClass) {
+  /**
+   * Применяет класс доспеха из окна: расчёт и свои бонусы правятся там вместе.
+   *
+   * @param payload - настройка из окна
+   * @param payload.armorClass - расчёт класса доспеха
+   * @param payload.bonuses - свои бонусы к классу доспеха
+   */
+  function onArmorClassApply(payload: {
+    armorClass: ActorArmorClass;
+    bonuses: DnDCustomBonus[];
+  }) {
     emit('update:actor', {
-      system: { ...props.actor.system, armorClass },
+      system: {
+        ...props.actor.system,
+        armorClass: payload.armorClass,
+        armorClassBonuses: payload.bonuses,
+      },
     });
   }
 
+  /**
+   * Записывает правку окна хитов. `data.max` — СВОЙ максимум листа: окно правит
+   * запас, а прибавку эффектов только показывает рядом.
+   *
+   * @param data - правка из окна хитов
+   */
   function onHitPointsApply(data: {
     current: number;
     max: number;
@@ -477,8 +843,14 @@
     return resolvedStats.value?.saves[abilityKey] ?? 0;
   }
 
-  function formatModifier(value: number): string {
-    return value >= 0 ? `+${value}` : `${value}`;
+  /** Итоговые спасброски листа: из них окно берёт вклад активных эффектов */
+  const savingThrowValues = computed<Partial<Record<AbilityType, number>>>(
+    () => resolvedStats.value?.saves ?? {},
+  );
+
+  /** Открывает окно настройки спасбросков */
+  function openSavingThrowSettings(): void {
+    isSavingThrowSettingsOpen.value = true;
   }
 
   function toggleSavingThrow(ability: AbilityType) {
@@ -507,6 +879,30 @@
   }
 
   /**
+   * Применяет настройку спасбросков: владения и поправки расчёта приходят из
+   * окна вместе — их правят там одной таблицей.
+   *
+   * @param payload - настройка из окна
+   * @param payload.savingThrows - характеристики, спасбросками которых владеют
+   * @param payload.settings - поправки расчёта спасбросков
+   */
+  function onSavingThrowSettingsApply(payload: {
+    savingThrows: AbilityType[];
+    settings: DnDSavingThrowSettings;
+  }) {
+    emit('update:actor', {
+      system: {
+        ...props.actor.system,
+        savingThrowSettings: payload.settings,
+        proficiencies: {
+          ...props.actor.system.proficiencies,
+          savingThrows: payload.savingThrows,
+        },
+      },
+    });
+  }
+
+  /**
    * Применяет выбор владения бронёй из модалки
    */
   function onArmorProfApply(selected: string[]) {
@@ -522,15 +918,21 @@
   }
 
   /**
-   * Применяет выбор владения оружием из модалки
+   * Применяет выбор владения и мастерства оружием из модалки
    */
-  function onWeaponProfApply(weapons: string[]) {
+  function onWeaponProfApply(
+    weapons: string[],
+    masteries: string[],
+    masteryProperties: string[],
+  ) {
     emit('update:actor', {
       system: {
         ...props.actor.system,
         proficiencies: {
           ...props.actor.system.proficiencies,
           weapons,
+          weaponMasteries: masteries,
+          masteryProperties,
         },
       },
     });
@@ -570,68 +972,106 @@
 <template>
   <div
     v-bind="$attrs"
-    class="flex flex-col gap-3 text-toned"
+    class="text-toned"
+    :class="layoutClasses.panel"
   >
-    <!-- Top Stats Grid -->
-    <div class="mb-0 grid grid-cols-2 gap-x-3 gap-y-3">
-      <!-- Proficiency bonus -->
+    <!-- Плитки показателей -->
+    <div :class="layoutClasses.tiles">
+      <!-- Mastery -->
       <FieldsetLabel
-        label="Мастерство"
+        :label="SHEET_TILE_LABELS.proficiency"
         center
-        class="h-12 border-muted bg-default/20"
+        class="h-12 bg-default/20 transition-colors"
+        :class="editableTileClass"
+        @click.left.exact.prevent="isEditMode && openProficiencyBonus()"
       >
-        <div class="flex items-center justify-center px-2 pb-2">
-          <div class="text-xl font-bold text-highlighted">
-            +{{ proficiencyBonus }}
+        <!-- Шестерёнка ведёт в то же окно, что и клик по плитке: значок
+          называет настройку, а не прячет её за догадкой -->
+        <template
+          v-if="isEditMode"
+          #actions
+        >
+          <SheetSettingsGear
+            :label="PROFICIENCY_SETTINGS_LABELS.open"
+            @open="openProficiencyBonus"
+          />
+        </template>
+
+        <!-- Подсказка на содержимом, а не на всей плитке: вложенная в неё
+          подсказка шестерёнки показалась бы вместе с этой -->
+        <UTooltip
+          :text="proficiencyTooltip"
+          :delay-duration="300"
+          :ui="{ content: 'h-auto' }"
+        >
+          <div class="flex items-center justify-center px-2 pb-2">
+            <div class="text-xl font-bold text-highlighted tabular-nums">
+              {{ formatSignedNumber(proficiencyBonus) }}
+            </div>
           </div>
-        </div>
+        </UTooltip>
       </FieldsetLabel>
 
       <!-- AC -->
-      <UTooltip
-        :delay-duration="300"
-        :ui="{ content: 'h-auto' }"
+      <FieldsetLabel
+        :label="armorClassLabel"
+        :aria-label="SHEET_TILE_LABELS.armorClass"
+        center
+        class="h-12 bg-default/20 transition-colors"
+        :class="editableTileClass"
+        @click.left.exact.prevent="isEditMode && openArmorClass()"
       >
-        <FieldsetLabel
-          label="Класс доспеха"
-          center
-          class="h-12 bg-default/20 transition-colors"
-          :class="[
-            isEditMode
-              ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-              : 'border-muted',
-          ]"
-          @click.left.exact.prevent="isEditMode && openArmorClass()"
+        <template
+          v-if="isEditMode"
+          #actions
         >
-          <div class="flex items-center justify-center px-2 pb-2">
+          <SheetSettingsGear
+            :label="ARMOR_CLASS_SETTINGS_LABELS.open"
+            @open="openArmorClass"
+          />
+        </template>
+
+        <UTooltip
+          :text="armorClassTooltip"
+          :delay-duration="300"
+          :ui="{ content: 'h-auto' }"
+        >
+          <div class="flex items-center justify-center gap-1 px-2 pb-2">
+            <UIcon
+              :name="SHEET_TILE_ICONS.armorClass"
+              class="size-5 shrink-0 text-primary"
+            />
+
             <span class="text-xl font-bold text-highlighted">{{
               effectiveAC
             }}</span>
           </div>
-        </FieldsetLabel>
-
-        <template #content>
-          <span>{{ armorClassTooltip }}</span>
-        </template>
-      </UTooltip>
+        </UTooltip>
+      </FieldsetLabel>
     </div>
 
     <!-- Здоровье + Кости хитов -->
     <FieldsetLabel
-      label="Здоровье"
-      class="group cursor-pointer bg-default/20 transition-colors"
-      :class="
-        isEditMode
-          ? 'border-gold/30 hover:border-gold/50'
-          : 'border-muted hover:border-primary/50'
-      "
+      :label="SHEET_TILE_LABELS.hitPoints"
+      class="group bg-default/20 transition-colors"
+      :class="[hitPointsBlockClass, layoutClasses.health]"
       @click.left.exact.prevent="openHitPoints()"
     >
+      <template
+        v-if="isEditMode"
+        #actions
+      >
+        <SheetSettingsGear
+          :label="HIT_POINTS_LABELS.open"
+          @open="openHitPoints"
+        />
+      </template>
+
       <!-- ХП: цифры + подписи -->
       <div class="p-3 pt-1">
         <div class="flex items-center">
           <span
-            class="flex-1 text-center text-xl font-bold text-white tabular-nums"
+            class="flex-1 text-center text-xl font-bold text-highlighted tabular-nums"
             >{{ actor.system.hitPoints?.current ?? 0 }}</span
           >
 
@@ -639,7 +1079,7 @@
 
           <span
             class="flex-1 text-center text-xl font-bold text-muted tabular-nums"
-            >{{ actor.system.hitPoints?.max ?? 0 }}</span
+            >{{ maxHitPoints }}</span
           >
 
           <div class="mx-2 h-6 w-px bg-elevated" />
@@ -648,7 +1088,7 @@
             class="flex-1 text-center text-xl font-bold tabular-nums"
             :class="
               (actor.system.hitPoints?.temp ?? 0) > 0
-                ? 'text-gold/80'
+                ? 'text-primary/80'
                 : 'text-dimmed'
             "
             >{{ actor.system.hitPoints?.temp ?? 0 }}</span
@@ -658,22 +1098,25 @@
         <div class="mt-0.5 flex items-center">
           <span
             class="flex-1 text-center text-[9px] font-medium tracking-wider text-dimmed uppercase"
-            >Сейчас</span
           >
+            {{ ACTOR_LEFT_PANEL_LABELS.hitPointsCurrent }}
+          </span>
 
           <span class="w-3" />
 
           <span
             class="flex-1 text-center text-[9px] font-medium tracking-wider text-dimmed uppercase"
-            >Всего</span
           >
+            {{ ACTOR_LEFT_PANEL_LABELS.hitPointsTotal }}
+          </span>
 
           <div class="mx-2 w-px" />
 
           <span
             class="flex-1 text-center text-[9px] font-medium tracking-wider text-dimmed uppercase"
-            >Врем.</span
           >
+            {{ ACTOR_LEFT_PANEL_LABELS.hitPointsTemporary }}
+          </span>
         </div>
       </div>
 
@@ -686,7 +1129,7 @@
           <span
             class="text-[10px] font-bold tracking-wider text-dimmed uppercase"
           >
-            Кости хитов
+            {{ ACTOR_LEFT_PANEL_LABELS.hitDice }}
           </span>
 
           <span class="text-sm font-bold text-toned tabular-nums">
@@ -710,46 +1153,73 @@
       </UTooltip>
     </FieldsetLabel>
 
+    <!-- Спасброски от смерти: сразу под здоровьем, пока хиты на нуле -->
+    <DeathSavesPanel
+      v-if="showDeathSaves"
+      :state="deathSaves"
+      :is-dead="isDead"
+      :is-edit-mode="isEditMode"
+      :class="layoutClasses.health"
+      @roll="rollDeathSave"
+      @update="updateDeathSaves"
+    />
+
+    <!-- Истощение: сразу под здоровьем — степень штрафует все тесты к20 и
+      скорость, и читается она вместе с хитами, а не на отдельной вкладке -->
+    <ExhaustionPanel
+      :level="exhaustionLevel"
+      :is-edit-mode="isEditMode"
+      :class="layoutClasses.exhaustion"
+      @select="handleExhaustionSelect"
+    />
+
     <!-- Спасброски -->
     <FieldsetLabel
-      label="Спасброски"
-      class="border-muted bg-default/20"
+      :label="GRANT_SECTION_LABELS.savingThrows"
+      class="bg-default/20 transition-colors"
+      :class="[blockClass, layoutClasses.savingThrows]"
     >
+      <!-- Шестерёнка ведёт в настройку расчёта: кружки в самом блоке ставят
+        только владение, а характеристику спасброска и свои бонусы правят в
+        окне. Вне правки листа её нет — настраивать там нечего -->
+      <template
+        v-if="isEditMode"
+        #actions
+      >
+        <SheetSettingsGear
+          :label="SAVING_THROW_SETTINGS_LABELS.open"
+          @open="openSavingThrowSettings"
+        />
+      </template>
+
       <div class="px-2 pb-1">
         <div class="grid grid-cols-2 gap-x-2 gap-y-1">
           <div
-            v-for="ability in abilities"
+            v-for="ability in SAVING_THROW_ABILITIES"
             :key="ability.key"
             class="flex cursor-pointer items-center gap-2 rounded p-1.5 transition-colors hover:bg-elevated"
             @click.left.exact.prevent="handleSavingThrowClick(ability)"
           >
             <button
-              class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border border-accented"
+              class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border"
               :class="
                 actor.system.proficiencies.savingThrows.includes(ability.key)
-                  ? 'bg-inverted'
-                  : 'bg-transparent'
+                  ? 'border-primary bg-primary'
+                  : 'border-accented bg-transparent'
               "
               @click.left.exact.prevent="
                 isEditMode && toggleSavingThrow(ability.key)
               "
-            >
-              <div
-                v-if="
-                  actor.system.proficiencies.savingThrows.includes(ability.key)
-                "
-                class="h-1.5 w-1.5 rounded-full bg-inverted"
-              />
-            </button>
+            />
 
             <span class="flex-1 truncate text-sm font-medium text-toned">{{
               ability.shortLabel
             }}</span>
 
             <span
-              class="rounded border border-default bg-elevated px-2 py-0.5 text-sm font-bold text-white shadow-sm"
+              class="rounded border border-default bg-elevated px-2 py-0.5 text-sm font-bold text-highlighted shadow-sm"
             >
-              {{ formatModifier(calculateSavingThrow(ability.key)) }}
+              {{ formatSignedNumber(calculateSavingThrow(ability.key)) }}
             </span>
           </div>
         </div>
@@ -757,21 +1227,25 @@
     </FieldsetLabel>
 
     <!-- Владения & Прочее (Броня, Оружие, Инструменты, Языки) -->
-    <div class="space-y-5 rounded-lg border border-muted bg-default/20 p-2">
+    <div
+      class="space-y-5 rounded-lg border bg-default/20 p-2 transition-colors"
+      :class="[blockClass, layoutClasses.proficiencies]"
+    >
       <!-- Броня -->
       <div>
         <div
           class="mb-2 flex items-center justify-between rounded-lg bg-elevated/40 px-3 py-2"
         >
-          <h4 class="text-xs font-bold tracking-wider text-white uppercase">
-            Снаряжение
+          <h4
+            class="text-xs font-bold tracking-wider text-highlighted uppercase"
+          >
+            {{ ACTOR_LEFT_PANEL_LABELS.equipment }}
           </h4>
 
-          <UIcon
+          <SheetSettingsGear
             v-if="isEditMode"
-            name="tabler:settings-filled"
-            class="h-4 w-4 cursor-pointer text-dimmed transition-colors hover:text-white"
-            @click.left.exact.prevent="isArmorProfOpen = true"
+            :label="PROFICIENCY_MODAL_LABELS.armorOpen"
+            @open="isArmorProfOpen = true"
           />
         </div>
 
@@ -787,8 +1261,9 @@
           <span
             v-if="armorProfBadges.length === 0"
             class="text-xs text-dimmed italic"
-            >Нет</span
           >
+            {{ ACTOR_LEFT_PANEL_LABELS.empty }}
+          </span>
         </div>
       </div>
 
@@ -797,15 +1272,16 @@
         <div
           class="mb-2 flex items-center justify-between rounded-lg bg-elevated/40 px-3 py-2"
         >
-          <h4 class="text-xs font-bold tracking-wider text-white uppercase">
-            Оружие
+          <h4
+            class="text-xs font-bold tracking-wider text-highlighted uppercase"
+          >
+            {{ GRANT_SECTION_LABELS.weapons }}
           </h4>
 
-          <UIcon
+          <SheetSettingsGear
             v-if="isEditMode"
-            name="tabler:settings-filled"
-            class="h-4 w-4 cursor-pointer text-dimmed transition-colors hover:text-white"
-            @click.left.exact.prevent="isWeaponProfOpen = true"
+            :label="PROFICIENCY_MODAL_LABELS.weaponsOpen"
+            @open="isWeaponProfOpen = true"
           />
         </div>
 
@@ -816,13 +1292,49 @@
             :label="badge.label"
             color="neutral"
             variant="subtle"
-          />
+          >
+            <template
+              v-if="badge.hasMastery"
+              #trailing
+            >
+              <UIcon
+                name="tabler:medal"
+                class="h-3.5 w-3.5 text-healing"
+              />
+            </template>
+          </UBadge>
 
           <span
             v-if="weaponProfBadges.length === 0"
             class="text-xs text-dimmed italic"
-            >Нет</span
           >
+            {{ ACTOR_LEFT_PANEL_LABELS.empty }}
+          </span>
+        </div>
+      </div>
+
+      <!-- Оружейные приёмы: показываются, только когда они есть — у
+        большинства персонажей приём привязан к оружию и живёт плашкой 🏅 -->
+      <div v-if="masteryPropertyBadges.length > 0">
+        <div
+          class="mb-2 flex items-center justify-between rounded-lg bg-elevated/40 px-3 py-2"
+        >
+          <h4
+            class="text-xs font-bold tracking-wider text-highlighted uppercase"
+          >
+            {{ GRANT_SECTION_LABELS.masteryProperties }}
+          </h4>
+        </div>
+
+        <div class="flex flex-wrap gap-1.5">
+          <UBadge
+            v-for="mastery in masteryPropertyBadges"
+            :key="mastery"
+            :label="mastery"
+            color="neutral"
+            variant="subtle"
+            icon="tabler:medal"
+          />
         </div>
       </div>
 
@@ -831,15 +1343,16 @@
         <div
           class="mb-2 flex items-center justify-between rounded-lg bg-elevated/40 px-3 py-2"
         >
-          <h4 class="text-xs font-bold tracking-wider text-white uppercase">
-            Инструменты
+          <h4
+            class="text-xs font-bold tracking-wider text-highlighted uppercase"
+          >
+            {{ GRANT_SECTION_LABELS.tools }}
           </h4>
 
-          <UIcon
+          <SheetSettingsGear
             v-if="isEditMode"
-            name="tabler:settings-filled"
-            class="h-4 w-4 cursor-pointer text-dimmed transition-colors hover:text-white"
-            @click.left.exact.prevent="isToolsProfOpen = true"
+            :label="PROFICIENCY_MODAL_LABELS.toolsOpen"
+            @open="isToolsProfOpen = true"
           />
         </div>
 
@@ -855,8 +1368,9 @@
           <span
             v-if="actor.system.proficiencies.tools.length === 0"
             class="text-xs text-dimmed italic"
-            >Нет</span
           >
+            {{ ACTOR_LEFT_PANEL_LABELS.empty }}
+          </span>
         </div>
       </div>
 
@@ -865,15 +1379,16 @@
         <div
           class="mb-2 flex items-center justify-between rounded-lg bg-elevated/40 px-3 py-2"
         >
-          <h4 class="text-xs font-bold tracking-wider text-white uppercase">
-            Языки
+          <h4
+            class="text-xs font-bold tracking-wider text-highlighted uppercase"
+          >
+            {{ GRANT_SECTION_LABELS.languages }}
           </h4>
 
-          <UIcon
+          <SheetSettingsGear
             v-if="isEditMode"
-            name="tabler:settings-filled"
-            class="h-4 w-4 cursor-pointer text-dimmed transition-colors hover:text-white"
-            @click.left.exact.prevent="isLanguagesProfOpen = true"
+            :label="PROFICIENCY_MODAL_LABELS.languagesOpen"
+            @open="isLanguagesProfOpen = true"
           />
         </div>
 
@@ -889,8 +1404,9 @@
           <span
             v-if="actor.system.proficiencies.languages.length === 0"
             class="text-xs text-dimmed italic"
-            >Нет</span
           >
+            {{ ACTOR_LEFT_PANEL_LABELS.empty }}
+          </span>
         </div>
       </div>
     </div>
@@ -900,7 +1416,11 @@
   <ArmorClassModal
     v-model:open="isArmorClassOpen"
     :armor-class="actor.system.armorClass"
+    :bonuses="actor.system.armorClassBonuses"
+    :context="bonusContext"
     :dex-modifier="dexModifier"
+    :resolved-armor-class="resolvedStats?.armorClass"
+    :active-effects="combinedEffects"
     @apply="onArmorClassApply"
   />
 
@@ -909,6 +1429,8 @@
     v-model:open="isHitPointsOpen"
     :current-hit-points="actor.system.hitPoints?.current ?? 0"
     :max-hit-points="actor.system.hitPoints?.max ?? 0"
+    :resolved-max-hit-points="maxHitPoints"
+    :max-hit-points-sources="maxHitPointsSources"
     :temp-hit-points="actor.system.hitPoints?.temp ?? 0"
     :classes="actor.system.classes ?? []"
     :manual-hit-dice="actor.system.manualHitDice ?? []"
@@ -921,9 +1443,13 @@
     :modifier="diceRollConfig.modifier"
     :title="diceRollConfig.title"
     :roll-label="diceRollConfig.rollLabel"
+    :actor-name="actor.name"
     :roll-button-text="diceRollConfig.rollButtonText"
     :initial-roll-mode="diceRollConfig.initialRollMode"
     :auto-fail="diceRollConfig.autoFail"
+    :evaluate-bonus-roll-formulas="diceRollConfig.evaluateBonusRollFormulas"
+    :target-dc="diceRollConfig.targetDc"
+    :on-check-roll="diceRollConfig.onCheckRoll"
   />
 
   <!-- Модалка владения бронёй -->
@@ -933,10 +1459,14 @@
     @apply="onArmorProfApply"
   />
 
-  <!-- Модалка владения оружием -->
+  <!-- Модалка владения и мастерства оружием -->
   <WeaponProficiencyModal
     v-model:open="isWeaponProfOpen"
     :selected-weapons="actor.system.proficiencies.weapons"
+    :selected-masteries="actor.system.proficiencies.weaponMasteries ?? []"
+    :selected-mastery-properties="
+      actor.system.proficiencies.masteryProperties ?? []
+    "
     @apply="onWeaponProfApply"
   />
 
@@ -952,5 +1482,27 @@
     v-model:open="isLanguagesProfOpen"
     :selected="actor.system.proficiencies.languages"
     @apply="onLanguagesProfApply"
+  />
+
+  <!-- Модалка настройки бонуса мастерства -->
+  <ProficiencyBonusModal
+    v-model:open="isProficiencyBonusOpen"
+    :settings="proficiencySettings"
+    :ability-mods="sheetAbilityMods"
+    :rule-value="ruleProficiencyBonus"
+    :rule-title="proficiencyRuleTitle"
+    :sheet-value="proficiencyBonus"
+    @apply="onProficiencySettingsApply"
+  />
+
+  <!-- Модалка настройки спасбросков -->
+  <SavingThrowSettingsModal
+    v-model:open="isSavingThrowSettingsOpen"
+    :saving-throws="actor.system.proficiencies.savingThrows"
+    :settings="actor.system.savingThrowSettings"
+    :ability-mods="sheetAbilityMods"
+    :proficiency-bonus="proficiencyBonus"
+    :saves="savingThrowValues"
+    @apply="onSavingThrowSettingsApply"
   />
 </template>

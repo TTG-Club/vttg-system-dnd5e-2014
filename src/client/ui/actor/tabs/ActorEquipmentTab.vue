@@ -1,65 +1,206 @@
 <script setup lang="ts">
-  import type { SceneEntity } from '@vtt/shared';
+  // Корневой вход `@nuxt/ui` — это Nuxt-модуль, типы компонентов он не отдаёт
+  import type { DropdownMenuItem } from '@nuxt/ui/components/DropdownMenu.vue';
+
+  import type { CompendiumEntry } from '@vtt/shared';
   import type {
-    Actor,
-    AttackRollMode,
-    GameItem,
+    DnDCarryingCapacity,
+    DnDCurrency,
+    DnDGameItem,
+    DnDSceneEntity,
     Spell,
   } from '@vtt/shared/system/dnd.js';
 
+  import type { ItemTransferPayload } from '../../../composables/useItemTransfer';
+  import type { ItemSection } from '../compendiumFilters';
+  import type { PickedCompendiumEntry } from '../CompendiumRefPickerModal.vue';
   import type {
-    RolledSpellDamagePart,
-    SpellDamagePartInput,
-  } from '../../../composables/useSpellResolution';
+    EquipmentAmmunitionBadge,
+    SheetRowStat,
+  } from '../sheetRowTypes';
 
-  import {
-    calculateWeaponAttackModifier,
-    calculateWeaponDamageModifier,
-    describeDamagePart,
-    evaluateConditionalBonuses,
-    formatWeaponDamageFormula,
-    getEquipmentCategoryIcon,
-    getWeaponPrimaryDamageType,
-    resolveActorStats,
-    TOOL_CATEGORIES,
-  } from '@vtt/shared/system/dnd.js';
   import { computed, ref, toRef } from 'vue';
 
+  import { loadCompendiumManifests } from '@/core/compendiumDataClient';
   import { startHotbarDrag } from '@/core/utils/hotbarDrag';
-  import { ContextMenuDangerItem } from '@/shared_ui/components';
-  import FieldGroupReset from '@/shared_ui/components/FieldGroupReset.vue';
   import { useModalManager } from '@/shared_ui/composables/useModalManager';
   import { useChatStore } from '@/stores/chatStore';
   import { useHotbarStore } from '@/stores/hotbarStore';
-  import { useTargetStore } from '@/stores/targetStore';
-  import { useWorldStore } from '@/stores/worldStore';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+  import { DISTANCE_UNIT_SHORT, formatItemCost } from '@vtt/shared';
+  import {
+    calculateWeaponAttackModifier,
+    calculateWeaponDamageModifier,
+    canSpendItemUses,
+    canUseItem,
+    createInventoryItem,
+    CURRENCY_OPTIONS,
+    DEFAULT_CREATURE_SIZE,
+    DEFAULT_REACH_FEET,
+    describeDamagePart,
+    describeWeaponAttack,
+    describeWeaponDamage,
+    describeWeaponDamageDisplay,
+    findLoadedAmmunition,
+    getWeaponDamageParts,
+    hasItemUseEffects,
+    isDnDGameItem,
+    isItemDepleted,
+    isThrowableMeleeWeapon,
+    itemCostInCopper,
+    listItemToggles,
+    listLoadableAmmunition,
+    listSourceDamageTypeChoices,
+    loadWeaponAmmunition,
+    normalizeItemQuantity,
+    receiveIntoWallet,
+    setItemUsesCurrent,
+    spendItemUses,
+    STARTING_EQUIPMENT_ITEM_KINDS,
+    TOOL_CATEGORIES,
+    weaponUsesAmmunition,
+    withLoadedAmmunition,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { useBonusDamageParts } from '../../../composables/useBonusDamageParts';
+  import { refuseWeaponAttack } from '../../../composables/actionRefusal';
+  import {
+    formatDamageBonusLines,
+    formatDamageTileFormula,
+    formatDamageTypeChoiceLabel,
+    resolveDamageStatIcon,
+  } from '../../../composables/damageTypeChoice';
+  import { applyEntityItemUse } from '../../../composables/effectActivationUse';
+  import { toggleEntityItemEffect } from '../../../composables/itemEffectToggle';
+  import { useCarryingCapacity } from '../../../composables/useCarryingCapacity';
+  import { useCompendiumWarmup } from '../../../composables/useCompendiumWarmup';
   import { useResolvedStats } from '../../../composables/useResolvedStats';
-  import { useSpellResolution } from '../../../composables/useSpellResolution';
   import { useWeaponIcon } from '../../../composables/useWeaponIcon';
-  import { GAME_ITEM_TRANSFER_MIME } from '../constants';
-  import DiceRollModal from '../DiceRollModal.vue';
+  import {
+    createWeaponAttackPort,
+    startWeaponAttack,
+  } from '../../../composables/weaponAttackRoll';
+  import {
+    DND_MACRO_TYPES,
+    ITEM_USE_MACRO_ICON,
+  } from '../../../macros/constants';
+  import { useSystemDataStore } from '../../../stores/systemDataStore';
+  import {
+    EFFECT_USE_LABELS,
+    ITEM_TOGGLE_ICONS,
+    ITEM_TOGGLE_LABELS,
+  } from '../../effect/constants';
+  import ActorEquipmentRow from '../ActorEquipmentRow.vue';
+  import CarryingCapacityModal from '../CarryingCapacityModal.vue';
+  import {
+    buildItemSectionFilterValue,
+    collectItemSections,
+    itemSectionFilterOrder,
+  } from '../compendiumFilters';
+  import CompendiumRefPickerModal from '../CompendiumRefPickerModal.vue';
+  import {
+    ACTOR_EQUIPMENT_TAB_LABELS,
+    EQUIPMENT_AMMUNITION_BADGE,
+    EQUIPMENT_EQUIP_ACTION_LABELS,
+    EQUIPMENT_MENU_LABELS,
+    EQUIPMENT_PURCHASE_ICON,
+    EQUIPMENT_STAT_HINTS,
+    EQUIPMENT_STAT_LABELS,
+    FILTER_ROW_CONTROL_SIZE,
+    GAME_ITEM_TRANSFER_MIME,
+    SHEET_ROW_MENU_LABELS,
+    SHEET_ROW_TOOLTIP_LINE_BREAK,
+    WEAPON_RANGE_TYPE_LABELS,
+    WEAPON_THROWN_RANGE_LABEL,
+    WEIGHT_UNIT_LABEL,
+  } from '../constants';
+  import CurrencyModal from '../CurrencyModal.vue';
+  import EquipmentPurchaseModal from '../EquipmentPurchaseModal.vue';
+  import SheetStatTile from '../SheetStatTile.vue';
   import { extractSpellFromGameItem } from '../utils/extractSpellFromGameItem';
-  import WeaponIcon from '../WeaponIcon.vue';
+  import { formatMeleeOrRangedDistances } from '../utils/formatAttackDistances';
+  import { formatSignedNumber } from '../utils/formatSignedNumber';
+  import { formatWeaponModifierParts } from '../utils/formatWeaponModifierParts';
+  import { getItemIcon } from '../utils/itemIcon';
 
   const props = defineProps<Props>();
 
-  const { resolvedStats, combinedEffects } = useResolvedStats(
-    toRef(() => props.actor),
-  );
+  const { resolvedStats } = useResolvedStats(toRef(() => props.entity));
 
+  /** Переносимый вес: сумма веса инвентаря и грузоподъёмность листа */
+  const { weightLabel, isOverweight, capacitySettings, strength } =
+    useCarryingCapacity(
+      toRef(() => props.entity),
+      resolvedStats,
+    );
+
+  // События точечные, а не одно «вот тебе кусок листа»: у актёра и существа
+  // разные `system`, и общий тип обновления схлопнулся бы до полей, которые
+  // есть у обоих. Панель отдаёт только то, что сама поменяла, а куда это
+  // положить — знает хозяин листа
   const emit = defineEmits<{
-    'update:actor': [updates: Partial<Actor>];
+    'update:equipment': [equipment: DnDGameItem[]];
+    'update:currency': [currency: DnDCurrency];
+    'update:carrying-capacity': [capacity: DnDCarryingCapacity];
     'immediate-save': [];
   }>();
 
   interface Props {
-    actor: Actor;
+    /**
+     * Лист-владелец инвентаря. И персонаж, и существо: механика снаряжения у
+     * них общая — бросок атаки, урон и вес считаются одним кодом.
+     */
+    entity: DnDSceneEntity;
     isEditMode: boolean;
     isDragOver?: boolean;
+    /** Показывать кошелёк. Есть у обоих листов, но не везде уместен */
+    showCurrency?: boolean;
+    /** Показывать плитку переносимого веса и её настройку */
+    showCarryingCapacity?: boolean;
+    /**
+     * Разрешать перетаскивание оружия на панель быстрого доступа. У существа
+     * выключено: макрос атаки ищет владельца среди актёров, и кнопка вышла бы
+     * мёртвой — это хуже, чем её отсутствие
+     */
+    allowHotbarDrag?: boolean;
+    /**
+     * Лист только для чтения: инвентарь показывается, но не правится. Так лист
+     * существа закрывает мешок чужого монстра от игрока без контроля над ним —
+     * у листа персонажа для этого своя проверка владельца выше по дереву
+     */
+    isReadOnly?: boolean;
+    /**
+     * Показывать кнопку «Добавить» — выбор предметов из компендиума. Там, где
+     * инвентарь пополняют только перетаскиванием (быстрое окно), её нет
+     */
+    showAddButton?: boolean;
   }
+
+  /**
+   * Инвентарь листа. Читается со страховкой: у существа поле необязательное, а
+   * в быстром окне лист приезжает из стора хоста без нормализации
+   */
+  const inventory = computed<DnDGameItem[]>(() => props.entity.equipment ?? []);
+
+  /**
+   * Текущий кошелёк актёра. Нули подставляются намеренно: во вкладку попадает и
+   * актёр из `QuickEquipmentModal`, который берёт его из стора хоста без
+   * `normalizeActor`, — у записи из старого мира поля кошелька может не быть.
+   */
+  const currency = computed<DnDCurrency>(() => {
+    const wallet = props.entity.system.currency;
+
+    return {
+      cp: wallet?.cp ?? 0,
+      sp: wallet?.sp ?? 0,
+      ep: wallet?.ep ?? 0,
+      gp: wallet?.gp ?? 0,
+      pp: wallet?.pp ?? 0,
+    };
+  });
+
+  /** Видна ли кнопка «Добавить»: чужой мешок только для чтения не пополняют */
+  const canAddItems = computed(
+    () => Boolean(props.showAddButton) && !props.isReadOnly,
+  );
 
   /**
    * Запрашивает у хозяина вкладки немедленное сохранение актёра — только вне
@@ -73,33 +214,37 @@
     }
   }
 
+  /**
+   * Отдаёт новый инвентарь хозяину листа и просит сохранить.
+   *
+   * Единственный выход правки наружу — поэтому здесь же стоит и проверка режима
+   * только для чтения: разложи её по девяти операциям, и следующая десятая
+   * приехала бы без неё.
+   *
+   * @param equipment - новый инвентарь листа
+   */
+  function commitEquipment(equipment: DnDGameItem[]): void {
+    if (props.isReadOnly) {
+      return;
+    }
+
+    emit('update:equipment', equipment);
+
+    triggerSaveIfNotEdit();
+  }
+
   const { getWeaponIcon } = useWeaponIcon();
-
-  /** Иконки по типу предмета (кроме weapon/armor — у них своя логика) */
-  const ITEM_TYPE_ICON_MAP: Record<string, string> = {
-    'trinket': 'tabler:diamond',
-    'rod': 'tabler:wand',
-    'ring': 'tabler:circle-dotted',
-    'clothing': 'tabler:hanger',
-    'wand': 'tabler:wand',
-    'wondrous': 'tabler:sparkles',
-    'vehicle-equipment': 'tabler:horse',
-    'tool': 'tabler:tools',
-    'spell': 'tabler:sparkles',
-  };
-
-  /** Fallback-иконка для неизвестных типов */
-  const DEFAULT_ITEM_ICON = 'tabler:box';
 
   const systemDataStore = useSystemDataStore();
   const hotbarStore = useHotbarStore();
-  const targetStore = useTargetStore();
   const chatStore = useChatStore();
-  const worldStore = useWorldStore();
 
-  const { resolveSpellDamageWithParts } = useSpellResolution();
-
-  const { buildWeaponRollSetup, buildTargetHpContext } = useBonusDamageParts();
+  // Записи для окна «Добавить» грузятся, пока игрок смотрит на вкладку
+  useCompendiumWarmup(
+    () => chatStore.getSocket(),
+    STARTING_EQUIPMENT_ITEM_KINDS,
+    () => canAddItems.value,
+  );
 
   /**
    * Карта key → name для локализации типов урона
@@ -142,8 +287,8 @@
 
   /** Лейблы категорий оружия */
   const WEAPON_CATEGORY_LABELS: Record<string, string> = {
-    simple: 'Простое оружие',
-    martial: 'Воинское оружие',
+    simple: ACTOR_EQUIPMENT_TAB_LABELS.weaponsSimple,
+    martial: ACTOR_EQUIPMENT_TAB_LABELS.weaponsMartial,
   };
 
   /**
@@ -164,9 +309,9 @@
 
   /** Конфигурация групп предметов для разделителей */
   const EQUIPMENT_GROUP_ORDER = [
-    { type: 'weapon', label: 'Оружие' },
-    { type: 'equipment', label: 'Экипировка' },
-    { type: 'tool', label: 'Инструменты' },
+    { type: 'weapon', label: ACTOR_EQUIPMENT_TAB_LABELS.sectionWeapons },
+    { type: 'equipment', label: ACTOR_EQUIPMENT_TAB_LABELS.sectionEquipment },
+    { type: 'tool', label: ACTOR_EQUIPMENT_TAB_LABELS.sectionTools },
   ];
 
   /**
@@ -174,12 +319,10 @@
    * Оружие, Доспехи, Прочее
    */
   const equipmentGroups = computed(() => {
-    const groups: Array<{ label: string; items: GameItem[] }> = [];
+    const groups: Array<{ label: string; items: DnDGameItem[] }> = [];
 
     for (const group of EQUIPMENT_GROUP_ORDER) {
-      const items = props.actor.equipment.filter(
-        (item) => item.type === group.type,
-      );
+      const items = inventory.value.filter((item) => item.type === group.type);
 
       if (items.length > 0) {
         groups.push({ label: group.label, items });
@@ -191,12 +334,15 @@
       EQUIPMENT_GROUP_ORDER.map((group) => group.type),
     );
 
-    const otherItems = props.actor.equipment.filter(
+    const otherItems = inventory.value.filter(
       (item) => !knownTypes.has(item.type),
     );
 
     if (otherItems.length > 0) {
-      groups.push({ label: 'Прочее', items: otherItems });
+      groups.push({
+        label: ACTOR_EQUIPMENT_TAB_LABELS.sectionOther,
+        items: otherItems,
+      });
     }
 
     return groups;
@@ -210,7 +356,7 @@
    * По правилам D&D можно носить только один доспех.
    */
   const equippedArmorId = computed(() => {
-    const found = props.actor.equipment.find(
+    const found = inventory.value.find(
       (item) =>
         item.type === 'equipment'
         && item.equipped
@@ -227,7 +373,7 @@
    * @param item - предмет для проверки
    * @returns true если кнопка должна быть заблокирована
    */
-  function isEquipDisabled(item: GameItem): boolean {
+  function isEquipDisabled(item: DnDGameItem): boolean {
     // Если предмет уже экипирован — всегда можно снять
     if (item.equipped) {
       return false;
@@ -245,203 +391,19 @@
     return equippedArmorId.value !== null;
   }
 
-  // --- Бросок урона (через DiceRollModal) ---
-  const isRollModalOpen = ref(false);
-
-  const rollConfig = ref({
-    name: '',
-    formula: '',
-    attackModifier: undefined as number | undefined,
-    evaluateBonuses: undefined as
-      | ((context: { hasAdvantage: boolean; hasDisadvantage: boolean }) => {
-          attackBonus: number;
-          damageBonus: number;
-        })
-      | undefined,
-    initialRollMode: 'normal' as AttackRollMode,
-    incomingAttackType: undefined as 'melee' | 'ranged' | 'spell' | undefined,
-    damageType: undefined as string | undefined,
-    // Многочастный путь (бонус-части урона от Active Effects)
-    damageParts: undefined as SpellDamagePartInput[] | undefined,
-    evaluateBonusDamageParts: undefined as
-      | ((context: {
-          hasAdvantage: boolean;
-          hasDisadvantage: boolean;
-        }) => SpellDamagePartInput[])
-      | undefined,
-    onRollParts: undefined as
-      | ((parts: RolledSpellDamagePart[]) => void)
-      | undefined,
-    onHit: undefined as (() => void) | undefined,
-  });
+  // --- Удар оружием ---
 
   /**
-   * Сущности текущего мира (акторы + существа) — цели многочастного применения.
-   */
-  function getCurrentWorldEntities(): SceneEntity[] {
-    const worldId = worldStore.connectionState.currentWorldId;
-
-    if (!worldId) {
-      return [];
-    }
-
-    const world = worldStore.worlds.find(
-      (worldEntry) => worldEntry.id === worldId,
-    );
-
-    if (!world) {
-      return [];
-    }
-
-    return [...(world.actors ?? []), ...(world.creatures ?? [])];
-  }
-
-  /**
-   * Открывает модалку броска урона для оружия
-   * @param weapon - оружие с формулой урона
-   */
-  function openRollModal(weapon: GameItem): void {
-    if (!weapon.damageParts?.length) {
-      return;
-    }
-
-    // Оружие со спасброском: цель кидает спас, броска попадания нет.
-    const hasSave = !!weapon.saveType && weapon.saveType !== 'none';
-
-    const baseMod = calculateWeaponAttackModifier(
-      props.actor,
-      weapon,
-      resolvedStats.value,
-    );
-
-    const weaponSaveDC = 8 + baseMod;
-
-    const evaluateBonuses = (context: {
-      hasAdvantage: boolean;
-      hasDisadvantage: boolean;
-    }) => {
-      const attackKey =
-        weapon.rangeType === 'ranged' ? 'attack.ranged' : 'attack.melee';
-
-      const damageKey =
-        weapon.rangeType === 'ranged' ? 'damage.ranged' : 'damage.melee';
-
-      // HP цели читается в момент броска — для условий target.hp.* («Убийца»)
-      const rollContext = { ...context, target: buildTargetHpContext() };
-
-      return {
-        attackBonus: evaluateConditionalBonuses(
-          combinedEffects.value,
-          attackKey,
-          rollContext,
-        ),
-        damageBonus: evaluateConditionalBonuses(
-          combinedEffects.value,
-          damageKey,
-          rollContext,
-        ),
-      };
-    };
-
-    const targetActor = targetStore.getTargetActor();
-
-    let targetFlags = new Set<string>();
-
-    if (targetActor) {
-      targetFlags = resolveActorStats(targetActor).activeFlags;
-    }
-
-    const isAdvantage =
-      resolvedStats.value?.activeFlags.has('attack.advantage')
-      || targetFlags.has('attacksAgainst.advantage');
-
-    const isDisadvantage =
-      resolvedStats.value?.activeFlags.has('attack.disadvantage')
-      || targetFlags.has('attacksAgainst.disadvantage');
-
-    let initialRollMode: AttackRollMode = 'normal';
-
-    if (isAdvantage && !isDisadvantage) {
-      initialRollMode = 'advantage';
-    } else if (isDisadvantage && !isAdvantage) {
-      initialRollMode = 'disadvantage';
-    }
-
-    // Единая со заклинаниями система урона: бросок ВСЕГДА идёт многочастным
-    // путём (части урона оружия + бонус-части эффектов). Состояние HP цели —
-    // для условных веток @target.full/@target.notFull.
-    const targetHp = buildTargetHpContext();
-
-    const targetIsFull = targetHp
-      ? targetHp.currentHp >= targetHp.maxHp
-      : undefined;
-
-    const weaponPartsSetup = buildWeaponRollSetup({
-      weapon,
-      actor: props.actor,
-      effects: combinedEffects.value,
-      resolvedStats: resolvedStats.value,
-      targetIsFull,
-    });
-
-    rollConfig.value = {
-      name: weapon.name,
-      formula: weaponPartsSetup.baseParts[0]?.formula ?? '',
-      attackModifier: hasSave ? undefined : baseMod,
-      evaluateBonuses,
-      initialRollMode,
-      incomingAttackType: weapon.rangeType === 'ranged' ? 'ranged' : 'melee',
-      damageType: getWeaponPrimaryDamageType(weapon),
-      damageParts: weaponPartsSetup.baseParts,
-      evaluateBonusDamageParts: weaponPartsSetup.evaluateBonusDamageParts,
-      onRollParts: (parts: RolledSpellDamagePart[]) =>
-        handleWeaponRollParts(
-          weaponPartsSetup.pseudoSpell,
-          parts,
-          weaponSaveDC,
-        ),
-      // Попадание обрабатывает многочастный путь (`onRollParts`), отдельного
-      // обработчика у оружия нет. Ключ всё равно обязан быть: конфиг броска —
-      // объект с полным набором полей, и пропуск ключа сбрасывал бы предыдущее
-      // значение мимо типа.
-      onHit: undefined,
-    };
-
-    isRollModalOpen.value = true;
-  }
-
-  /**
-   * Применяет брошенные части урона оружия через многочастный оркестратор:
-   * защиты по типу на каждую часть, per-target гейты @target.*, единый
-   * HP-апдейт и одно сообщение в чат.
+   * Наносит удар оружием — общим путём удара, тем же, что у горячей панели:
+   * атакующий и боеприпас — из мира (окно переживает вкладку), отказ —
+   * уведомлением.
    *
-   * @param pseudoSpell - псевдо-заклинание оружия (со спасбросском оружия, если есть)
-   * @param parts - брошенные части урона
-   * @param spellSaveDC - DC спасброска оружия (для оружия со спасброском)
+   * @param sourceWeapon - оружие с формулой урона; эффекты — до выбора варианта
    */
-  function handleWeaponRollParts(
-    pseudoSpell: Spell,
-    parts: RolledSpellDamagePart[],
-    spellSaveDC: number,
-  ): void {
-    const actors = getCurrentWorldEntities();
-    const socket = chatStore.getSocket();
-
-    if (actors.length === 0 || !socket) {
-      return;
-    }
-
-    void resolveSpellDamageWithParts(
-      {
-        spell: pseudoSpell,
-        damageTotal: 0,
-        spellSaveDC,
-        actors,
-        socket,
-        casterId: props.actor.id,
-      },
-      parts,
-      { scene: worldStore.currentScene },
+  function openRollModal(sourceWeapon: DnDGameItem): void {
+    startWeaponAttack(
+      sourceWeapon,
+      createWeaponAttackPort(props.entity.id, refuseWeaponAttack),
     );
   }
 
@@ -450,8 +412,8 @@
    * @param event - событие dragstart
    * @param weapon - оружие
    */
-  function handleWeaponDragStart(event: DragEvent, weapon: GameItem): void {
-    if (!weapon.damageParts?.length) {
+  function handleWeaponDragStart(event: DragEvent, weapon: DnDGameItem): void {
+    if (!weapon.damageParts?.length || !props.allowHotbarDrag) {
       return;
     }
 
@@ -460,11 +422,33 @@
 
     startHotbarDrag(event, {
       id: weapon.id,
-      type: 'weapon-attack',
-      label: `Атака — ${weapon.name}`,
+      type: DND_MACRO_TYPES.weaponAttack,
+      label: `${ACTOR_EQUIPMENT_TAB_LABELS.attackRollPrefix}${weapon.name}`,
       icon: hotbarIcon,
       ref: weapon.id,
-      actorId: props.actor.id,
+      actorId: props.entity.id,
+    });
+  }
+
+  /**
+   * Кладёт на панель быстрого доступа кнопку применения предмета — зелья,
+   * яда, свитка. Кончился предмет — кнопка гаснет, но остаётся.
+   * @param event - событие dragstart
+   * @param item - предмет с эффектами применения
+   */
+  function handleItemUseDragStart(event: DragEvent, item: DnDGameItem): void {
+    if (!props.allowHotbarDrag) {
+      return;
+    }
+
+    startHotbarDrag(event, {
+      id: item.id,
+      type: DND_MACRO_TYPES.itemUse,
+      label: `${EFFECT_USE_LABELS.hotbarPrefix}${item.name}`,
+      // Значок самого предмета, как в инвентаре, а не общий значок применения
+      icon: getItemIcon(item),
+      ref: item.id,
+      actorId: props.entity.id,
     });
   }
 
@@ -474,23 +458,34 @@
    * @param event - событие dragstart
    * @param item - передаваемый предмет
    */
-  function handleItemDragStart(event: DragEvent, item: GameItem): void {
-    if (!event.dataTransfer) {
+  function handleItemDragStart(event: DragEvent, item: DnDGameItem): void {
+    // Из листа в режиме чтения и из листа в режиме правки предмет не вынимается:
+    // у получателя он появится сразу, а здесь правка либо запрещена, либо ещё
+    // не сохранена, и предмет бы размножился
+    if (!event.dataTransfer || props.isReadOnly || props.isEditMode) {
       return;
     }
 
-    // Для любого предмета — MIME передачи между токенами
-    const transferPayload = JSON.stringify({
+    // Для любого предмета — MIME передачи между листами и токенами. Нагрузка
+    // собирается по объявленному типу, а не безымянным литералом: иначе
+    // переименование поля не поймал бы никто, а перенос просто перестал бы
+    // срабатывать — молча, без ошибки
+    const payload: ItemTransferPayload = {
       item,
-      sourceActorId: props.actor.id,
-    });
+      sourceActorId: props.entity.id,
+    };
+
+    const transferPayload = JSON.stringify(payload);
 
     event.dataTransfer.setData(GAME_ITEM_TRANSFER_MIME, transferPayload);
     event.dataTransfer.effectAllowed = 'copyMove';
 
-    // Для оружия с уроном — дополнительно hotbar drag
+    // Оружие с уроном ложится на панель атакой, предмет с эффектами
+    // применения — кнопкой «Использовать»
     if (item.type === 'weapon' && item.damageParts?.length) {
       handleWeaponDragStart(event, item);
+    } else if (hasItemUseEffects(item)) {
+      handleItemUseDragStart(event, item);
     }
   }
 
@@ -501,15 +496,19 @@
    * Модалки независимы от листа персонажа и остаются при его закрытии.
    * @param item - предмет снаряжения
    */
-  function openDetailModal(item: GameItem): void {
+  function openDetailModal(item: DnDGameItem): void {
     if (item.type === 'equipment') {
       openModal('EquipmentDetailModal', { item, open: true });
     } else if (item.type === 'tool') {
       openModal('ToolDetailModal', { item, open: true });
     } else if (item.type === 'spell') {
-      openModal('SpellDetailModal', { spell: extractSpellFromGameItem(item) });
+      const spell = extractSpellFromGameItem(item);
+
+      if (spell) {
+        openModal('SpellDetailModal', { spell });
+      }
     } else {
-      openModal('WeaponDetailModal', { item, open: true });
+      openModal('WeaponDetailModal', { item, open: true, actor: props.entity });
     }
   }
 
@@ -517,7 +516,7 @@
    * Открывает модалку редактирования предмета в зависимости от типа
    * @param item - предмет снаряжения
    */
-  function openEditModal(item: GameItem): void {
+  function openEditModal(item: DnDGameItem): void {
     const modalMap: Record<string, string> = {
       equipment: 'EquipmentFormModal',
       tool: 'ToolFormModal',
@@ -538,7 +537,11 @@
     } else {
       openModal(modalName, {
         item,
-        onSave: (updated: GameItem) => saveEquipmentEdit(updated, formId),
+        // Владелец нужен только форме оружия — для предпросмотра атаки и
+        // урона. Остальным формам его не передаём: необъявленный проп осел бы
+        // атрибутом на корне и дал ворнинг
+        ...(item.type === 'weapon' ? { actor: props.entity } : {}),
+        onSave: (updated: DnDGameItem) => saveEquipmentEdit(updated, formId),
         onClose: () => closeModal(formId),
       });
     }
@@ -550,26 +553,32 @@
    * @param updatedItem - обновлённый предмет
    * @param formId - ID модалки для закрытия
    */
-  function saveEquipmentEdit(updatedItem: GameItem, formId: string): void {
-    const equipment = props.actor.equipment.map((item) =>
+  function saveEquipmentEdit(updatedItem: DnDGameItem, formId: string): void {
+    // Надет ли предмет и чем заряжено оружие — состояние листа, а не записи:
+    // форма его не знает, и правка его не сбрасывает
+    const equipment = inventory.value.map((item) =>
       item.id === updatedItem.id
-        ? { ...updatedItem, equipped: item.equipped }
+        ? {
+            ...updatedItem,
+            equipped: item.equipped,
+            ...(item.loadedAmmunitionId
+              ? { loadedAmmunitionId: item.loadedAmmunitionId }
+              : {}),
+          }
         : item,
     );
 
-    emit('update:actor', { equipment });
+    commitEquipment(equipment);
     closeModal(formId);
-
-    triggerSaveIfNotEdit();
   }
 
   /** Сохраняет редактированное заклинание-предмет в equipment */
   function saveSpellEdit(
     updatedSpell: Spell,
     formId: string,
-    originalItem: GameItem,
+    originalItem: DnDGameItem,
   ): void {
-    const updatedSpellItem: GameItem = {
+    const updatedSpellItem: DnDGameItem = {
       ...originalItem,
       name: updatedSpell.name,
       nameEn: updatedSpell.nameEn,
@@ -577,14 +586,12 @@
       spellData: updatedSpell,
     };
 
-    const equipment = props.actor.equipment.map((item) =>
+    const equipment = inventory.value.map((item) =>
       item.id === originalItem.id ? updatedSpellItem : item,
     );
 
-    emit('update:actor', { equipment });
+    commitEquipment(equipment);
     closeModal(formId);
-
-    triggerSaveIfNotEdit();
   }
 
   // --- Действия ---
@@ -595,62 +602,139 @@
   // TODO: Вернуть блокировку экипировки при нехватке рук (canEquip / freeHands)
 
   /**
-   * Переключает экипировку предмета
+   * Переключает экипировку предмета.
+   *
+   * Хват универсального оружия снятие не трогает: это выбор игрока, как оружием
+   * пользуются, а не состояние рук. Сбрасывая его, лист забывал бы двуручный
+   * хват при каждом снятии — и после надевания урон молча падал бы до меньшей
+   * кости.
+   *
    * @param itemId - ID предмета
    */
   function toggleEquipped(itemId: string): void {
-    const equipment = props.actor.equipment.map((item) =>
-      item.id === itemId
-        ? {
-            ...item,
-            equipped: !item.equipped,
-            twoHandedGrip: item.equipped ? false : item.twoHandedGrip,
-          }
-        : item,
+    const equipment = inventory.value.map((item) =>
+      item.id === itemId ? { ...item, equipped: !item.equipped } : item,
     );
 
-    emit('update:actor', { equipment });
-
-    triggerSaveIfNotEdit();
+    commitEquipment(equipment);
   }
 
   /**
-   * Переключает хват универсального оружия (1 рука ↔ 2 руки)
+   * Переключает хват универсального оружия (одноручный ↔ двуручный).
+   *
+   * Хват — свойство самого оружия, а не рук: он остаётся выбранным и у снятого
+   * оружия, и после следующего надевания. Поэтому пункт меню виден всегда, а
+   * `toggleEquipped` его не трогает.
+   *
    * @param itemId - ID предмета
    */
   function toggleTwoHandedGrip(itemId: string): void {
-    const target = props.actor.equipment.find((item) => item.id === itemId);
-
-    if (!target || !target.equipped) {
-      return;
-    }
-
-    const equipment = props.actor.equipment.map((item) =>
+    const equipment = inventory.value.map((item) =>
       item.id === itemId
         ? { ...item, twoHandedGrip: !item.twoHandedGrip }
         : item,
     );
 
-    emit('update:actor', { equipment });
-
-    triggerSaveIfNotEdit();
+    commitEquipment(equipment);
   }
 
   /**
-   * Обновляет количество предмета
+   * Обновляет количество предмета; ноль оставляет предмет закончившимся
    * @param itemId - ID предмета
-   * @param newQuantity - новое количество (минимум 1)
+   * @param newQuantity - новое количество
    */
   function updateItemQuantity(itemId: string, newQuantity: number): void {
-    const clampedQuantity = Math.max(1, Math.floor(newQuantity));
+    const quantity = normalizeItemQuantity(newQuantity);
 
-    const equipment = props.actor.equipment.map((item) =>
-      item.id === itemId ? { ...item, quantity: clampedQuantity } : item,
+    if (quantity === undefined) {
+      return;
+    }
+
+    const equipment = inventory.value.map((item) =>
+      item.id === itemId ? { ...item, quantity } : item,
     );
 
-    emit('update:actor', { equipment });
+    commitEquipment(equipment);
+  }
 
-    triggerSaveIfNotEdit();
+  /**
+   * Заряжает оружие боеприпасом; повторный выбор заряженного снимает выбор —
+   * боеприпас снова подбирается по типу.
+   *
+   * @param weapon - оружие
+   * @param ammunitionId - выбранный боеприпас
+   */
+  function toggleLoadedAmmunition(
+    weapon: DnDGameItem,
+    ammunitionId: string,
+  ): void {
+    const next =
+      weapon.loadedAmmunitionId === ammunitionId ? undefined : ammunitionId;
+
+    commitEquipment(loadWeaponAmmunition(inventory.value, weapon.id, next));
+  }
+
+  /**
+   * Подменю «Боеприпасы» стрелкового оружия: расходуемые предметы инвентаря,
+   * отмечен тот, которым оружие выстрелит.
+   *
+   * @param weapon - оружие со свойством «Боеприпасы»
+   * @returns пункт меню с подменю
+   */
+  function buildAmmunitionMenu(weapon: DnDGameItem): DropdownMenuItem {
+    const loadable = listLoadableAmmunition(inventory.value, weapon);
+    const current = findLoadedAmmunition(inventory.value, weapon);
+
+    return {
+      label: EQUIPMENT_MENU_LABELS.ammunition,
+      icon: 'tabler:archery-arrow',
+      children:
+        loadable.length > 0
+          ? loadable.map((ammunition): DropdownMenuItem => ({
+              label: ammunition.name,
+              description: `${EQUIPMENT_MENU_LABELS.ammunitionQuantity}${ammunition.quantity}`,
+              type: 'checkbox',
+              checked: ammunition.id === current?.id,
+              onUpdateChecked: () =>
+                toggleLoadedAmmunition(weapon, ammunition.id),
+            }))
+          : [{ label: EQUIPMENT_MENU_LABELS.ammunitionEmpty, disabled: true }],
+    };
+  }
+
+  /**
+   * Значок боеприпаса стрелкового оружия: чем заряжено и сколько осталось,
+   * «Не заряжено», если зарядить есть чем, иначе значка нет.
+   *
+   * @param item - предмет снаряжения
+   * @returns значок либо `undefined`
+   */
+  function getAmmunitionBadge(
+    item: DnDGameItem,
+  ): EquipmentAmmunitionBadge | undefined {
+    if (!weaponUsesAmmunition(item)) {
+      return undefined;
+    }
+
+    const current = findLoadedAmmunition(inventory.value, item);
+
+    if (current) {
+      return {
+        label: `${current.name} · ${current.quantity}`,
+        hint: EQUIPMENT_AMMUNITION_BADGE.loadedHint,
+        color: isItemDepleted(current) ? 'error' : 'neutral',
+      };
+    }
+
+    if (listLoadableAmmunition(inventory.value, item).length === 0) {
+      return undefined;
+    }
+
+    return {
+      label: EQUIPMENT_AMMUNITION_BADGE.unloaded,
+      hint: EQUIPMENT_AMMUNITION_BADGE.unloadedHint,
+      color: 'warning',
+    };
   }
 
   /**
@@ -658,13 +742,59 @@
    * @param itemId - ID предмета
    */
   function toggleAttuned(itemId: string): void {
-    const equipment = props.actor.equipment.map((item) =>
+    const equipment = inventory.value.map((item) =>
       item.id === itemId ? { ...item, isAttuned: !item.isAttuned } : item,
     );
 
-    emit('update:actor', { equipment });
+    commitEquipment(equipment);
+  }
 
-    triggerSaveIfNotEdit();
+  /**
+   * Списывает заряд предмета — правило расхода живёт в движке
+   * ({@link spendItemUses}), здесь только запись результата в лист.
+   *
+   * @param itemId - ID предмета
+   */
+  function spendItemCharge(itemId: string): void {
+    const equipment = inventory.value.map((item) =>
+      item.id === itemId ? spendItemUses(item) : item,
+    );
+
+    commitEquipment(equipment);
+  }
+
+  /**
+   * Возвращает один заряд вручную — отмена ошибочной траты. Восстановление
+   * отдыхом идёт своим путём, через движок отдыха.
+   *
+   * @param itemId - ID предмета
+   */
+  function restoreItemCharge(itemId: string): void {
+    const equipment = inventory.value.map((item) =>
+      item.id === itemId && item.uses
+        ? setItemUsesCurrent(item, item.uses.current + 1)
+        : item,
+    );
+
+    commitEquipment(equipment);
+  }
+
+  /**
+   * Применяет предмет: эффекты применения ложатся на персонажа или цель,
+   * предмет теряет заряд или единицу количества.
+   *
+   * Тем же путём мира, что кнопка горячей панели (`applyEntityItemUse`):
+   * заряд списывается после выбора цели и вопроса о цене, а вкладка к этому
+   * времени может быть размонтирована — её `emit` ничего бы не списал.
+   *
+   * @param item - предмет
+   */
+  function applyItemUse(item: DnDGameItem): void {
+    if (props.isReadOnly) {
+      return;
+    }
+
+    applyEntityItemUse(props.entity.id, item.id);
   }
 
   /**
@@ -672,69 +802,201 @@
    * @param itemId - ID предмета
    */
   function removeItem(itemId: string): void {
-    const equipment = props.actor.equipment.filter(
-      (item) => item.id !== itemId,
-    );
-
-    emit('update:actor', { equipment });
-    hotbarStore.removeByRef(itemId);
-
-    triggerSaveIfNotEdit();
-  }
-
-  // --- Контекстное меню ---
-  const isContextMenuOpen = ref(false);
-  const contextMenuX = ref(0);
-  const contextMenuY = ref(0);
-  const contextMenuItem = ref<GameItem | null>(null);
-
-  /**
-   * Открывает контекстное меню для предмета
-   * @param event - Событие мыши
-   * @param item - Предмет снаряжения
-   */
-  function openContextMenu(event: MouseEvent, item: GameItem): void {
-    event.preventDefault();
-    event.stopPropagation();
-
-    contextMenuX.value = event.clientX;
-    contextMenuY.value = event.clientY;
-    contextMenuItem.value = item;
-    isContextMenuOpen.value = true;
-  }
-
-  /** Закрывает контекстное меню */
-  function closeContextMenu(): void {
-    isContextMenuOpen.value = false;
-    contextMenuItem.value = null;
-  }
-
-  /** Обрабатывает выбор пункта меню */
-  function handleContextMenuAction(
-    action: 'attack' | 'edit' | 'delete' | 'share',
-  ): void {
-    if (!contextMenuItem.value) {
+    if (props.isReadOnly) {
       return;
     }
 
-    if (action === 'attack') {
-      openRollModal(contextMenuItem.value);
-    } else if (action === 'edit') {
-      openEditModal(contextMenuItem.value);
-    } else if (action === 'delete') {
-      removeItem(contextMenuItem.value.id);
-    } else if (action === 'share') {
-      shareItemToChat(contextMenuItem.value);
+    const equipment = inventory.value.filter((item) => item.id !== itemId);
+
+    commitEquipment(equipment);
+
+    // Кнопка удалённого предмета на панели быстрого доступа снимается ТОЛЬКО
+    // вместе с успешной правкой: иначе лист в режиме просмотра чистил бы чужой
+    // хотбар, ничего при этом не удалив
+    hotbarStore.removeByRef(itemId);
+  }
+
+  /**
+   * Продаёт предмет: он уходит из инвентаря, его цена ложится в кошелёк. Обе
+   * правки уходят до сохранения — иначе лист на миг сохранился бы без
+   * предмета, но при прежних деньгах.
+   *
+   * @param item - продаваемый предмет
+   */
+  function sellItem(item: DnDGameItem): void {
+    if (props.isReadOnly) {
+      return;
     }
 
-    closeContextMenu();
+    emit(
+      'update:equipment',
+      inventory.value.filter((owned) => owned.id !== item.id),
+    );
+
+    emit(
+      'update:currency',
+      receiveIntoWallet(currency.value, itemCostInCopper(item.cost)),
+    );
+
+    triggerSaveIfNotEdit();
+
+    // Кнопка проданного предмета на панели быстрого доступа — как при удалении
+    hotbarStore.removeByRef(item.id);
+  }
+
+  /** Типы записей, у которых на листе есть своя форма правки */
+  const EDITABLE_ITEM_TYPES = new Set(['weapon', 'equipment', 'spell', 'tool']);
+
+  /**
+   * Пункты меню строки предмета. Меню одно на правую кнопку мыши и на «⋮» в
+   * конце строки: два набора действий у одной строки расходились бы.
+   *
+   * Группы разделяются чертой: сверху игровые действия предметом, ниже —
+   * действия над записью листа, последним — удаление.
+   *
+   * @param item - предмет снаряжения
+   * @returns группы пунктов для `UContextMenu` и `UDropdownMenu`
+   */
+  function getItemMenuItems(item: DnDGameItem): DropdownMenuItem[][] {
+    const gameActions: DropdownMenuItem[] = [];
+
+    // Надевание стоит первым и повторяет кнопку со значком слева: по одному
+    // значку не всякий поймёт, что предмет им и берут в руки. Значок —
+    // человечек: надевают тут и оружие, и кольцо, а рубашка обещала одежду,
+    // щит же — доспех.
+    gameActions.push({
+      label: item.equipped
+        ? EQUIPMENT_EQUIP_ACTION_LABELS.unequip
+        : EQUIPMENT_EQUIP_ACTION_LABELS.equip,
+      icon: item.equipped ? 'tabler:user-off' : 'tabler:user-check',
+      disabled: isEquipDisabled(item),
+      onSelect: () => toggleEquipped(item.id),
+    });
+
+    // Применение — пункт предмета с эффектами «при применении»: зелье,
+    // свиток, масло. Режим правки пункт не гасит: погашенный пункт молчит, а
+    // щелчок доходит до общей проверки листа и объясняет отказ
+    if (hasItemUseEffects(item) && !props.isReadOnly) {
+      gameActions.push({
+        label: EFFECT_USE_LABELS.use,
+        icon: ITEM_USE_MACRO_ICON,
+        disabled: !canUseItem(item),
+        onSelect: () => applyItemUse(item),
+      });
+    }
+
+    // Переключатели предмета: «Язык пламени» зажигают и гасят командным
+    // словом. В режиме правки отказ объясняет вход переключателя — как и у
+    // применения
+    if (!props.isReadOnly) {
+      for (const toggle of listItemToggles(item)) {
+        gameActions.push({
+          label: `${toggle.on ? ITEM_TOGGLE_LABELS.switchOff : ITEM_TOGGLE_LABELS.switchOn}${toggle.effect.name}`,
+          icon: toggle.on ? ITEM_TOGGLE_ICONS.on : ITEM_TOGGLE_ICONS.off,
+          onSelect: () =>
+            toggleEntityItemEffect(props.entity.id, item.id, toggle.effect.id),
+        });
+      }
+    }
+
+    if (item.type === 'weapon' && item.damageParts?.length) {
+      gameActions.push({
+        label: EQUIPMENT_MENU_LABELS.attack,
+        icon: 'tabler:sword',
+        onSelect: () => openRollModal(item),
+      });
+    }
+
+    if (weaponUsesAmmunition(item) && !props.isReadOnly) {
+      gameActions.push(buildAmmunitionMenu(item));
+    }
+
+    // Хват — не разовое действие, а способ пользоваться оружием: отметка в
+    // меню показывает, каким хватом оружие идёт в бой сейчас.
+    if (isVersatile(item)) {
+      gameActions.push({
+        label: EQUIPMENT_MENU_LABELS.twoHandedGrip,
+        icon: 'tabler:hand-grab',
+        type: 'checkbox',
+        checked: Boolean(item.twoHandedGrip),
+        onUpdateChecked: () => toggleTwoHandedGrip(item.id),
+      });
+    }
+
+    if (item.magicAttunement && item.magicAttunement !== 'none') {
+      gameActions.push({
+        label: item.isAttuned
+          ? EQUIPMENT_MENU_LABELS.unattune
+          : EQUIPMENT_MENU_LABELS.attune,
+        icon: 'tabler:sparkles',
+        onSelect: () => toggleAttuned(item.id),
+      });
+    }
+
+    if (item.uses) {
+      gameActions.push({
+        label: EQUIPMENT_MENU_LABELS.spendCharge,
+        icon: 'tabler:battery-vertical-3',
+        disabled: !canSpendItemUses(item),
+        onSelect: () => spendItemCharge(item.id),
+      });
+
+      if (item.uses.current < item.uses.max) {
+        gameActions.push({
+          label: EQUIPMENT_MENU_LABELS.restoreCharge,
+          icon: 'tabler:battery-vertical-charging',
+          onSelect: () => restoreItemCharge(item.id),
+        });
+      }
+    }
+
+    const sheetActions: DropdownMenuItem[] = [];
+
+    if (EDITABLE_ITEM_TYPES.has(item.type)) {
+      sheetActions.push({
+        label: SHEET_ROW_MENU_LABELS.edit,
+        icon: 'tabler:edit',
+        onSelect: () => openEditModal(item),
+      });
+    }
+
+    sheetActions.push({
+      label: SHEET_ROW_MENU_LABELS.share,
+      icon: 'tabler:message-share',
+      onSelect: () => shareItemToChat(item),
+    });
+
+    // Продажа — только там, где показан кошелёк, и только у предмета с ценой:
+    // выручку больше некуда класть, а «Продать за 0» — это то же «Удалить»
+    if (
+      props.showCurrency
+      && !props.isReadOnly
+      && itemCostInCopper(item.cost)
+    ) {
+      sheetActions.push({
+        label: `${EQUIPMENT_MENU_LABELS.sellPrefix}${formatItemCost(item.cost)}`,
+        icon: EQUIPMENT_PURCHASE_ICON,
+        onSelect: () => sellItem(item),
+      });
+    }
+
+    const removeAction: DropdownMenuItem[] = [
+      {
+        label: SHEET_ROW_MENU_LABELS.remove,
+        icon: 'tabler:trash',
+        color: 'error',
+        onSelect: () => removeItem(item.id),
+      },
+    ];
+
+    return [gameActions, sheetActions, removeAction];
   }
 
   /**
    * Отправляет карточку предмета в чат.
    * @param item - предмет для публикации
    */
-  function shareItemToChat(item: GameItem): void {
+  function shareItemToChat(item: DnDGameItem): void {
     chatStore.sendItemCard({
       cardType: 'equipment',
       title: item.name,
@@ -746,7 +1008,7 @@
    * Проверяет, является ли оружие универсальным (versatile)
    * @param item - предмет из инвентаря
    */
-  function isVersatile(item: GameItem): boolean {
+  function isVersatile(item: DnDGameItem): boolean {
     return (
       item.type === 'weapon'
       && Boolean(item.weaponProperties?.includes('versatile'))
@@ -756,14 +1018,69 @@
   /**
    * Вычисляет и форматирует бонус к броску атаки текущим оружием
    */
-  function getWeaponAttackBonusLabel(weapon: GameItem): string {
-    const mod = calculateWeaponAttackModifier(
-      props.actor,
-      weapon,
-      resolvedStats.value,
+  function getWeaponAttackBonusLabel(weapon: DnDGameItem): string {
+    return formatSignedNumber(
+      calculateWeaponAttackModifier(props.entity, weapon, resolvedStats.value),
+    );
+  }
+
+  /**
+   * Расшифровка бонуса атаки для подсказки плитки: из чего сложилось число.
+   * Строка мастерства остаётся в разборе и без владения — по ней видно, почему
+   * бонуса мастерства в атаке нет.
+   *
+   * @param weapon - оружие
+   * @returns строка вида «Ловкость +3 · Мастерство +2»
+   */
+  function weaponAttackHint(weapon: DnDGameItem): string {
+    return formatWeaponModifierParts(
+      describeWeaponAttack(props.entity, weapon, resolvedStats.value),
+    );
+  }
+
+  /**
+   * Подсказка плитки урона: вид урона и расшифровка статической прибавки.
+   *
+   * @param weapon - оружие
+   * @returns строка вида «Колющий · Ловкость +3 · Магия +1»
+   */
+  function weaponDamageHint(weapon: DnDGameItem): string {
+    return [
+      weaponKindLabel(weapon),
+      formatWeaponModifierParts(
+        describeWeaponDamage(props.entity, weapon, resolvedStats.value),
+      ),
+    ]
+      .filter(Boolean)
+      .join(' · ');
+  }
+
+  /**
+   * Подсказка и значок плитки урона оружия. Добавки по условию («+1к8, если
+   * атакующий окровавлен») идут строками после основной подсказки; значок
+   * говорит, что у урона есть ещё что-то — тип на выбор либо такая добавка.
+   *
+   * @param weapon - оружие
+   * @returns подсказка и значок плитки урона
+   */
+  function weaponDamageStatExtras(
+    weapon: DnDGameItem,
+  ): Pick<SheetRowStat, 'tooltip' | 'icon'> {
+    const bonusLines = formatDamageBonusLines(
+      describeWeaponDamageDisplay(weapon, resolvedStats.value)
+        .conditionalFormulas,
     );
 
-    return mod >= 0 ? `+${mod}` : `${mod}`;
+    return {
+      tooltip: [weaponDamageHint(weapon), ...bonusLines].join(
+        SHEET_ROW_TOOLTIP_LINE_BREAK,
+      ),
+      // Тип на выбор назван в подсказке, в плитке — только значок
+      icon: resolveDamageStatIcon(
+        listSourceDamageTypeChoices(weapon).length > 0,
+        bonusLines.length > 0,
+      ),
+    };
   }
 
   /**
@@ -773,18 +1090,21 @@
    * @param weapon - оружие
    * @returns строка вида «4к6+4» / «1к8 + 1к6»
    */
-  function weaponDamageFormulaLabel(weapon: GameItem): string {
-    const base = formatWeaponDamageFormula(weapon);
+  function weaponDamageFormulaLabel(weapon: DnDGameItem): string {
+    // Добавки по условию в плитку не идут — они в подсказке
+    const base = describeWeaponDamageDisplay(
+      weapon,
+      resolvedStats.value,
+    ).baseFormula;
 
-    const mod =
-      calculateWeaponDamageModifier(props.actor, weapon, resolvedStats.value)
-      + (weapon.isMagical && weapon.magicBonus ? weapon.magicBonus : 0);
+    // Магический бонус входит в расчёт прибавки — отдельно его не добавляем
+    const mod = calculateWeaponDamageModifier(
+      props.entity,
+      weapon,
+      resolvedStats.value,
+    );
 
-    if (mod === 0) {
-      return base;
-    }
-
-    return `${base}${mod > 0 ? '+' : ''}${mod}`;
+    return formatDamageTileFormula(base, mod);
   }
 
   /**
@@ -794,16 +1114,24 @@
    * @param weapon - оружие
    * @returns подпись вида «Гром» / «Рубящий + Огонь» / «Лечение»
    */
-  function weaponKindLabel(weapon: GameItem): string {
+  function weaponKindLabel(weapon: DnDGameItem): string {
     const types = new Set<string>();
+    const typeChoices = new Set<string>();
+
+    const getTypeLabel = (type: string): string =>
+      damageTypeMap.value.get(type) ?? type;
 
     let hasHealing = false;
 
-    for (const part of weapon.damageParts ?? []) {
+    for (const part of getWeaponDamageParts(weapon, resolvedStats.value)) {
       const info = describeDamagePart(part);
 
       for (const type of info.types) {
         types.add(type);
+      }
+
+      for (const choice of info.typeChoices) {
+        typeChoices.add(formatDamageTypeChoiceLabel(choice, getTypeLabel));
       }
 
       if (info.isHealing) {
@@ -811,129 +1139,494 @@
       }
     }
 
-    const labels = [...types].map(
-      (type) => damageTypeMap.value.get(type) ?? type,
-    );
+    const labels = [...[...types].map(getTypeLabel), ...typeChoices];
 
     if (hasHealing) {
-      labels.push('Лечение');
+      labels.push(ACTOR_EQUIPMENT_TAB_LABELS.healing);
     }
 
     return labels.join(' + ');
   }
 
   /**
-   * Обновляет количество монет
+   * Подпись под названием предмета: категория записи, у оружия — ещё и вид
+   * дальности. Собирается здесь, а не в строке: названия категорий приходят из
+   * справочников хоста.
+   *
+   * @param item - предмет снаряжения
+   * @returns подпись вида «Воинское оружие, Рукопашное оружие»
    */
-  function updateCurrency(
-    coinKey: 'cp' | 'sp' | 'ep' | 'gp' | 'pp',
-    value: string | number,
-  ): void {
-    const numericValue =
-      typeof value === 'string' ? Number.parseInt(value, 10) || 0 : value;
+  function getItemSubtitle(item: DnDGameItem): string {
+    // Метательное рукопашное: им и бьют, и бросают — видны обе дальности
+    if (item.type === 'weapon' && isThrowableMeleeWeapon(item)) {
+      const distances = formatMeleeOrRangedDistances({
+        reach: item.reach ?? DEFAULT_REACH_FEET,
+        range: item.range,
+        unitLabel: DISTANCE_UNIT_SHORT[item.distanceUnit ?? 'ft'],
+      });
 
-    emit('update:actor', {
-      system: {
-        ...props.actor.system,
-        currency: {
-          ...(props.actor.system.currency || {
-            cp: 0,
-            sp: 0,
-            ep: 0,
-            gp: 0,
-            pp: 0,
-          }),
-          [coinKey]: numericValue,
+      return [
+        getWeaponCategoryLabel(item.baseType),
+        `${WEAPON_THROWN_RANGE_LABEL}, ${distances}`,
+      ]
+        .filter(Boolean)
+        .join(', ');
+    }
+
+    if (item.type === 'weapon') {
+      const parts = [
+        getWeaponCategoryLabel(item.baseType),
+        item.rangeType ? WEAPON_RANGE_TYPE_LABELS[item.rangeType] : '',
+      ];
+
+      return parts.filter(Boolean).join(', ');
+    }
+
+    if (item.type === 'equipment') {
+      const category = item.equipmentCategory ?? '';
+
+      return armorCategoryMap.value.get(category) ?? category;
+    }
+
+    if (item.type === 'tool') {
+      const category = item.toolCategory ?? '';
+
+      return toolCategoryMap.value.get(category) ?? category;
+    }
+
+    return item.typeLabel ?? '';
+  }
+
+  /**
+   * Плитки параметров строки: боевой параметр предмета (атака и урон оружия,
+   * КД доспеха, бонус инструмента), затем цена и вес.
+   *
+   * Цена уступает место боевым плиткам: в бою нужны они, а ряд не растёт.
+   *
+   * @param item - предмет снаряжения
+   * @returns плитки в порядке показа
+   */
+  function getItemStats(item: DnDGameItem): SheetRowStat[] {
+    const stats: SheetRowStat[] = [];
+
+    if (item.type === 'weapon' && item.damageParts?.length) {
+      // Числа — как у выстрела: бонус заряженного боеприпаса в счёте
+      const weapon = withLoadedAmmunition(inventory.value, item);
+
+      stats.push(
+        {
+          key: 'attack',
+          label: EQUIPMENT_STAT_LABELS.attack,
+          value: getWeaponAttackBonusLabel(weapon),
+          tooltip: weaponAttackHint(weapon),
+          accent: true,
+          rollable: true,
         },
-      },
-    });
+        {
+          key: 'damage',
+          label: EQUIPMENT_STAT_LABELS.damage,
+          value: weaponDamageFormulaLabel(weapon),
+          accent: true,
+          rollable: true,
+          ...weaponDamageStatExtras(weapon),
+        },
+      );
+    } else if (item.type === 'equipment' && item.baseArmorAC) {
+      // Щит прибавляет к классу доспеха, а не задаёт его — и показан прибавкой
+      const isShield = item.equipmentCategory === 'shield';
+      const armorClass = item.baseArmorAC + (item.magicBonus ?? 0);
+
+      stats.push({
+        key: 'armorClass',
+        label: EQUIPMENT_STAT_LABELS.armorClass,
+        value: isShield ? formatSignedNumber(armorClass) : String(armorClass),
+        tooltip: isShield
+          ? EQUIPMENT_STAT_HINTS.shieldClass
+          : EQUIPMENT_STAT_HINTS.armorClass,
+        accent: true,
+      });
+    } else if (item.type === 'tool' && item.toolBonus) {
+      stats.push({
+        key: 'toolBonus',
+        label: EQUIPMENT_STAT_LABELS.toolBonus,
+        value: formatSignedNumber(item.toolBonus),
+        tooltip: EQUIPMENT_STAT_HINTS.toolBonus,
+        accent: true,
+      });
+    }
+
+    // Заряды идут сразу за боевой плиткой: у предмета с зарядами это главное
+    // число строки — по нему видно, работает предмет ещё или уже пуст
+    if (item.uses) {
+      stats.push({
+        key: 'uses',
+        label: EQUIPMENT_STAT_LABELS.uses,
+        value: `${item.uses.current}/${item.uses.max}`,
+        tooltip: EQUIPMENT_STAT_HINTS.uses,
+        accent: item.uses.current > 0,
+      });
+    }
+
+    const cost = formatItemCost(item.cost);
+
+    if (cost && stats.length < 2) {
+      stats.push({
+        key: 'cost',
+        label: EQUIPMENT_STAT_LABELS.cost,
+        value: cost,
+        tooltip: EQUIPMENT_STAT_HINTS.cost,
+      });
+    }
+
+    if (item.weight > 0) {
+      stats.push({
+        key: 'weight',
+        label: WEIGHT_UNIT_LABEL,
+        value: String(item.weight),
+        tooltip: EQUIPMENT_STAT_HINTS.weight,
+      });
+    }
+
+    return stats;
+  }
+
+  /**
+   * Разделы снаряжения со строками, уже собранными для показа.
+   *
+   * Собираются вычислимым, а не вызовами из шаблона: бонус атаки и формула
+   * урона считаются по характеристикам персонажа, и из шаблона они шли бы на
+   * каждую перерисовку списка.
+   */
+  const equipmentRowGroups = computed(() =>
+    equipmentGroups.value.map((group) => ({
+      label: group.label,
+      rows: group.items.map((item) => ({
+        item,
+        subtitle: getItemSubtitle(item),
+        stats: getItemStats(item),
+        menuItems: getItemMenuItems(item),
+        isEquipBlocked: isEquipDisabled(item),
+        ammunition: getAmmunitionBadge(item),
+      })),
+    })),
+  );
+
+  // --- Переносимый вес ---
+
+  /** Открыта ли модалка настройки грузоподъёмности */
+  const isCapacityModalOpen = ref(false);
+
+  /** Ячейка плитки переносимого веса */
+  const carryingCapacityCells = computed(() => [
+    {
+      label: ACTOR_EQUIPMENT_TAB_LABELS.carriedWeight,
+      value: weightLabel.value,
+    },
+  ]);
+
+  /** Размер листа для расчёта грузоподъёмности */
+  const actorSize = computed(
+    () => props.entity.system?.size ?? DEFAULT_CREATURE_SIZE,
+  );
+
+  /**
+   * Сохраняет настройку предела переносимого веса.
+   *
+   * Настройка живёт в блоке `system` листа персонажа, поэтому окно и не
+   * показывается существу: предел у него считается по правилам от Силы и
+   * размера, и менять там нечего
+   */
+  function applyCarryingCapacity(updated: DnDCarryingCapacity): void {
+    if (props.isReadOnly) {
+      return;
+    }
+
+    emit('update:carrying-capacity', updated);
+
+    triggerSaveIfNotEdit();
+  }
+
+  // --- Добавление из компендиума ---
+
+  /** Открыто ли окно выбора предметов компендиума */
+  const isItemPickerOpen = ref(false);
+
+  /** Разделы предметов из манифестов компендиумов — для фильтра окна */
+  const itemSections = ref<ItemSection[]>([]);
+
+  /** Значение фильтра «Раздел» у записи окна */
+  const itemSectionFilterValue = computed(() =>
+    buildItemSectionFilterValue(itemSections.value),
+  );
+
+  /** Порядок разделов в фильтре окна — как в дереве компендиума */
+  const itemSectionOrder = computed(() =>
+    itemSectionFilterOrder(itemSections.value),
+  );
+
+  /**
+   * Открывает окно выбора предметов. Разделы подтягиваются следом: окно
+   * показывается сразу, а фильтр по разделам появляется, как только приедут
+   * манифесты (сервер держит их в памяти, так что ждать почти не приходится).
+   */
+  function openItemPicker(): void {
+    if (props.isReadOnly) {
+      return;
+    }
+
+    isItemPickerOpen.value = true;
+
+    const socket = chatStore.getSocket();
+
+    if (socket && itemSections.value.length === 0) {
+      void loadCompendiumManifests(socket).then((manifests) => {
+        itemSections.value = collectItemSections(manifests);
+      });
+    }
+  }
+
+  /**
+   * Кладёт выбранные в окне предметы в инвентарь — так же, как при
+   * перетаскивании из компендиума: каждая запись становится своей копией.
+   *
+   * @param picked - отмеченные записи
+   */
+  function addPickedItems(picked: PickedCompendiumEntry[]): void {
+    const added = picked
+      .map((pickedEntry) => pickedEntry.entry)
+      .filter(isDnDGameItem)
+      .map(createInventoryItem);
+
+    if (added.length === 0) {
+      return;
+    }
+
+    commitEquipment([...inventory.value, ...added]);
+  }
+
+  /**
+   * Цена записи для строки окна. Запись читается со страховкой: окно отдаёт
+   * её как есть из компендиума, и цены у неё может не быть вовсе.
+   *
+   * @param entry - запись компендиума
+   * @returns цена вида «15 зм» либо прочерк
+   */
+  function formatEntryCost(entry: CompendiumEntry): string {
+    const cost = isDnDGameItem(entry) ? formatItemCost(entry.cost) : '';
+
+    return cost || ACTOR_EQUIPMENT_TAB_LABELS.noCost;
+  }
+
+  /**
+   * Открывает карточку записи из окна выбора — ту же, что у предмета в
+   * инвентаре.
+   *
+   * @param entry - запись компендиума
+   */
+  function openPickedEntry(entry: CompendiumEntry): void {
+    if (isDnDGameItem(entry)) {
+      openDetailModal(entry);
+    }
+  }
+
+  // --- Покупка из компендиума ---
+
+  /**
+   * Подпись кнопки «Купить» в окне выбора; пусто — кнопки нет. Покупают
+   * только там, где показан кошелёк: списывать больше неоткуда.
+   */
+  const buyActionLabel = computed(() =>
+    props.showCurrency ? ACTOR_EQUIPMENT_TAB_LABELS.buy : '',
+  );
+
+  /** Открыто ли окно покупки */
+  const isPurchaseOpen = ref(false);
+
+  /** Предметы, отмеченные к покупке в окне выбора */
+  const purchaseItems = ref<DnDGameItem[]>([]);
+
+  /**
+   * Открывает окно покупки поверх окна выбора. Окно выбора остаётся открытым:
+   * отказ от покупки возвращает к списку с теми же отметками.
+   *
+   * @param picked - отмеченные записи
+   */
+  function openPurchase(picked: PickedCompendiumEntry[]): void {
+    const items = picked
+      .map((pickedEntry) => pickedEntry.entry)
+      .filter(isDnDGameItem);
+
+    if (items.length === 0 || props.isReadOnly) {
+      return;
+    }
+
+    purchaseItems.value = items;
+    isPurchaseOpen.value = true;
+  }
+
+  /**
+   * Завершает покупку: предметы ложатся в инвентарь, кошелёк худеет на их
+   * цену. Обе правки уходят до сохранения — иначе лист на миг сохранился бы с
+   * предметами, но при прежних деньгах.
+   *
+   * @param bought - купленные предметы
+   * @param walletAfter - кошелёк после оплаты
+   */
+  function completePurchase(
+    bought: DnDGameItem[],
+    walletAfter: DnDCurrency,
+  ): void {
+    if (props.isReadOnly) {
+      return;
+    }
+
+    emit('update:equipment', [
+      ...inventory.value,
+      ...bought.map(createInventoryItem),
+    ]);
+
+    emit('update:currency', walletAfter);
+
+    triggerSaveIfNotEdit();
+
+    isItemPickerOpen.value = false;
+  }
+
+  // --- Кошелёк ---
+
+  /** Открыта ли модалка редактирования валюты */
+  const isCurrencyModalOpen = ref(false);
+
+  /** Ячейки строки валюты: количество, сокращение и полное название монеты */
+  const currencyCells = computed(() =>
+    CURRENCY_OPTIONS.map((option) => ({
+      key: option.value,
+      amount: currency.value[option.value],
+      labelShort: option.labelShort,
+      labelFull: option.labelFull,
+    })),
+  );
+
+  /**
+   * Открывает окно правки кошелька. В режиме чтения не открывается вовсе:
+   * иначе игрок «поменял» бы монеты чужого монстра, сервер молча отверг бы
+   * запись, и лист врал бы до следующей синхронизации.
+   */
+  function openCurrencyModal(): void {
+    if (props.isReadOnly) {
+      return;
+    }
+
+    isCurrencyModalOpen.value = true;
+  }
+
+  /**
+   * Сохраняет кошелёк после подтверждения в модалке
+   */
+  function applyCurrency(updated: DnDCurrency): void {
+    if (props.isReadOnly) {
+      return;
+    }
+
+    emit('update:currency', updated);
+
+    triggerSaveIfNotEdit();
   }
 </script>
 
 <template>
-  <div class="flex min-h-[200px] flex-1 flex-col space-y-1">
-    <!-- Деньги / Валюта (Вплотную к табам) -->
-    <div class="mb-5 flex flex-col">
-      <div class="flex items-center gap-3 rounded-lg bg-accented/30 px-3 py-2">
-        <div
-          v-for="coin in [
-            {
-              key: 'cp',
-              label: 'ММ',
-              full: 'Медные монеты',
-              color: 'text-orange-600',
-            },
-            {
-              key: 'sp',
-              label: 'СМ',
-              full: 'Серебряные монеты',
-              color: 'text-muted',
-            },
-            {
-              key: 'ep',
-              label: 'ЭМ',
-              full: 'Электрумовые монеты',
-              color: 'text-indigo-300',
-            },
-            {
-              key: 'gp',
-              label: 'ЗМ',
-              full: 'Золотые монеты',
-              color: 'text-gold',
-            },
-            {
-              key: 'pp',
-              label: 'ПМ',
-              full: 'Платиновые монеты',
-              color: 'text-sky-200',
-            },
-          ] as const"
-          :key="coin.key"
-          class="flex flex-1 items-center gap-1.5"
-        >
-          <input
-            :value="actor.system.currency?.[coin.key] ?? 0"
-            type="number"
-            min="0"
-            class="w-0 min-w-0 flex-1 rounded bg-default/40 px-1.5 py-0.5 text-right text-xs font-semibold text-highlighted ring-1 ring-default/50 transition-shadow outline-none focus:ring-primary-500/50 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-            @input="
-              updateCurrency(
-                coin.key,
-                ($event.target as HTMLInputElement).value,
-              )
-            "
-            @blur="triggerSaveIfNotEdit()"
-          />
+  <div class="flex min-h-50 flex-1 flex-col space-y-1">
+    <!-- Переносимый вес + деньги / валюта (Вплотную к табам) -->
+    <div
+      v-if="showCarryingCapacity || showCurrency || canAddItems"
+      class="mb-5 flex flex-col gap-2"
+    >
+      <!-- Обёртка-flex: плитка занимает ширину по содержимому, а не всю
+        строку. «Добавить» стоит в правом краю того же ряда — как на вкладке
+        заклинаний -->
+      <div
+        v-if="showCarryingCapacity || canAddItems"
+        class="flex items-center gap-2"
+      >
+        <SheetStatTile
+          v-if="showCarryingCapacity"
+          :cells="carryingCapacityCells"
+          :tooltip="ACTOR_EQUIPMENT_TAB_LABELS.carriedWeightHint"
+          :aria-label="ACTOR_EQUIPMENT_TAB_LABELS.carryingCapacitySettings"
+          clickable
+          :danger="isOverweight"
+          @click="isCapacityModalOpen = true"
+        />
 
-          <UTooltip
-            :text="coin.full"
-            :popper="{ placement: 'top' }"
-          >
-            <span :class="['cursor-help text-xs font-bold', coin.color]">
-              {{ coin.label }}
-            </span>
-          </UTooltip>
-        </div>
+        <UButton
+          v-if="canAddItems"
+          icon="tabler:plus"
+          color="primary"
+          variant="soft"
+          :size="FILTER_ROW_CONTROL_SIZE"
+          class="ml-auto shrink-0"
+          @click.left.exact.prevent="openItemPicker"
+        >
+          {{ ACTOR_EQUIPMENT_TAB_LABELS.add }}
+        </UButton>
+      </div>
+
+      <!-- Высота строки та же, что у ряда отбора на других вкладках (28px,
+        ступень `sm` компонентов кита) — задана `min-h`, а не отступами: на
+        узком листе монеты переносятся, и строке нужно вырасти -->
+      <div
+        v-if="showCurrency"
+        :role="isReadOnly ? undefined : 'button'"
+        :tabindex="isReadOnly ? undefined : 0"
+        :aria-label="ACTOR_EQUIPMENT_TAB_LABELS.editCurrency"
+        class="flex min-h-7 cursor-pointer flex-wrap items-center justify-between gap-2 rounded-lg border border-default/50 bg-elevated/20 px-4 py-0.5 transition-colors hover:border-default hover:bg-elevated/40"
+        @click.left.exact.prevent="openCurrencyModal"
+        @keydown.enter.prevent="openCurrencyModal"
+        @keydown.space.prevent="openCurrencyModal"
+      >
+        <UTooltip
+          v-for="cell in currencyCells"
+          :key="cell.key"
+          :text="cell.labelFull"
+        >
+          <span class="flex items-baseline gap-1.5">
+            <span class="text-sm font-bold text-highlighted tabular-nums">{{
+              cell.amount
+            }}</span>
+
+            <span
+              class="text-[10px] font-bold tracking-wider text-muted uppercase"
+              >{{ cell.labelShort }}</span
+            >
+          </span>
+        </UTooltip>
       </div>
     </div>
 
+    <!--
+      Приписка листа под кошельком: у существа сюда встаёт свободная строка
+      снаряжения из статблока. Слотом, а не полем: у листа персонажа такой
+      строки нет, и панель не должна знать, чем именно её заполнили.
+    -->
+    <slot name="note" />
+
     <!-- Индикатор пустого списка -->
     <div
-      v-if="actor.equipment.length === 0"
+      v-if="inventory.length === 0"
       class="flex flex-1 items-center justify-center rounded-lg border-2 border-dashed px-3 py-8 text-xs transition-colors"
       :class="
         isDragOver
-          ? 'border-primary-500/50 bg-primary-500/5 text-primary-400'
+          ? 'border-primary/50 bg-primary/5 text-primary'
           : 'border-default/30 text-dimmed'
       "
     >
-      Перетащите сюда
+      {{ ACTOR_EQUIPMENT_TAB_LABELS.dropHere }}
     </div>
 
     <!-- Список предметов с разделителями -->
-    <template v-if="actor.equipment.length > 0">
+    <template v-if="inventory.length > 0">
       <div
-        v-for="(group, index) in equipmentGroups"
+        v-for="(group, index) in equipmentRowGroups"
         :key="group.label"
         class="flex flex-col"
       >
@@ -945,421 +1638,72 @@
           {{ group.label }}
         </h4>
 
-        <div class="flex flex-col gap-1">
-          <UFieldGroup
-            v-for="item in group.items"
-            :key="item.id"
-            size="lg"
-            class="flex w-full items-stretch"
-          >
-            <!-- Кнопка применения оружия — внешний связанный сегмент
-                 (иконка оружия, подсветка при экипировке) -->
-            <UButton
-              v-if="item.type === 'weapon'"
-              :color="item.equipped ? 'primary' : 'neutral'"
-              variant="soft"
-              class="shrink-0"
-              title="Атаковать"
-              @click.left.exact.prevent.stop="openRollModal(item)"
-            >
-              <WeaponIcon
-                :base-type="item.baseType"
-                class="size-5"
-              />
-            </UButton>
-
-            <!-- Иконка-сегмент для не-оружия (тот же размер для выравнивания) -->
-            <UButton
-              v-else
-              :color="item.equipped ? 'primary' : 'neutral'"
-              variant="soft"
-              class="shrink-0"
-              @click.left.exact.prevent.stop="
-                !isEditMode && openDetailModal(item)
-              "
-            >
-              <UIcon
-                :name="
-                  item.type === 'equipment'
-                    ? getEquipmentCategoryIcon(item.equipmentCategory)
-                    : (ITEM_TYPE_ICON_MAP[item.type] ?? DEFAULT_ITEM_ICON)
-                "
-                class="size-5"
-              />
-            </UButton>
-
-            <!-- Карточка предмета (сетка) -->
-            <div
-              :draggable="true"
-              class="grid flex-1 cursor-grab items-center gap-x-3 rounded-l-none bg-accented/30 px-3 py-2 transition-colors active:cursor-grabbing"
-              :class="[
-                !isEditMode ? 'hover:bg-accented/50' : '',
-                isEditMode ? 'rounded-r-none' : 'rounded-r-lg',
-              ]"
-              :style="{
-                gridTemplateColumns: 'minmax(0, 1fr) 2.75rem 7rem 4.5rem 5rem',
-              }"
-              @click.left.exact.prevent="!isEditMode && openDetailModal(item)"
-              @contextmenu="openContextMenu($event, item)"
-              @dragstart="handleItemDragStart($event, item)"
-            >
-              <!-- Сброс контекста группы, чтобы бейджи сохранили скругление -->
-              <FieldGroupReset>
-                <!-- col 1: Название + категория (две строки) -->
-                <div class="col-start-1 flex min-w-0 flex-col">
-                  <span class="truncate text-xs font-medium text-highlighted">
-                    {{ item.name }}
-                  </span>
-
-                  <span
-                    v-if="
-                      (item.type === 'weapon' && item.baseType)
-                      || (item.type === 'equipment' && item.equipmentCategory)
-                      || (item.type === 'tool' && item.toolCategory)
-                    "
-                    class="truncate text-[10px] leading-tight text-dimmed"
-                  >
-                    <template v-if="item.type === 'weapon'">
-                      {{ getWeaponCategoryLabel(item.baseType) }}
-                    </template>
-
-                    <template v-else-if="item.type === 'equipment'">
-                      {{
-                        armorCategoryMap.get(item.equipmentCategory ?? '')
-                        ?? item.equipmentCategory
-                      }}
-                    </template>
-
-                    <template v-else-if="item.type === 'tool'">
-                      {{
-                        toolCategoryMap.get(item.toolCategory ?? '')
-                        ?? item.toolCategory
-                      }}
-                    </template>
-                  </span>
-                </div>
-
-                <!-- Бонус атаки (оружие) -->
-                <div
-                  v-if="item.type === 'weapon' && item.damageParts?.length"
-                  class="col-start-2 flex flex-col items-start"
-                >
-                  <UBadge
-                    color="neutral"
-                    variant="subtle"
-                    size="sm"
-                    class="font-mono font-bold"
-                  >
-                    {{ getWeaponAttackBonusLabel(item) }}
-                  </UBadge>
-
-                  <span class="mt-0.5 text-[9px] leading-none text-dimmed">
-                    Атака
-                  </span>
-                </div>
-
-                <!-- Урон (оружие) / КД (доспех) / Бонус (инструмент) -->
-                <div
-                  v-if="
-                    (item.type === 'weapon' && item.damageParts?.length)
-                    || (item.type === 'equipment' && item.baseArmorAC)
-                    || (item.type === 'tool' && item.toolBonus)
-                  "
-                  class="col-start-3 flex min-w-0 flex-col items-start"
-                >
-                  <UBadge
-                    v-if="item.type === 'weapon' && item.damageParts?.length"
-                    color="neutral"
-                    variant="subtle"
-                    size="sm"
-                    class="font-mono"
-                  >
-                    {{ weaponDamageFormulaLabel(item) }}
-                  </UBadge>
-
-                  <UBadge
-                    v-else-if="item.type === 'equipment' && item.baseArmorAC"
-                    color="neutral"
-                    variant="subtle"
-                    size="sm"
-                    class="font-mono"
-                  >
-                    КД {{ (item.baseArmorAC ?? 0) + (item.magicBonus ?? 0) }}
-                  </UBadge>
-
-                  <UBadge
-                    v-else-if="item.type === 'tool' && item.toolBonus"
-                    color="neutral"
-                    variant="subtle"
-                    size="sm"
-                    class="font-mono"
-                  >
-                    +{{ item.toolBonus }}
-                  </UBadge>
-
-                  <span
-                    :title="
-                      item.type === 'weapon' ? weaponKindLabel(item) : undefined
-                    "
-                    class="mt-0.5 max-w-full truncate text-left text-[9px] leading-none text-dimmed"
-                  >
-                    {{
-                      (item.type === 'weapon' ? weaponKindLabel(item) : '')
-                      || '\u00A0'
-                    }}
-                  </span>
-                </div>
-
-                <!-- Количество -->
-                <div
-                  class="col-start-4 flex items-center justify-center gap-0.5"
-                >
-                  <UButton
-                    icon="tabler:minus"
-                    color="neutral"
-                    variant="ghost"
-                    size="2xs"
-                    :disabled="item.quantity <= 1"
-                    @click.left.exact.prevent.stop="
-                      updateItemQuantity(item.id, (item.quantity ?? 1) - 1)
-                    "
-                  />
-
-                  <input
-                    type="number"
-                    :value="item.quantity ?? 1"
-                    min="1"
-                    class="w-8 [appearance:textfield] rounded border border-default bg-elevated/60 text-center text-xs text-highlighted focus:border-primary-500 focus:outline-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                    @change="
-                      updateItemQuantity(
-                        item.id,
-                        Number(($event.target as HTMLInputElement).value),
-                      )
-                    "
-                    @click.stop
-                  />
-
-                  <UButton
-                    icon="tabler:plus"
-                    color="neutral"
-                    variant="ghost"
-                    size="2xs"
-                    @click.left.exact.prevent.stop="
-                      updateItemQuantity(item.id, (item.quantity ?? 1) + 1)
-                    "
-                  />
-                </div>
-
-                <!-- Кнопки экипировки/хвата/настройки (в конце строки) -->
-                <div class="col-start-5 flex items-center justify-end gap-0.5">
-                  <!-- Экипировать/Снять -->
-                  <UTooltip
-                    :text="
-                      isEquipDisabled(item)
-                        ? 'Уже надето другое снаряжение'
-                        : item.equipped
-                          ? 'Снять'
-                          : 'Экипировать'
-                    "
-                  >
-                    <UButton
-                      :icon="
-                        item.equipped ? 'tabler:circle-filled' : 'tabler:circle'
-                      "
-                      :color="item.equipped ? 'primary' : 'neutral'"
-                      variant="ghost"
-                      size="xs"
-                      :disabled="isEquipDisabled(item)"
-                      @click.left.exact.prevent.stop="toggleEquipped(item.id)"
-                    />
-                  </UTooltip>
-
-                  <!-- Хват двумя руками (только versatile) -->
-                  <UTooltip
-                    v-if="
-                      item.type === 'weapon'
-                      && isVersatile(item)
-                      && item.equipped
-                    "
-                    :text="
-                      item.twoHandedGrip
-                        ? 'Взять одной рукой'
-                        : 'Взять двумя руками'
-                    "
-                  >
-                    <UButton
-                      :icon="
-                        item.twoHandedGrip
-                          ? 'tabler:circle-filled'
-                          : 'tabler:circle'
-                      "
-                      :color="item.twoHandedGrip ? 'primary' : 'neutral'"
-                      variant="ghost"
-                      size="xs"
-                      @click.left.exact.prevent.stop="
-                        toggleTwoHandedGrip(item.id)
-                      "
-                    />
-                  </UTooltip>
-
-                  <!-- Настройка (attunement) -->
-                  <UTooltip
-                    v-if="
-                      item.magicAttunement && item.magicAttunement !== 'none'
-                    "
-                    :text="item.isAttuned ? 'Снять настройку' : 'Настроить'"
-                  >
-                    <UButton
-                      :icon="item.isAttuned ? 'tabler:link' : 'tabler:unlink'"
-                      :color="item.isAttuned ? 'warning' : 'neutral'"
-                      variant="ghost"
-                      size="xs"
-                      @click.left.exact.prevent.stop="toggleAttuned(item.id)"
-                    />
-                  </UTooltip>
-                </div>
-              </FieldGroupReset>
-            </div>
-
-            <!-- Редактировать / Удалить — сегменты, появляются в режиме
-                 редактирования и не занимают место в обычном режиме -->
-            <template v-if="isEditMode">
-              <UTooltip
-                v-if="
-                  item.type === 'weapon'
-                  || item.type === 'equipment'
-                  || item.type === 'spell'
-                  || item.type === 'tool'
-                "
-                text="Редактировать"
-              >
-                <UButton
-                  icon="tabler:edit"
-                  color="neutral"
-                  variant="soft"
-                  @click.left.exact.prevent.stop="openEditModal(item)"
-                />
-              </UTooltip>
-
-              <UButton
-                icon="tabler:trash"
-                color="error"
-                variant="soft"
-                @click.left.exact.prevent.stop="removeItem(item.id)"
-              />
-            </template>
-          </UFieldGroup>
+        <div class="flex flex-col gap-2">
+          <ActorEquipmentRow
+            v-for="row in group.rows"
+            :key="row.item.id"
+            :item="row.item"
+            :subtitle="row.subtitle"
+            :stats="row.stats"
+            :menu-items="row.menuItems"
+            :is-equip-blocked="row.isEquipBlocked"
+            :ammunition="row.ammunition"
+            :is-edit-mode="isEditMode"
+            @open="openDetailModal(row.item)"
+            @toggle-equip="toggleEquipped(row.item.id)"
+            @roll="openRollModal(row.item)"
+            @update:quantity="updateItemQuantity(row.item.id, $event)"
+            @dragstart="handleItemDragStart($event, row.item)"
+          />
         </div>
       </div>
     </template>
   </div>
 
-  <DiceRollModal
-    v-model:open="isRollModalOpen"
-    :formula="rollConfig.formula"
-    :title="`Атака — ${rollConfig.name}`"
-    :roll-label="rollConfig.name"
-    :attack-modifier="rollConfig.attackModifier"
-    :evaluate-conditional-bonuses="rollConfig.evaluateBonuses"
-    :initial-roll-mode="rollConfig.initialRollMode"
-    :incoming-attack-type="rollConfig.incomingAttackType"
-    :damage-type="rollConfig.damageType"
-    :damage-parts="rollConfig.damageParts"
-    :evaluate-bonus-damage-parts="rollConfig.evaluateBonusDamageParts"
-    :on-roll-parts="rollConfig.onRollParts"
-    :on-hit="rollConfig.onHit"
-    roll-button-text="Атаковать"
+  <!-- Предметы компендиума: слева компендиумы и разделы, справа записи с
+    поиском. Предметы мира окно показывает отдельным компендиумом -->
+  <CompendiumRefPickerModal
+    v-if="isItemPickerOpen"
+    v-model:open="isItemPickerOpen"
+    :socket="chatStore.getSocket()"
+    :kind="STARTING_EQUIPMENT_ITEM_KINDS"
+    :title="ACTOR_EQUIPMENT_TAB_LABELS.addTitle"
+    :filter-value="itemSectionFilterValue"
+    :filter-label="ACTOR_EQUIPMENT_TAB_LABELS.sectionFilter"
+    :filter-order="itemSectionOrder"
+    :entry-note="formatEntryCost"
+    show-entry-info
+    :extra-action-label="buyActionLabel"
+    :extra-action-icon="EQUIPMENT_PURCHASE_ICON"
+    @select-entries="addPickedItems"
+    @open-entry="openPickedEntry"
+    @extra-action="openPurchase"
   />
 
-  <!-- Контекстное меню (Teleport для корректного z-index) -->
-  <Teleport to="body">
-    <div
-      v-if="isContextMenuOpen && contextMenuItem"
-      class="fixed inset-0 z-10000"
-      @click.left.exact.prevent="closeContextMenu"
-      @contextmenu.prevent="closeContextMenu"
-    >
-      <div
-        class="absolute min-w-[180px] rounded-lg border border-default bg-default py-1 shadow-xl"
-        :style="{ left: `${contextMenuX}px`, top: `${contextMenuY}px` }"
-        @click.stop
-      >
-        <!-- Атаковать (только для оружия с формулой урона) -->
-        <button
-          v-if="
-            contextMenuItem.type === 'weapon'
-            && contextMenuItem.damageParts?.length
-          "
-          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-          @click.left.exact.prevent="handleContextMenuAction('attack')"
-        >
-          <UIcon
-            name="tabler:sword"
-            class="h-4 w-4 text-muted"
-          />
-          Атаковать
-        </button>
+  <!-- Покупка отмеченного: поверх окна выбора, со своим подтверждением -->
+  <EquipmentPurchaseModal
+    v-if="showCurrency"
+    v-model:open="isPurchaseOpen"
+    :currency="currency"
+    :items="purchaseItems"
+    @confirm="completePurchase"
+  />
 
-        <!-- Разделитель после «Атаковать» -->
-        <div
-          v-if="
-            contextMenuItem.type === 'weapon'
-            && contextMenuItem.damageParts?.length
-          "
-          class="mx-2"
-        />
+  <!-- Модалка настройки грузоподъёмности -->
+  <CarryingCapacityModal
+    v-if="showCarryingCapacity"
+    v-model:open="isCapacityModalOpen"
+    :capacity="capacitySettings"
+    :strength="strength"
+    :actor-size="actorSize"
+    @apply="applyCarryingCapacity"
+  />
 
-        <!-- Редактировать -->
-        <button
-          v-if="
-            contextMenuItem.type === 'weapon'
-            || contextMenuItem.type === 'equipment'
-            || contextMenuItem.type === 'spell'
-            || contextMenuItem.type === 'tool'
-          "
-          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-          @click.left.exact.prevent="handleContextMenuAction('edit')"
-        >
-          <UIcon
-            name="tabler:edit"
-            class="h-4 w-4 text-muted"
-          />
-          Редактировать
-        </button>
-
-        <!-- Разделитель -->
-        <div
-          v-if="
-            contextMenuItem.type === 'weapon'
-            || contextMenuItem.type === 'equipment'
-            || contextMenuItem.type === 'spell'
-            || contextMenuItem.type === 'tool'
-          "
-          class="mx-2 my-1 border-t border-default/50"
-        />
-
-        <!-- Поделиться в чат -->
-        <button
-          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-          @click.left.exact.prevent="handleContextMenuAction('share')"
-        >
-          <UIcon
-            name="tabler:message-share"
-            class="h-4 w-4 text-muted"
-          />
-          Поделиться в чат
-        </button>
-
-        <!-- Разделитель -->
-
-        <!-- Удалить -->
-        <ContextMenuDangerItem
-          icon="tabler:trash"
-          @click="handleContextMenuAction('delete')"
-        >
-          Удалить
-        </ContextMenuDangerItem>
-      </div>
-    </div>
-  </Teleport>
+  <!-- Модалка редактирования кошелька -->
+  <CurrencyModal
+    v-if="showCurrency"
+    v-model:open="isCurrencyModalOpen"
+    :currency="currency"
+    @apply="applyCurrency"
+  />
 </template>

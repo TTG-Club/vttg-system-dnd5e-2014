@@ -15,12 +15,28 @@
  *
  * Безопасность:
  * - НЕ использует eval() или Function()
- * - Поддерживает ТОЛЬКО: числа, +, -, ×, /, скобки, @-переменные, min/max/floor/ceil
+ * - Поддерживает ТОЛЬКО: числа, +, -, ×, /, скобки, @-переменные,
+ *   min/max/floor/ceil/abs/steps
  * - Отклоняет любой невалидный ввод
  */
 
+import type { AbilityType, MovementType } from '@vtt/shared';
+
 import { isActorEntity } from '@vtt/shared';
-import { getTotalLevel } from './classTypes.js';
+
+import { calculateProficiencyBonus } from './calculations.js';
+import { getClassLevels, getTotalLevel } from './classTypes.js';
+import {
+  ABILITY_KEYS,
+  isCreatureCategory,
+  isMovementType,
+  MOVEMENT_KEYS,
+} from './consts.js';
+import {
+  DEFAULT_PROFICIENCY_BONUS,
+  getProficiencyBonusBreakdown,
+  parseProficiencySettings,
+} from './proficiencyBonus.js';
 
 // ── Типы ──────────────────────────────────────────────────────
 
@@ -32,6 +48,35 @@ export interface FormulaContext {
   prof: number;
   /** Уровень персонажа */
   level: number;
+  /**
+   * Уровень в СВОЁМ классе — токен `@classLevel`. Им пишутся формулы умений
+   * класса: «Драконья устойчивость» поднимает максимум хитов на уровень
+   * ЧАРОДЕЯ, а не на сумму уровней мультиклассера.
+   *
+   * Заполняется не листом, а источником формулы: значение зависит от того, чьё
+   * это умение, и пайплайн подставляет его в формулы эффекта по метке класса в
+   * его id (см. `classEffectScope.ts`). Не задан — токен читается как `@level`:
+   * у одноклассника это одно и то же число, и формула без класса за спиной
+   * считает ровно то, что считала до появления токена.
+   */
+  classLevel?: number;
+  /**
+   * Уровни листа по классам — из них источник формулы берёт свой
+   * {@link classLevel}. Держать их в контексте приходится потому, что контекст
+   * собирается один на весь лист, а формулы у классовых ресурсов свои: счётчик
+   * знает лишь ключ своего класса (см. `resolveCounterMaxIn`).
+   */
+  classLevels?: ReadonlyMap<string, number>;
+  /**
+   * Скорости передвижения листа в футах — токены `@speed.walk`, `@speed.fly`
+   * и т.д. Ими задаётся «полёт равен скорости ходьбы»: эффект пишет не число, а
+   * ссылку на скорость, и та едет за листом сама.
+   *
+   * Это БАЗОВЫЕ скорости листа, а не итоговые: итоговые считает пайплайн
+   * эффектов, и формула эффекта, читающая их, зависела бы от собственного
+   * результата. По той же причине число берёт из базы и механика черты.
+   */
+  movement: Record<MovementType, number>;
   /**
    * Модификатор заклинательной характеристики (для токена `@mod.spell`).
    *
@@ -50,8 +95,82 @@ export interface FormulaContext {
   target?: {
     /** У цели полный запас хитов */
     isFull: boolean;
+    /**
+     * Тип существа цели — для токенов `@target.type.<тип>`. Не задан (цели нет
+     * или у неё нет типа) — такой токен считается как `0`.
+     */
+    creatureType?: import('./creatureTypes.js').CreatureCategory;
   };
+  /**
+   * Данные события срабатывания — токен `@damage` (урон события) в Сл
+   * срабатывания. Вне события токен — ошибка формулы.
+   */
+  event?: { damage: number };
+  /**
+   * Сл заклинаний владельца формулы — токен `@spellDc`. Им пишется Сл умения
+   * «равна Сл ваших заклинаний» (аура, умение подкласса). Заполняется только
+   * там, где формула Сл считается по владельцу: вне этого токен — ошибка.
+   */
+  spellSaveDc?: number;
+  /**
+   * Круг ячейки каста — токен `@castLevel`: «Лунный луч» `(@castLevel)к10`,
+   * «Подмога» `5 * (@castLevel - 1)`. Подставляется числом при касте
+   * (`sourceFormulaBinding`) и дальше живёт в эффекте; вне каста токен —
+   * ошибка формулы.
+   */
+  castLevel?: number;
+  /**
+   * Непотраченные кости хитов листа — токен `@hitDice.left`: «отдать половину
+   * оставшихся Костей хитов» — `ceil(@hitDice.left / 2)`. У существа — ноль.
+   */
+  hitDiceLeft?: number;
+  /**
+   * Текущие временные хиты — токен `@hp.temp`: «теряет оставшиеся временные
+   * хиты и получает столько же урона».
+   */
+  tempHp?: number;
+  /**
+   * Сколько отметок каждого ключа лежит на сущности — токен `@tag.<ключ>`:
+   * «1к8 за каждую Точку давления» — `(@tag.pressure)к8`. Ключ в токене —
+   * латиницей, цифрами и `_`.
+   */
+  tags?: Readonly<Record<string, number>>;
 }
+
+/** Переменная непотраченных костей хитов листа */
+export const HIT_DICE_LEFT_VARIABLE = 'hitDice.left';
+
+/** Переменная текущих временных хитов */
+export const TEMP_HP_VARIABLE = 'hp.temp';
+
+/** Начало переменной числа отметок: дальше — ключ отметки */
+export const TAG_COUNT_VARIABLE = 'tag';
+
+/** Переменная урона события в Сл срабатывания */
+export const EVENT_DAMAGE_VARIABLE = 'damage';
+
+/** Переменная Сл заклинаний владельца в формуле Сл */
+export const SPELL_SAVE_DC_VARIABLE = 'spellDc';
+
+/** Переменная круга ячейки каста */
+export const CAST_LEVEL_VARIABLE = 'castLevel';
+
+/**
+ * Токены формул листа. Тот же диалект понимают активные эффекты и количество
+ * заклинаний ступени: второй диалект того же смысла разошёлся бы с первым.
+ */
+export const COUNTER_FORMULA_TOKENS = {
+  /** Бонус мастерства */
+  proficiencyBonus: '@prof',
+  /** Уровень персонажа */
+  level: '@level',
+  /** Уровень в своём классе: ресурс класса растёт по его уровням */
+  classLevel: '@classLevel',
+  /** Приставка модификатора характеристики: `@mod.cha` */
+  abilityModifierPrefix: '@mod.',
+  /** Модификатор заклинательной характеристики */
+  spellAbilityModifier: '@mod.spell',
+} as const;
 
 /**
  * Сокращённые коды характеристик → полные имена.
@@ -67,6 +186,15 @@ export const ABILITY_ABBREVIATIONS: Readonly<Record<string, string>> = {
   wis: 'wisdom',
   cha: 'charisma',
 };
+
+/** Сокращение характеристики для формулы по её ключу (`charisma` → `cha`) */
+export const ABILITY_ABBREVIATION_BY_KEY: Readonly<Record<string, string>> =
+  Object.fromEntries(
+    Object.entries(ABILITY_ABBREVIATIONS).map(([abbreviation, ability]) => [
+      ability,
+      abbreviation,
+    ]),
+  );
 
 /** Результат валидации формулы */
 export interface FormulaValidationResult {
@@ -104,11 +232,7 @@ interface FormulaToken {
 
 /** Тип узла AST */
 type AstNodeType =
-  | 'number'
-  | 'variable'
-  | 'binaryOp'
-  | 'unaryOp'
-  | 'functionCall';
+  'number' | 'variable' | 'binaryOp' | 'unaryOp' | 'functionCall';
 
 /** Узел AST */
 interface AstNode {
@@ -135,8 +259,26 @@ export class FormulaError extends Error {
 
 // ── Константы ─────────────────────────────────────────────────
 
+/** Функция ступеней: `steps(значение, порог1, порог2, …)` */
+const STEPS_FUNCTION = 'steps';
+
+/** Функция чётности: `even(число)` — 1 у чётного, 0 у нечётного */
+const EVEN_FUNCTION = 'even';
+
+/** Функция нечётности: `odd(число)` — 1 у нечётного, 0 у чётного */
+const ODD_FUNCTION = 'odd';
+
 /** Поддерживаемые функции */
-const SUPPORTED_FUNCTIONS = new Set(['min', 'max', 'floor', 'ceil', 'abs']);
+const SUPPORTED_FUNCTIONS = new Set([
+  'min',
+  'max',
+  'floor',
+  'ceil',
+  'abs',
+  STEPS_FUNCTION,
+  EVEN_FUNCTION,
+  ODD_FUNCTION,
+]);
 
 /** Приоритет операторов */
 const OPERATOR_PRECEDENCE: Record<string, number> = {
@@ -188,7 +330,7 @@ function tokenize(formula: string): FormulaToken[] {
       continue;
     }
 
-    // @-переменные: @mod.str, @prof, @level
+    // @-переменные: @mod.str, @prof, @level, @classLevel
     if (char === '@') {
       let variablePath = '';
       position++; // пропускаем @
@@ -243,7 +385,7 @@ function tokenize(formula: string): FormulaToken[] {
       continue;
     }
 
-    // Идентификаторы (функции: min, max, floor, ceil)
+    // Идентификаторы (функции: min, max, floor, ceil, abs, steps)
     if (isAlpha(char)) {
       let identifier = '';
 
@@ -481,6 +623,9 @@ function evaluateNode(node: AstNode, context: FormulaContext): number {
  * - mod.str → context.abilities.strength.mod (mod.spell — заклинательная)
  * - prof → context.prof
  * - level → context.level
+ * - classLevel → context.classLevel, иначе context.level
+ * - spellDc → context.spellSaveDc (Сл заклинаний владельца)
+ * - castLevel → context.castLevel (круг ячейки каста)
  * - target.full / target.notFull → 1/0 по состоянию цели
  *
  * @param variablePath - путь переменной (без @)
@@ -494,7 +639,7 @@ function resolveVariable(
 ): number {
   const parts = variablePath.split('.');
 
-  // Простые переменные: prof, level
+  // Простые переменные: prof, level, classLevel
   if (parts.length === 1) {
     const simpleKey = parts[0];
 
@@ -504,6 +649,38 @@ function resolveVariable(
 
     if (simpleKey === 'level') {
       return context.level;
+    }
+
+    if (simpleKey === 'classLevel') {
+      return context.classLevel ?? context.level;
+    }
+
+    if (simpleKey === EVENT_DAMAGE_VARIABLE) {
+      if (!context.event) {
+        throw new FormulaError(`@${simpleKey} есть только у события урона`);
+      }
+
+      return context.event.damage;
+    }
+
+    if (simpleKey === CAST_LEVEL_VARIABLE) {
+      if (context.castLevel === undefined) {
+        throw new FormulaError(
+          `@${simpleKey} есть только у эффекта заклинания: круг ставит каст`,
+        );
+      }
+
+      return context.castLevel;
+    }
+
+    if (simpleKey === SPELL_SAVE_DC_VARIABLE) {
+      if (context.spellSaveDc === undefined) {
+        throw new FormulaError(
+          `@${simpleKey} есть только в Сл, которую считают по владельцу`,
+        );
+      }
+
+      return context.spellSaveDc;
     }
 
     // Короткий код характеристики @int → значение (16), парно к @mod.int (мод)
@@ -555,6 +732,36 @@ function resolveVariable(
     );
   }
 
+  // Непотраченные кости хитов листа
+  if (variablePath === HIT_DICE_LEFT_VARIABLE) {
+    return context.hitDiceLeft ?? 0;
+  }
+
+  // Текущие временные хиты
+  if (variablePath === TEMP_HP_VARIABLE) {
+    return context.tempHp ?? 0;
+  }
+
+  // Число отметок на сущности: отметки нет — ноль, а не ошибка
+  if (parts[0] === TAG_COUNT_VARIABLE && parts.length === 2) {
+    return context.tags?.[parts[1]] ?? 0;
+  }
+
+  // Скорости листа: @speed.walk, @speed.fly, @speed.climb, @speed.swim,
+  // @speed.burrow. Ими эффект выражает «полёт равен скорости ходьбы»
+  if (parts[0] === 'speed' && parts.length === 2) {
+    const movementType = parts[1];
+
+    if (!isMovementType(movementType)) {
+      throw new FormulaError(
+        `Неизвестный вид движения: @speed.${movementType}. `
+          + `Допустимо: ${MOVEMENT_KEYS.join(', ')}`,
+      );
+    }
+
+    return context.movement[movementType] ?? 0;
+  }
+
   // Условные токены цели: @target.full / @target.notFull → 1 или 0.
   // В Active Effects используются как множитель/значение; в формулах урона
   // заклинаний обрабатываются раньше (гейт на слагаемое, см. applyTargetConditionals).
@@ -570,8 +777,36 @@ function resolveVariable(
     }
 
     throw new FormulaError(
-      `Неизвестный токен цели: @target.${parts[1]}. Допустимо: full, notFull`,
+      `Неизвестный токен цели: @target.${parts[1]}. Допустимо: full, notFull, type.<тип>`,
     );
+  }
+
+  // Состояния сторон: @self.status.<ключ> / @target.status.<ключ>. В формулах
+  // урона они гасят своё слагаемое ещё до парсера (`expandDamageParts`); здесь
+  // состояний не знают — токен читается как «состояния нет» (0) и не роняет
+  // формулу «неизвестной переменной»
+  if (
+    (parts[0] === 'self' || parts[0] === 'target')
+    && parts[1] === 'status'
+    && parts.length === 3
+  ) {
+    return 0;
+  }
+
+  // Тип существа цели: @target.type.undead → 1 у нежити, иначе 0. В формулах
+  // урона этот токен гасит своё слагаемое ещё до парсера
+  // (`applyTargetTypeConditionals`); здесь он нужен значениям эффектов и тому,
+  // чтобы токен нигде не ронял формулу «неизвестной переменной»
+  if (parts[0] === 'target' && parts[1] === 'type' && parts.length === 3) {
+    const wanted = parts[2].toLowerCase();
+
+    if (!isCreatureCategory(wanted)) {
+      throw new FormulaError(
+        `Неизвестный тип существа: @target.type.${parts[2]}`,
+      );
+    }
+
+    return context.target?.creatureType === wanted ? 1 : 0;
   }
 
   throw new FormulaError(`Неизвестная переменная: @${variablePath}`);
@@ -647,9 +882,46 @@ function evaluateFunction(funcName: string, args: number[]): number {
       }
 
       return Math.abs(args[0]);
+    case STEPS_FUNCTION:
+      return countReachedSteps(args);
+    // Развилка по выпавшему числу: «чётное — временные хиты, нечётное — урон»
+    // пишется множителем `@paid.hitDiceRoll * even(@paid.hitDiceRoll)`
+    case EVEN_FUNCTION:
+    case ODD_FUNCTION: {
+      if (args.length !== 1) {
+        throw new FormulaError(`${funcName}() требует ровно 1 аргумент`);
+      }
+
+      const isEven = Math.abs(Math.trunc(args[0])) % 2 === 0;
+
+      return isEven === (funcName === EVEN_FUNCTION) ? 1 : 0;
+    }
     default:
       throw new FormulaError(`Неизвестная функция: ${funcName}()`);
   }
+}
+
+/**
+ * `steps(значение, порог1, порог2, …)` — сколько порогов значение уже
+ * достигло.
+ *
+ * Правила растят число по ступеням уровня, а не по ровной арифметике:
+ * «Божественная искра» даёт лишнюю к8 на 7, 13 и 18 уровнях жреца, и
+ * `floor` такой ряд не описывает. Ступени пишутся порогами прямо в формуле —
+ * `1 + steps(@classLevel, 7, 13, 18)` — и формула остаётся строкой, которую
+ * хранит справочник сайта без новых полей.
+ *
+ * @param args - значение и пороги
+ * @returns число достигнутых порогов
+ */
+function countReachedSteps(args: number[]): number {
+  if (args.length < 2) {
+    throw new FormulaError('steps() требует значение и хотя бы один порог');
+  }
+
+  const [value, ...thresholds] = args;
+
+  return thresholds.filter((threshold) => value >= threshold).length;
 }
 
 // ── Вспомогательные функции ───────────────────────────────────
@@ -666,7 +938,60 @@ function isAlphaNumeric(char: string): boolean {
   return isAlpha(char) || (char >= '0' && char <= '9');
 }
 
+/**
+ * Модификаторы характеристик из контекста формул: в нём они лежат рядом со
+ * значениями, а расчёту своих бонусов мастерства нужны одни модификаторы.
+ *
+ * @param abilities - характеристики контекста
+ * @returns модификаторы всех шести характеристик
+ */
+function toAbilityModifiers(
+  abilities: Record<string, { value: number; mod: number }>,
+): Record<AbilityType, number> {
+  return {
+    strength: abilities.strength?.mod ?? 0,
+    dexterity: abilities.dexterity?.mod ?? 0,
+    constitution: abilities.constitution?.mod ?? 0,
+    intelligence: abilities.intelligence?.mod ?? 0,
+    wisdom: abilities.wisdom?.mod ?? 0,
+    charisma: abilities.charisma?.mod ?? 0,
+  };
+}
+
 // ── Публичный API ─────────────────────────────────────────────
+
+/**
+ * Базовые скорости сущности для токенов `@speed.*`.
+ *
+ * У существа поля скоростей может не быть вовсе — тогда все нули: формула
+ * посчитается, а не упадёт, и «равен скорости ходьбы» просто ничего не даст.
+ *
+ * @param entity - лист персонажа или существо
+ * @returns запись «вид движения → футы»
+ */
+function readMovement(
+  entity:
+    | import('./dndEntities.js').DnDActor
+    | import('./dndEntities.js').DnDCreature,
+): Record<MovementType, number> {
+  const movement: Record<MovementType, number> = {
+    walk: 0,
+    swim: 0,
+    fly: 0,
+    climb: 0,
+    burrow: 0,
+  };
+
+  const system = entity.system;
+
+  if ('movement' in system && system.movement) {
+    for (const movementKey of MOVEMENT_KEYS) {
+      movement[movementKey] = system.movement[movementKey] ?? 0;
+    }
+  }
+
+  return movement;
+}
 
 /**
  * Строит контекст формул из данных актора D&D 5e.
@@ -680,7 +1005,7 @@ function isAlphaNumeric(char: string): boolean {
 export function buildFormulaContext(
   actor:
     | import('./dndEntities.js').DnDActor
-    | import('./dndEntities.js').Creature,
+    | import('./dndEntities.js').DnDCreature,
 ): FormulaContext {
   const abilityNames = [
     'strength',
@@ -703,27 +1028,149 @@ export function buildFormulaContext(
   }
 
   let level = 1;
-  let prof = 2;
+  let ruleProficiencyBonus = DEFAULT_PROFICIENCY_BONUS;
+  let classLevels: ReadonlyMap<string, number> = new Map();
 
   if (isActorEntity(actor)) {
     level = getTotalLevel(actor.system.classes);
-    prof = calculateProficiencyBonus(level);
+    ruleProficiencyBonus = calculateProficiencyBonus(level);
+    classLevels = getClassLevels(actor.system.classes);
   } else if ('proficiencyBonus' in actor.system) {
-    // Существо: классовых уровней нет (@level остаётся 1) — бонус мастерства
-    // берётся напрямую из system.proficiencyBonus.
+    // Существо: классовых уровней нет (@level остаётся 1) — основа бонуса
+    // берётся напрямую из system.proficiencyBonus (бонус по опасности).
     const creatureProficiencyBonus = actor.system.proficiencyBonus;
 
-    prof =
+    ruleProficiencyBonus =
       typeof creatureProficiencyBonus === 'number'
         ? creatureProficiencyBonus
-        : 2;
+        : DEFAULT_PROFICIENCY_BONUS;
   }
+
+  // Настройка листа правит и `@prof`: со своей основой мастерства формулы
+  // эффектов должны считать то же число, что и весь остальной лист
+  const prof = getProficiencyBonusBreakdown({
+    ruleValue: ruleProficiencyBonus,
+    settings: parseProficiencySettings(actor.system.proficiencySettings),
+    abilityMods: toAbilityModifiers(abilities),
+  }).value;
 
   return {
     abilities,
     prof,
     level,
+    classLevels,
+    movement: readMovement(actor),
+    hitDiceLeft: countHitDiceLeft(actor),
+    tempHp: readTempHp(actor),
+    tags: countTags(actor),
   };
+}
+
+/**
+ * Контекст формул с итоговыми числами листа: характеристики, их модификаторы
+ * и бонус мастерства — те, что показывает лист, а не сырые значения записи.
+ *
+ * Правило порядка расчёта (README, § «Токены формул»): изменения самих
+ * характеристик считаются от сырых чисел — здесь круг размыкается; всё
+ * остальное (КД формулой, Сл, урон, цена, максимум счётчика) — от итоговых.
+ *
+ * @param context - контекст листа ({@link buildFormulaContext})
+ * @param stats - итоговые числа листа
+ * @param stats.abilities - итоговые значения характеристик
+ * @param stats.abilityMods - итоговые модификаторы
+ * @param stats.proficiencyBonus - итоговый бонус мастерства
+ * @returns контекст с итоговыми числами
+ */
+export function withResolvedSheetNumbers(
+  context: FormulaContext,
+  stats: {
+    abilities: Readonly<Record<AbilityType, number>>;
+    abilityMods: Readonly<Record<AbilityType, number>>;
+    proficiencyBonus: number;
+  },
+): FormulaContext {
+  return {
+    ...context,
+    abilities: Object.fromEntries(
+      ABILITY_KEYS.map((abilityKey) => [
+        abilityKey,
+        {
+          value: stats.abilities[abilityKey],
+          mod: stats.abilityMods[abilityKey],
+        },
+      ]),
+    ),
+    prof: stats.proficiencyBonus,
+  };
+}
+
+/**
+ * Непотраченные кости хитов листа: по каждому классу — уровень минус
+ * потраченные.
+ *
+ * @param actor - персонаж или существо
+ * @returns число костей; у существа — ноль
+ */
+function countHitDiceLeft(
+  actor:
+    | import('./dndEntities.js').DnDActor
+    | import('./dndEntities.js').DnDCreature,
+): number {
+  if (!isActorEntity(actor)) {
+    return 0;
+  }
+
+  return (actor.system.classes ?? []).reduce(
+    (total, entry) =>
+      total + Math.max(0, entry.level - (entry.hitDiceUsed ?? 0)),
+    0,
+  );
+}
+
+/**
+ * Текущие временные хиты сущности.
+ *
+ * @param actor - персонаж или существо
+ * @returns временные хиты; поля нет — ноль
+ */
+function readTempHp(
+  actor:
+    | import('./dndEntities.js').DnDActor
+    | import('./dndEntities.js').DnDCreature,
+): number {
+  const temp = actor.system.hitPoints?.temp;
+
+  return typeof temp === 'number' ? Math.max(0, temp) : 0;
+}
+
+/**
+ * Сколько отметок каждого ключа лежит на сущности: у отметки-счётчика — число
+ * ступеней. Выключенные отметки не считаются.
+ *
+ * @param actor - персонаж или существо
+ * @returns ключ отметки → число
+ */
+function countTags(
+  actor:
+    | import('./dndEntities.js').DnDActor
+    | import('./dndEntities.js').DnDCreature,
+): Record<string, number> {
+  const counts: Record<string, number> = {};
+
+  for (const effect of actor.activeEffects ?? []) {
+    const { tag } = effect;
+
+    if (typeof tag === 'string' && effect.disabled !== true) {
+      const stacks =
+        'tagStacks' in effect && typeof effect.tagStacks === 'number'
+          ? effect.tagStacks
+          : 1;
+
+      counts[tag] = (counts[tag] ?? 0) + stacks;
+    }
+  }
+
+  return counts;
 }
 
 /**
@@ -761,8 +1208,51 @@ export function evaluateFormula(
   return evaluateNode(ast, context);
 }
 
+/**
+ * Контекст без листа: формула без `@`-переменных его не читает, но вычислитель
+ * требует контекст целиком.
+ */
+const DETACHED_FORMULA_CONTEXT: FormulaContext = {
+  abilities: {},
+  prof: 0,
+  level: 0,
+  movement: { walk: 0, swim: 0, fly: 0, climb: 0, burrow: 0 },
+};
+
+/**
+ * Вычисляет арифметику без `@`-переменных: `1 + steps(7, 7, 13, 18)` → 2.
+ *
+ * Нужна там, где числа источника уже подставлены, а листа под рукой нет, —
+ * например, число костей перед броском.
+ *
+ * @param formula - формула без `@`-переменных
+ * @returns число либо `undefined`, если формулу не посчитать
+ */
+export function evaluateDetachedFormula(formula: string): number | undefined {
+  if (formula.includes('@')) {
+    return undefined;
+  }
+
+  try {
+    return evaluateFormula(formula, DETACHED_FORMULA_CONTEXT);
+  } catch {
+    return undefined;
+  }
+}
+
 /** Регэксп для поиска @-переменных в смешанной формуле (кости + @) */
 const VARIABLE_TOKEN_REGEX = /@([a-z][\w.]*)/gi;
+
+/**
+ * Число, подставленное в формулу. Отрицательное — в скобках: «1к6 + @mod» с
+ * −2 даёт «1к6 + (-2)», а не «1к6 + -2».
+ *
+ * @param value - число
+ * @returns запись числа для формулы
+ */
+export function formatFormulaNumber(value: number): string {
+  return value < 0 ? `(${value})` : String(value);
+}
 
 /**
  * Подставляет числовые значения @-переменных в смешанную формулу,
@@ -794,7 +1284,7 @@ export function substituteFormulaVariables(
     const path = rawPath.replace(/\.+$/, '');
     const value = resolveVariable(path, context);
 
-    return value < 0 ? `(${value})` : String(value);
+    return formatFormulaNumber(value);
   });
 }
 
@@ -865,105 +1355,124 @@ export function validateFormula(formula: string): FormulaValidationResult {
   }
 }
 
-/**
- * Вычисляет бонус мастерства по уровню (D&D 5e).
- *
- * @param level - уровень персонажа (1-20)
- * @returns бонус мастерства
- */
-function calculateProficiencyBonus(level: number): number {
-  return Math.ceil(level / 4) + 1;
-}
-
 // ── Подсказки для UI ──────────────────────────────────────────
 
+// ── Читаемая запись для UI ────────────────────────────────────
+
+/** Как функция формулы читается словами; `{0}`, `{1}` — её аргументы */
+const READABLE_FUNCTION_TEMPLATES: Readonly<Record<string, string>> = {
+  floor: '({0}, с округлением вниз)',
+  ceil: '({0}, с округлением вверх)',
+  min: 'меньшее из ({0}; {1})',
+  max: 'большее из ({0}; {1})',
+  abs: '|{0}|',
+  even: '(1, если {0} чётное, иначе 0)',
+  odd: '(1, если {0} нечётное, иначе 0)',
+};
+
+/** Знаки операторов в читаемой записи: минус и умножение — типографские */
+const READABLE_OPERATORS: Readonly<Record<string, string>> = {
+  '+': '+',
+  '-': '−',
+  '*': '×',
+  '/': '/',
+};
+
 /**
- * Все доступные @-переменные для формул Active Effects.
+ * Узел AST словами. Скобки ставятся только там, где без них поменялся бы
+ * смысл: исходные скобки парсер не хранит, а лишние мешают читать.
  *
- * Используется в UI автокомплита при вводе формул.
- * Каждая запись содержит ключ, локализованное описание и группу.
+ * @param node - узел
+ * @param labelVariable - подпись переменной по токену (`@prof` → «бонус мастерства»)
+ * @param parentPrecedence - приоритет оператора-родителя
+ * @param isRightOperand - узел стоит справа от родителя (для `a − (b − c)`)
+ * @returns читаемая запись узла
  */
-export const FORMULA_VARIABLES: readonly FormulaVariableHint[] = [
-  // Характеристики (значения) — короткий синтаксис @<код>
-  {
-    key: '@str',
-    label: 'Сила (значение)',
-    group: 'Характеристики',
-  },
-  {
-    key: '@dex',
-    label: 'Ловкость (значение)',
-    group: 'Характеристики',
-  },
-  {
-    key: '@con',
-    label: 'Телосложение (значение)',
-    group: 'Характеристики',
-  },
-  {
-    key: '@int',
-    label: 'Интеллект (значение)',
-    group: 'Характеристики',
-  },
-  {
-    key: '@wis',
-    label: 'Мудрость (значение)',
-    group: 'Характеристики',
-  },
-  {
-    key: '@cha',
-    label: 'Харизма (значение)',
-    group: 'Характеристики',
-  },
-  // Характеристики (модификаторы) — короткий синтаксис @mod.<код>
-  {
-    key: '@mod.str',
-    label: 'Сила (модификатор)',
-    group: 'Модификаторы',
-  },
-  {
-    key: '@mod.dex',
-    label: 'Ловкость (модификатор)',
-    group: 'Модификаторы',
-  },
-  {
-    key: '@mod.con',
-    label: 'Телосложение (модификатор)',
-    group: 'Модификаторы',
-  },
-  {
-    key: '@mod.int',
-    label: 'Интеллект (модификатор)',
-    group: 'Модификаторы',
-  },
-  {
-    key: '@mod.wis',
-    label: 'Мудрость (модификатор)',
-    group: 'Модификаторы',
-  },
-  {
-    key: '@mod.cha',
-    label: 'Харизма (модификатор)',
-    group: 'Модификаторы',
-  },
-  {
-    key: '@mod.spell',
-    label: 'Заклинательная характеристика (модификатор)',
-    group: 'Модификаторы',
-  },
-  // Общие
-  { key: '@prof', label: 'Бонус мастерства', group: 'Общее' },
-  { key: '@level', label: 'Уровень персонажа', group: 'Общее' },
-  // Условные токены цели. В формулах урона заклинаний гасят своё слагаемое
-  // (голый токен, без `*`); в Active Effects резолвятся в 1/0 как множитель.
-  {
-    key: '@target.full',
-    label: 'Цель с полным HP (1/0)',
-    group: 'Цель',
-  },
-  {
-    key: '@target.notFull',
-    label: 'Цель ранена / не полное HP (1/0)',
-    group: 'Цель',
-  },
-] as const;
+function renderReadableNode(
+  node: AstNode,
+  labelVariable: (token: string) => string,
+  parentPrecedence = 0,
+  isRightOperand = false,
+): string {
+  switch (node.type) {
+    case 'number':
+      return String(node.numericValue ?? 0);
+    case 'variable':
+      return labelVariable(`@${node.value ?? ''}`);
+    case 'unaryOp':
+      return node.right
+        ? `−${renderReadableNode(node.right, labelVariable, Number.POSITIVE_INFINITY)}`
+        : '';
+    case 'functionCall': {
+      const args = (node.args ?? []).map((argument) =>
+        renderReadableNode(argument, labelVariable),
+      );
+
+      // У ступеней число порогов любое — шаблон с номерами аргументов не годится
+      if (node.value === STEPS_FUNCTION) {
+        const [value, ...thresholds] = args;
+
+        return `(число порогов ${thresholds.join(', ')}, пройденных по ${value ?? ''})`;
+      }
+
+      const template = READABLE_FUNCTION_TEMPLATES[node.value ?? ''];
+
+      return template
+        ? template.replace(
+            /\{(\d)\}/g,
+            (_match, index: string) => args[Number(index)] ?? '',
+          )
+        : `${node.value ?? ''}(${args.join('; ')})`;
+    }
+    case 'binaryOp':
+    default: {
+      const operator = node.value ?? '';
+      const precedence = OPERATOR_PRECEDENCE[operator] ?? 0;
+
+      const left = node.left
+        ? renderReadableNode(node.left, labelVariable, precedence)
+        : '';
+
+      const right = node.right
+        ? renderReadableNode(node.right, labelVariable, precedence, true)
+        : '';
+
+      const text = `${left} ${READABLE_OPERATORS[operator] ?? operator} ${right}`;
+
+      const needsParens =
+        precedence < parentPrecedence
+        || (isRightOperand && precedence === parentPrecedence);
+
+      return needsParens ? `(${text})` : text;
+    }
+  }
+}
+
+/**
+ * Формула словами — для подписи под полем значения: `floor(@classLevel / 4)`
+ * читается «(уровень в классе / 4, с округлением вниз)».
+ *
+ * Разбирает формулу тем же парсером, что и вычисление, поэтому подпись не
+ * может разойтись с тем, как формула посчитается. Кости и токены урона парсер
+ * не понимает — для них подписи нет.
+ *
+ * @param formula - строка формулы
+ * @param labelVariable - подпись переменной по токену
+ * @returns читаемая запись либо `null`, если формулу не разобрать
+ */
+export function renderReadableFormula(
+  formula: string,
+  labelVariable: (token: string) => string,
+): string | null {
+  const trimmed = formula.trim();
+
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  try {
+    return renderReadableNode(parse(tokenize(trimmed)), labelVariable);
+  } catch {
+    return null;
+  }
+}

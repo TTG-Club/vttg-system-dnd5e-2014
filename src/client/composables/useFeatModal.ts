@@ -1,9 +1,8 @@
 import type { Feature } from '@vtt/shared';
-import type { GameItem } from '@vtt/shared/system/dnd.js';
-
-import { systemRegistry } from '@vtt/shared';
+import type { DnDGameItem } from '@vtt/shared/system/dnd.js';
 
 import { useModalManager } from '@/shared_ui/composables/useModalManager';
+import { systemRegistry } from '@vtt/shared';
 
 /**
  * Композабл для открытия модального окна просмотра черты (D&D 5e).
@@ -22,9 +21,27 @@ export function useFeatModal() {
    * @param options.onCopy - колбэк при копировании
    */
   function openFeatDescription(
-    feat: Feature | GameItem,
+    feat: Feature | DnDGameItem,
     options?: { showCopyButton?: boolean; onCopy?: () => void },
   ) {
+    const badges = [];
+
+    let alertConfig:
+      | { title?: string; description: string; color: 'warning'; icon?: string }
+      | undefined;
+
+    if (feat.repeatable) {
+      badges.push({ text: 'Повторяемая', color: 'warning' });
+
+      alertConfig = {
+        title: 'Повторяемая черта',
+        description:
+          'Вы можете выбирать эту черту больше 1 раза, но каждый раз вы должны выбирать другой список заклинаний.',
+        color: 'warning',
+        icon: 'tabler:repeat',
+      };
+    }
+
     const nameEn = 'nameEn' in feat ? feat.nameEn : undefined;
 
     // Описание остаётся чистой прозой; механические дары выводятся отдельным
@@ -33,15 +50,24 @@ export function useFeatModal() {
     const automation =
       systemRegistry.getActiveSystem()?.getFeatGrantsSummary?.(feat) ?? '';
 
+    // Вкладка «Эффекты» у черты есть ВСЕГДА, даже пустая: черта их носит, и по
+    // отсутствию вкладки нельзя было бы понять, эффектов нет или их тут просто
+    // не показывают. Пустой список — осмысленный ответ, а не отсутствие ответа.
+    const activeEffects =
+      'activeEffects' in feat ? (feat.activeEffects ?? []) : [];
+
     openModal('ActorDescriptionModal', {
       _modalKey: feat.id,
       title: feat.name,
       subtitle: nameEn || undefined,
       description: feat.description,
       automation: automation || undefined,
+      effects: activeEffects,
       sourceKey: feat.sourceKey,
       isSRD: feat.isSRD ?? false,
-      fields: [],
+      recordAutomation: 'automation' in feat ? feat.automation : undefined,
+      fields: badges.length > 0 ? [{ badges }] : [],
+      alert: alertConfig,
       showCopyButton: options?.showCopyButton,
       onCopy: options?.onCopy,
       shareCard: {

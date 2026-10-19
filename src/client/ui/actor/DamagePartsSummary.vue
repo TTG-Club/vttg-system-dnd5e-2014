@@ -1,10 +1,13 @@
 <script setup lang="ts">
   import type { DamagePart } from '@vtt/shared';
 
-  import { describeDamagePart } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+  import { describeDamagePart } from '@vtt/shared/system/dnd.js';
+
+  import { formatDamageTypeChoiceLabel } from '../../composables/damageTypeChoice';
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import { DAMAGE_PART_LABELS } from './constants';
 
   const props = defineProps<{
     /** Части урона/лечения для отображения */
@@ -24,6 +27,11 @@
     return map;
   });
 
+  /** Название типа урона по ключу; незнакомый ключ — как есть */
+  function getTypeLabel(type: string): string {
+    return damageTypeMap.value.get(type) ?? type;
+  }
+
   /**
    * Части с готовыми подписями: «Урон»/«Лечение», формула без токенов и
    * локализованные типы (несколько — через « + »; временные ХП помечаются).
@@ -32,18 +40,23 @@
     props.parts.map((part) => {
       const info = describeDamagePart(part);
 
-      const labels = info.types.map(
-        (type) => damageTypeMap.value.get(type) ?? type,
-      );
+      const labels = [
+        ...info.types.map(getTypeLabel),
+        ...info.typeChoices.map((choice) =>
+          formatDamageTypeChoiceLabel(choice, getTypeLabel),
+        ),
+      ];
 
       if (info.isTemp) {
-        labels.push('временные ХП');
+        labels.push(DAMAGE_PART_LABELS.temporaryHitPoints);
       }
 
       return {
         formula: info.formula,
         isHealing: info.isHealing,
-        kind: info.isHealing ? 'Лечение' : 'Урон',
+        kind: info.isHealing
+          ? DAMAGE_PART_LABELS.healing
+          : DAMAGE_PART_LABELS.damage,
         typeLabel: labels.join(' + '),
       };
     }),

@@ -1,14 +1,21 @@
 <script setup lang="ts">
   import type { ActorClassEntry } from '@vtt/shared/system/dnd.js';
 
-  import {
-    calculateExperienceForNextLevel,
-    getTotalLevel,
-  } from '@vtt/shared/system/dnd.js';
+  import type { WizardQueueStep } from './levelUpTypes';
+
   import { computed, ref, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
+  import {
+    calculateExperienceForNextLevel,
+    getTotalLevel,
+    MAX_LEVEL,
+    resolveExperienceInput,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { LEVEL_UP_LABELS, MODAL_BUTTON_LABELS } from './constants';
+  import { selectInputOnFocus } from './utils/selectInputOnFocus';
 
   interface Props {
     open: boolean;
@@ -23,7 +30,7 @@
     'apply': [data: { classes: ActorClassEntry[]; experience: number }];
     'start-wizard': [
       data: {
-        queue: Array<{ classKey: string; targetLevel: number }>;
+        queue: WizardQueueStep[];
         experience: number;
         forceApplies: ActorClassEntry[];
       },
@@ -37,16 +44,45 @@
   });
 
   const editClasses = ref<ActorClassEntry[]>([]);
-  const editExperience = ref(0);
+
+  /**
+   * Ввод опыта строкой, а не числом: поле работает как у хитов фишки —
+   * «+150» прибавляет к текущему опыту, «-50» отнимает, число задаёт. Поле
+   * `type="number"` знак впереди считает мусором и отдаёт пустую строку.
+   */
+  const editExperience = ref('');
+
+  /** Опыт, который запишет «Применить»; `undefined` — ввод не разобрать */
+  const resolvedExperience = computed(() =>
+    resolveExperienceInput(editExperience.value, props.experience),
+  );
+
+  const isExperienceInvalid = computed(
+    () => resolvedExperience.value === undefined,
+  );
+
+  /**
+   * В поле выражение, а не готовое число: тогда под полем показывается итог,
+   * иначе при «+150» не видно, сколько опыта станет. Сверка строкой, а не
+   * числом: `Number('+150')` равно 150, и при нулевом опыте итог бы пропал.
+   */
+  const showsExperienceResult = computed(
+    () =>
+      !isExperienceInvalid.value
+      && String(resolvedExperience.value) !== editExperience.value.trim(),
+  );
+
   const forceLevelUp = ref(false);
 
   /** Ключ класса, ожидающего подтверждения удаления */
   const pendingRemoveKey = ref<string | null>(null);
 
+  /** Суммарный уровень по всем классам в форме */
   const editTotalLevel = computed(() => {
     return getTotalLevel(editClasses.value);
   });
 
+  /** Опыт, нужный для следующего уровня при текущем наборе классов */
   const editNextLevelXP = computed(() => {
     return calculateExperienceForNextLevel(editTotalLevel.value);
   });
@@ -56,20 +92,22 @@
     () => props.open,
     (opened) => {
       if (opened) {
-        editClasses.value = JSON.parse(JSON.stringify(props.classes || []));
-        editExperience.value = props.experience;
+        editClasses.value = JSON.parse(JSON.stringify(props.classes ?? []));
+        editExperience.value = String(props.experience);
         forceLevelUp.value = false;
         pendingRemoveKey.value = null;
       }
     },
   );
 
+  /** Повышает уровень класса, пока суммарный не упёрся в потолок (20) */
   function incrementClassLevel(index: number) {
-    if (editTotalLevel.value < 20) {
+    if (editTotalLevel.value < MAX_LEVEL) {
       editClasses.value[index].level += 1;
     }
   }
 
+  /** Понижает уровень класса, но не ниже первого */
   function decrementClassLevel(index: number) {
     if (editClasses.value[index].level > 1) {
       editClasses.value[index].level -= 1;
@@ -107,12 +145,12 @@
    * Применяет изменения уровня и опыта
    */
   function applyLevelUp() {
-    const xp =
-      typeof editExperience.value === 'string'
-        ? Number.parseInt(editExperience.value, 10)
-        : editExperience.value;
+    // Неразобранный ввод не пишется: иначе опечатка обнулила бы опыт
+    const safeXp = resolvedExperience.value;
 
-    const safeXp = Number.isNaN(xp) ? 0 : Math.max(0, xp);
+    if (safeXp === undefined) {
+      return;
+    }
 
     if (forceLevelUp.value) {
       emit('apply', {
@@ -121,21 +159,26 @@
       });
     } else {
       // Собираем очередь уровней "пройти через мастер"
-      const queue: Array<{ classKey: string; targetLevel: number }> = [];
+      const queue: WizardQueueStep[] = [];
 
-      for (const editCls of editClasses.value) {
-        const origCls = props.classes.find(
-          (classEntry) => classEntry.classKey === editCls.classKey,
+      for (const editedClass of editClasses.value) {
+        const originalClass = props.classes.find(
+          (classEntry) => classEntry.classKey === editedClass.classKey,
         );
 
-        const origLevel = origCls ? origCls.level : 0;
+        const originalLevel = originalClass ? originalClass.level : 0;
 
         // Добавляем по одному таску на каждый полученный уровень
-        if (editCls.level > origLevel) {
-          for (let lvl = origLevel + 1; lvl <= editCls.level; lvl++) {
+        if (editedClass.level > originalLevel) {
+          for (
+            let level = originalLevel + 1;
+            level <= editedClass.level;
+            level++
+          ) {
             queue.push({
-              classKey: editCls.classKey,
-              targetLevel: lvl,
+              classKey: editedClass.classKey,
+              packId: editedClass.packId,
+              targetLevel: level,
             });
           }
         }
@@ -170,7 +213,7 @@
     :blocking="true"
     :min-width="360"
     :min-height="200"
-    title="Повышение уровня"
+    :title="LEVEL_UP_LABELS.title"
     :z-index="Z_INDEX.MODAL_ELEVATED"
   >
     <template #body>
@@ -181,13 +224,13 @@
           class="space-y-3"
         >
           <div
-            v-for="(cls, index) in editClasses"
-            :key="index"
+            v-for="(classEntry, index) in editClasses"
+            :key="classEntry.classKey"
             class="space-y-2"
           >
             <div class="flex items-center justify-between">
               <span class="text-sm font-medium text-highlighted">{{
-                cls.className || 'Класс'
+                classEntry.className || LEVEL_UP_LABELS.classLabel
               }}</span>
 
               <div class="flex items-center gap-3">
@@ -196,13 +239,13 @@
                   variant="ghost"
                   color="neutral"
                   size="xs"
-                  :disabled="cls.level <= 1"
+                  :disabled="classEntry.level <= 1"
                   @click.left.exact.prevent="decrementClassLevel(index)"
                 />
 
                 <span
                   class="w-8 text-center text-xl font-bold text-highlighted tabular-nums"
-                  >{{ cls.level }}</span
+                  >{{ classEntry.level }}</span
                 >
 
                 <UButton
@@ -210,7 +253,9 @@
                   variant="ghost"
                   color="neutral"
                   size="xs"
-                  :disabled="editTotalLevel >= 20 || cls.level >= 20"
+                  :disabled="
+                    editTotalLevel >= MAX_LEVEL || classEntry.level >= MAX_LEVEL
+                  "
                   @click.left.exact.prevent="incrementClassLevel(index)"
                 />
 
@@ -219,19 +264,21 @@
                   variant="ghost"
                   color="error"
                   size="xs"
-                  title="Удалить класс и все связанные данные"
-                  @click.left.exact.prevent="requestRemoveClass(cls.classKey)"
+                  :title="LEVEL_UP_LABELS.removeClass"
+                  @click.left.exact.prevent="
+                    requestRemoveClass(classEntry.classKey)
+                  "
                 />
               </div>
             </div>
 
             <!-- Инлайн-подтверждение удаления -->
             <div
-              v-if="pendingRemoveKey === cls.classKey"
+              v-if="pendingRemoveKey === classEntry.classKey"
               class="flex items-center justify-between rounded-md bg-danger-subtle/30 px-3 py-1.5"
             >
               <span class="text-xs text-danger">
-                Все особенности класса будут утеряны
+                {{ LEVEL_UP_LABELS.removeClassHint }}
               </span>
 
               <div class="flex items-center gap-3">
@@ -239,14 +286,14 @@
                   class="text-xs text-muted transition-colors hover:text-highlighted"
                   @click.left.exact.prevent="cancelRemove"
                 >
-                  Отмена
+                  {{ MODAL_BUTTON_LABELS.cancel }}
                 </button>
 
                 <button
                   class="text-xs font-medium text-danger transition-colors hover:text-danger-muted"
                   @click.left.exact.prevent="confirmRemoveClass"
                 >
-                  Удалить
+                  {{ MODAL_BUTTON_LABELS.remove }}
                 </button>
               </div>
             </div>
@@ -257,33 +304,63 @@
           v-else
           class="py-2 text-center text-sm text-muted italic"
         >
-          У персонажа пока нет классов
+          {{ LEVEL_UP_LABELS.empty }}
         </div>
 
-        <div class="h-px w-full bg-elevated"></div>
+        <div class="h-px w-full bg-elevated" />
 
         <!-- Опыт -->
         <div class="space-y-4">
           <div class="space-y-2">
             <div class="flex items-center justify-between">
-              <span class="text-sm text-muted">Опыт (XP)</span>
+              <span class="text-sm text-muted">{{
+                LEVEL_UP_LABELS.experience
+              }}</span>
 
-              <span class="text-xs text-dimmed"
-                >Следующий уровень: {{ editNextLevelXP }} XP</span
-              >
+              <span class="text-xs text-dimmed">
+                {{ LEVEL_UP_LABELS.nextLevelXpPrefix }} {{ editNextLevelXP }}
+                {{ LEVEL_UP_LABELS.experienceUnit }}
+              </span>
             </div>
 
+            <!-- Enter в поле опыта = «Применить»: правка опыта чаще всего
+                 сводится к вводу числа, лишний клик по кнопке не нужен.
+                 Фокус сразу здесь — окно открывают в основном ради опыта -->
             <UInput
               v-model="editExperience"
-              type="number"
               variant="none"
-              :min="0"
               size="lg"
+              autofocus
               class="w-full"
+              :placeholder="LEVEL_UP_LABELS.experiencePlaceholder"
               :ui="{
-                base: 'bg-white/5 text-highlighted rounded-lg px-3 py-2 focus:bg-white/10 transition-colors tabular-nums',
+                base: 'bg-inverted/5 text-highlighted rounded-lg px-3 py-2 focus:bg-inverted/10 transition-colors tabular-nums',
               }"
+              @focus="selectInputOnFocus"
+              @keydown.enter.prevent="applyLevelUp"
             />
+
+            <p
+              v-if="isExperienceInvalid"
+              class="text-xs text-error"
+            >
+              {{ LEVEL_UP_LABELS.experienceInvalid }}
+            </p>
+
+            <p
+              v-else-if="showsExperienceResult"
+              class="text-xs font-medium text-toned tabular-nums"
+            >
+              {{ LEVEL_UP_LABELS.experienceResultPrefix }}
+              {{ resolvedExperience }} {{ LEVEL_UP_LABELS.experienceUnit }}
+            </p>
+
+            <p
+              v-else
+              class="text-xs text-dimmed"
+            >
+              {{ LEVEL_UP_LABELS.experienceHint }}
+            </p>
           </div>
 
           <div class="flex items-center gap-2">
@@ -296,7 +373,7 @@
               for="force-levelup-checkbox"
               class="cursor-pointer text-sm leading-none text-muted select-none"
             >
-              Принудительное поднятие уровня (без мастера)
+              {{ LEVEL_UP_LABELS.forceLevelUp }}
             </label>
           </div>
         </div>
@@ -309,15 +386,16 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
             color="primary"
             size="sm"
+            :disabled="isExperienceInvalid"
             @click.left.exact.prevent="applyLevelUp"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

@@ -1,0 +1,712 @@
+import assert from 'node:assert/strict';
+
+import { describe, it } from 'vitest';
+
+import {
+  createActor,
+  createCreature,
+  createEffect,
+  createToken,
+  engine,
+  GRID,
+  MAX_ROLL,
+  MIN_ROLL,
+  sightFacts,
+  strikeEntity,
+  withHp,
+  withRandom,
+} from './_fixtures.mjs';
+
+/**
+ * Каталог: события срабатываний (`docs/EFFECT_SCENARIOS.md`, раздел
+ * «События»).
+ *
+ * Правило раздела: событие без данных не запускается вхолостую. Часть условия,
+ * для которой на этом событии данных нет, НЕ выполняется — срабатывание
+ * молчит, а не бьёт всегда.
+ */
+
+/** Кто наложил эффект в сценариях раздела */
+const SOURCE_ID = 'actor_source';
+
+/**
+ * Записывает сущности новый запас хитов боевым снимком — как это делает окно
+ * лечения.
+ *
+ * @param {object} system - система сервера
+ * @param {object} entity - сущность в мире (мутируется)
+ * @param {number} current - новые текущие хиты
+ * @param {number} temp - новые временные хиты
+ * @param {object} context - возможности ядра
+ * @returns {object} исход записи снимка
+ */
+function settleHitPoints(system, entity, current, temp, context = {}) {
+  const copy = structuredClone(entity);
+
+  copy.system.hitPoints = { ...copy.system.hitPoints, current, temp };
+
+  return system.settleCombatState(
+    entity,
+    engine.pickCombatState(copy),
+    context,
+  );
+}
+
+/**
+ * Эффект с одним срабатыванием, ставящим отметку.
+ *
+ * @param {string} name - название
+ * @param {object} trigger - поля срабатывания
+ * @returns {object} эффект
+ */
+function markingEffect(name, trigger) {
+  return createEffect(name, {
+    triggers: [
+      {
+        id: `trigger_${name}`,
+        actions: [{ type: 'applyTag', tag: 'fired' }],
+        ...trigger,
+      },
+    ],
+  });
+}
+
+/**
+ * Стоит ли на сущности отметка срабатывания.
+ *
+ * @param {object} entity - сущность
+ * @returns {boolean} сработало ли
+ */
+function hasFired(entity) {
+  return (entity.activeEffects ?? []).some((effect) => effect.tag === 'fired');
+}
+
+describe('каталог: события срабатываний', () => {
+  it('[E01] Второе дыхание: срабатывание «когда носителя лечат»', () => {
+    const watch = markingEffect('Печать жизни', { event: 'healed' });
+    const system = new engine.Dnd5eVttSystem();
+    const hero = withHp(createActor, 10, { activeEffects: [watch] }, 30);
+
+    settleHitPoints(system, hero, 20, 0);
+
+    assert.equal(hasFired(hero), true, 'хиты поднялись — событие пришло');
+
+    const idle = withHp(createActor, 20, { activeEffects: [watch] }, 30);
+
+    settleHitPoints(system, idle, 12, 0);
+
+    assert.equal(hasFired(idle), false, 'падение хитов лечением не считается');
+  });
+
+  it('[E02] Временные хиты лечением не считаются', () => {
+    const watch = markingEffect('Печать жизни', { event: 'healed' });
+    const system = new engine.Dnd5eVttSystem();
+    const hero = withHp(createActor, 10, { activeEffects: [watch] }, 30);
+
+    settleHitPoints(system, hero, 10, 8);
+
+    assert.equal(
+      hasFired(hero),
+      false,
+      'правила отделяют щит из временных хитов от лечения',
+    );
+  });
+
+  it('[E03] Освобождение: срабатывание «когда снимается состояние»', () => {
+    const system = new engine.Dnd5eVttSystem();
+
+    const run = (conditionKey) => {
+      const watch = markingEffect('Освобождение', {
+        event: 'conditionLost',
+        ...(conditionKey ? { conditionKey } : {}),
+      });
+
+      const restrained = engine.buildConditionActiveEffect('restrained');
+
+      const hero = withHp(createActor, 30, {
+        activeEffects: [watch, restrained],
+      });
+
+      const copy = structuredClone(hero);
+
+      copy.activeEffects = copy.activeEffects.filter(
+        (effect) => effect.id !== restrained.id,
+      );
+
+      system.settleCombatState(hero, engine.pickCombatState(copy));
+
+      return hasFired(hero);
+    };
+
+    assert.equal(run(undefined), true, 'без ключа — любое снятое состояние');
+    assert.equal(run('restrained'), true, 'ключ совпал');
+
+    assert.equal(
+      run('poisoned'),
+      false,
+      'срабатывание с ключом слушает только своё состояние',
+    );
+  });
+
+  it('[E04] Кровавая жатва: «когда носитель сваливает цель»', () => {
+    const harvest = markingEffect('Кровавая жатва', { event: 'downedOther' });
+    const system = new engine.Dnd5eVttSystem();
+
+    const slayer = withHp(createActor, 30, {
+      id: SOURCE_ID,
+      activeEffects: [harvest],
+    });
+
+    const victim = withHp(createCreature, 5, { id: 'creature_victim' });
+
+    const result = withRandom([MIN_ROLL], () =>
+      strikeEntity(system, victim, 10, 'slashing', {
+        details: { critical: false, sourceId: SOURCE_ID },
+        context: { getEntity: (id) => (id === SOURCE_ID ? slayer : undefined) },
+      }),
+    );
+
+    assert.equal(engine.resolveEntityCurrentHp(victim), 0);
+
+    assert.equal(
+      hasFired(slayer),
+      true,
+      'событие пришло на эффектах свалившего, а не поверженного',
+    );
+
+    assert.equal(hasFired(victim), false);
+
+    assert.deepEqual(
+      result.related?.map((related) => related.entity.id),
+      [SOURCE_ID],
+      'правки свалившего уходят в мир «другой стороной»: снимок пишет '
+        + 'поверженный, и без этого они остались бы в памяти сервера',
+    );
+  });
+
+  it('[E05] Свалившего не знаем — событие молчит', () => {
+    const harvest = markingEffect('Кровавая жатва', { event: 'downedOther' });
+    const system = new engine.Dnd5eVttSystem();
+
+    const slayer = withHp(createActor, 30, {
+      id: SOURCE_ID,
+      activeEffects: [harvest],
+    });
+
+    const victim = withHp(createCreature, 5, { id: 'creature_victim' });
+
+    withRandom([MIN_ROLL], () =>
+      strikeEntity(system, victim, 10, 'slashing', {
+        details: { critical: false, sourceId: SOURCE_ID },
+        context: {},
+      }),
+    );
+
+    assert.equal(
+      hasFired(slayer),
+      false,
+      'старое ядро сущностей не отдаёт — бить некого',
+    );
+  });
+
+  it('[E06] Бросок на шанс: неудача не тратит «раз в ход»', () => {
+    const spark = createEffect('Шальная искра', {
+      triggers: [
+        {
+          id: 'trigger_spark',
+          event: 'turnStart',
+          chancePercent: 50,
+          limit: { max: 1, per: 'turn' },
+          actions: [{ type: 'applyTag', tag: 'fired' }],
+        },
+      ],
+    });
+
+    const hero = withHp(createActor, 30, { activeEffects: [spark] });
+
+    const source = {
+      effect: spark,
+      trigger: spark.triggers[0],
+      ambient: false,
+      instance: true,
+      scope: spark.id,
+    };
+
+    // 0.99 * 100 = 99 — больше 50, шанс не выпал
+    assert.equal(
+      withRandom([0.99], () => engine.admitTrigger(hero, source)),
+      false,
+      'шанс не выпал',
+    );
+
+    // Лимит цел: следующая попытка всё ещё возможна
+    assert.equal(
+      withRandom([0], () => engine.admitTrigger(hero, source)),
+      true,
+      'неудавшийся шанс «раз в ход» не потратил',
+    );
+
+    assert.equal(
+      withRandom([0], () => engine.admitTrigger(hero, source)),
+      false,
+      'а сработавшее — потратило',
+    );
+  });
+
+  it('[E06b] «Раз в ход» на броске атаки: урон того же удара расход не откатывает', () => {
+    const system = new engine.Dnd5eVttSystem();
+
+    const focus = createEffect('Сосредоточенный удар', {
+      triggers: [
+        {
+          id: 'trigger_focus',
+          event: 'attackRoll',
+          actions: [{ type: 'applyCondition', conditionKey: 'prone' }],
+          limit: { max: 1, per: 'turn' },
+        },
+      ],
+    });
+
+    const server = withHp(createActor, 30, { activeEffects: [focus] });
+
+    // Стор клиента: ответ сервера на расход ещё не пришёл
+    const store = structuredClone(server);
+
+    // Окно броска расходует срабатывание на копии и шлёт снимок
+    const rolled = structuredClone(store);
+
+    engine.recordCombatBaseline(rolled, rolled);
+    engine.runAttackRollTriggers(rolled, 'attacker', { inCombat: true });
+    system.settleCombatState(server, engine.pickCombatState(rolled));
+
+    // Урон того же удара собран из стора — журнал в нём прежний
+    const damaged = structuredClone(store);
+
+    engine.recordCombatBaseline(damaged, damaged);
+    engine.writeEntityHitPoints(damaged, { current: 25, temp: 0 });
+    system.settleCombatState(server, engine.pickCombatState(damaged));
+
+    assert.equal(engine.resolveEntityCurrentHp(server), 25);
+
+    assert.equal(
+      engine.runAttackRollTriggers(server, 'attacker', { inCombat: true })
+        .usageChanged,
+      false,
+      'второй удар в том же ходу лимит не обходит',
+    );
+  });
+
+  it('[E06c] Одноразовый эффект цели действует на эту атаку и снимается после неё', () => {
+    const system = new engine.Dnd5eVttSystem();
+
+    // Сопротивление огню до следующей атаки по носителю
+    const ward = createEffect('Защитный знак', {
+      flags: ['resistance.fire'],
+      consumeOn: 'attackOnCarrier',
+    });
+
+    /**
+     * Удар огнём: расход эффекта броском, затем урон — в тике броска либо
+     * после показа броска, когда ответ сервера эффект из мира уже убрал.
+     *
+     * @param {boolean} echoBeforeDamage - ответ сервера пришёл до урона
+     * @returns {object} хиты и эффекты цели на сервере
+     */
+    const strike = (echoBeforeDamage) => {
+      const server = withHp(createActor, 30, { activeEffects: [ward] });
+      const store = structuredClone(server);
+
+      // Окно броска расходует эффект на копии и шлёт снимок
+      const rolled = structuredClone(store);
+
+      engine.recordCombatBaseline(rolled, rolled);
+      engine.runAttackRollTriggers(rolled, 'target', { inCombat: true });
+
+      const held = engine.listHeldAttackEffects(
+        store.activeEffects,
+        rolled.activeEffects,
+      );
+
+      system.settleCombatState(server, engine.pickCombatState(rolled));
+
+      if (echoBeforeDamage) {
+        store.activeEffects = structuredClone(server.activeEffects);
+      }
+
+      // Удар считается по свежей цели с израсходованным эффектом
+      const defenses = engine.resolveTargetDamageDefenses(
+        engine.withHeldAttackEffects(store, held),
+        undefined,
+      );
+
+      const damaged = structuredClone(store);
+
+      engine.recordCombatBaseline(damaged, damaged);
+
+      engine.writeEntityHitPoints(damaged, {
+        current:
+          30 - engine.applyDamageDefenses(10, 'fire', defenses).finalDamage,
+        temp: 0,
+      });
+
+      system.settleCombatState(server, engine.pickCombatState(damaged));
+
+      return {
+        hp: engine.resolveEntityCurrentHp(server),
+        effects: server.activeEffects.length,
+      };
+    };
+
+    assert.deepEqual(strike(false), { hp: 25, effects: 0 });
+    assert.deepEqual(strike(true), strike(false), 'итог не зависит от сети');
+  });
+
+  it('[E07] «Атака попала» и «атака промахнулась» — части условия', () => {
+    const landed = engine.writeTriggerCondition([{ kind: 'attackLanded' }]);
+    const missed = engine.writeTriggerCondition([{ kind: 'attackMissed' }]);
+
+    const hero = createActor();
+
+    const holds = (condition, attack) =>
+      engine.isTriggerConditionMet(
+        hero,
+        { condition },
+        attack ? { attack } : {},
+      );
+
+    assert.equal(holds(landed, { kinds: [], landed: true }), true);
+    assert.equal(holds(missed, { kinds: [], landed: true }), false);
+    assert.equal(holds(missed, { kinds: [], landed: false }), true);
+
+    assert.equal(
+      holds(landed, undefined),
+      false,
+      'без данных о попадании часть не выполняется',
+    );
+
+    assert.equal(
+      holds(missed, undefined),
+      false,
+      'и «промахнулась» тоже: неизвестно — значит молчим',
+    );
+
+    assert.ok(
+      engine.listTriggerConditionKinds('attackRoll').includes('attackLanded'),
+      'часть предлагается на броске атаки',
+    );
+
+    assert.equal(
+      engine.listTriggerConditionKinds('turnStart').includes('attackLanded'),
+      false,
+      'на границе хода атаки нет — части тоже',
+    );
+  });
+
+  it('[E17] Расписание по номеру раунда', () => {
+    const system = new engine.Dnd5eVttSystem();
+
+    const healedOnRound = (condition, context) => {
+      const watch = markingEffect('Расписание', { event: 'healed', condition });
+      const hero = withHp(createActor, 10, { activeEffects: [watch] }, 30);
+
+      settleHitPoints(system, hero, 20, 0, context);
+
+      return hasFired(hero);
+    };
+
+    const onSecond = 'combat.round === 2';
+    const fromSecond = 'combat.round >= 2';
+
+    assert.equal(
+      healedOnRound(onSecond, { getCombatRound: () => 2 }),
+      true,
+      'на втором раунде расписание выполняется',
+    );
+
+    assert.equal(
+      healedOnRound(onSecond, { getCombatRound: () => 1 }),
+      false,
+      'на первом — нет',
+    );
+
+    assert.equal(
+      healedOnRound(fromSecond, { getCombatRound: () => 3 }),
+      true,
+      '«не раньше второго» выполняется и на третьем',
+    );
+
+    assert.equal(
+      healedOnRound(onSecond, { getCombatRound: () => null }),
+      false,
+      'вне боя номера нет — расписание молчит',
+    );
+
+    assert.equal(
+      healedOnRound(onSecond, {}),
+      false,
+      'старое ядро номера не отдаёт — расписание молчит, а не бьёт всегда',
+    );
+
+    // Граница хода идёт своим путём: номер раунда доезжает и туда
+    const turnWatch = markingEffect('Расписание хода', {
+      event: 'turnStart',
+      condition: onSecond,
+    });
+
+    const fighter = withHp(createActor, 30, { activeEffects: [turnWatch] });
+
+    engine.processTurnEffects(fighter, 'startOfTurn', { combatRound: 2 });
+
+    assert.equal(hasFired(fighter), true, 'начало хода на втором раунде');
+
+    // «При действии» считает клиент — номер раунда он берёт из трекера
+    const actionWatch = markingEffect('Расписание действия', {
+      event: 'activate',
+      condition: onSecond,
+    });
+
+    const caster = withHp(createActor, 30, { activeEffects: [actionWatch] });
+
+    assert.equal(
+      hasFired(engine.runEffectActiveAction(caster, actionWatch.id, 2)),
+      true,
+      'действие эффекта на втором раунде',
+    );
+
+    assert.equal(
+      hasFired(engine.runEffectActiveAction(caster, actionWatch.id)),
+      false,
+      'вне боя действие по расписанию молчит',
+    );
+
+    assert.equal(
+      engine.listTriggerConditionKinds('rest').includes('combatRoundIs'),
+      false,
+      'отдых идёт вне боя — расписание ему не предлагается',
+    );
+  });
+
+  it('[E09] Громовой клинок: урон, если цель сама прошла путь', () => {
+    const system = new engine.Dnd5eVttSystem();
+
+    // «Громовой клинок»: сдвинулась сама хотя бы на 5 футов — 1к8 звуком, и
+    // эффект сгорает
+    const boomingBlade = () =>
+      createEffect('Громовой клинок', {
+        triggers: [
+          {
+            id: 'trigger_booming_blade',
+            event: 'moved',
+            condition: 'move.forced === false',
+            actions: [
+              { type: 'damage', parts: [{ formula: '1d8@dmg.thunder' }] },
+              { type: 'removeSelf' },
+            ],
+          },
+        ],
+      });
+
+    const moveOf = (distance, forced = false) => ({
+      from: { id: 'token', actorId: 'x', x: 0, y: 0, scale: 1, rotation: 0 },
+      to: { id: 'token', actorId: 'x', x: 50, y: 0, scale: 1, rotation: 0 },
+      distance,
+      steps: [],
+      forced,
+      stopped: false,
+    });
+
+    const walker = withHp(createCreature, 20, {
+      activeEffects: [boomingBlade()],
+    });
+
+    withRandom([MAX_ROLL], () =>
+      system.applyMovementEffects(walker, moveOf(15)),
+    );
+
+    assert.equal(
+      engine.resolveEntityCurrentHp(walker),
+      12,
+      'сама прошла путь — 1к8 звуком один раз: эффект сгорел на первом шаге',
+    );
+
+    assert.equal(walker.activeEffects.length, 0, 'клинок снят');
+
+    const pushed = withHp(createCreature, 20, {
+      activeEffects: [boomingBlade()],
+    });
+
+    system.applyMovementEffects(pushed, moveOf(15, true));
+
+    assert.equal(
+      engine.resolveEntityCurrentHp(pushed),
+      20,
+      'толчок чужими правилами — не её воля: клинок молчит',
+    );
+
+    // Без снятия срабатывание повторяется за каждый шаг пути
+    const trail = createEffect('Шипастый след', {
+      triggers: [
+        {
+          id: 'trigger_trail',
+          event: 'moved',
+          everyFeet: 10,
+          actions: [{ type: 'damage', parts: [{ formula: '1@dmg.piercing' }] }],
+        },
+      ],
+    });
+
+    const runner = withHp(createCreature, 20, { activeEffects: [trail] });
+
+    system.applyMovementEffects(runner, moveOf(35));
+
+    assert.equal(
+      engine.resolveEntityCurrentHp(runner),
+      17,
+      '35 футов при шаге 10 — три срабатывания, остаток не считается',
+    );
+
+    assert.ok(
+      engine.listTriggerConditionKinds('moved').includes('movementOwn'),
+      'на пути предлагается «шёл сам»',
+    );
+
+    assert.equal(
+      engine.listTriggerConditionKinds('damageTaken').includes('movementOwn'),
+      false,
+      'вне пути частей о перемещении нет',
+    );
+  });
+
+  // Пробелы: этим событиям нужны данные, которых ядро не отдаёт, либо новая
+  // точка в пути каста
+  it.todo('[E08] Каст доиграл срок или был прерван');
+  it.todo('[E11] Снятие после первого любого броска к20');
+  it.todo('[E12] Носитель стал целью заклинания');
+  it.todo('[E13] Носитель колдует, и каст можно отменить');
+
+  it('[E14] На глазах носителя ранили союзника', () => {
+    const system = new engine.Dnd5eVttSystem();
+    const friendly = { disposition: 'friendly' };
+
+    /**
+     * Свидетель с эффектом, слушающим событие.
+     *
+     * @returns {object} свидетель
+     */
+    const createWitness = () => {
+      const witness = withHp(createActor, 30, {
+        id: 'actor_witness',
+        activeEffects: [markingEffect('Страж', { event: 'allyHurt' })],
+      });
+
+      witness.token = { ...witness.token, ...friendly };
+
+      return witness;
+    };
+
+    /**
+     * Раненый: союзник свидетеля либо враг.
+     *
+     * @param {string} disposition - отношение фишки
+     * @returns {object} раненый
+     */
+    const createHurt = (disposition) => {
+      const hurt = withHp(createCreature, 30, { id: 'creature_hurt' });
+
+      hurt.token = { ...hurt.token, disposition };
+
+      return hurt;
+    };
+
+    /**
+     * Контекст ядра: раненый и свидетель на одной сцене.
+     *
+     * @param {object} hurt - раненый
+     * @param {object} witness - свидетель
+     * @param {object | undefined} facts - факты ядра; нет — старое ядро
+     * @returns {object} контекст
+     */
+    const contextOf = (hurt, witness, facts) => {
+      const hurtToken = createToken(hurt.id, 0, 0, {
+        disposition: hurt.token.disposition,
+      });
+
+      const witnessToken = createToken(witness.id, 3, 0, friendly);
+
+      return {
+        getSceneSurroundings: (entity) =>
+          entity.id === hurt.id
+            ? {
+                token: hurtToken,
+                gridSettings: GRID,
+                neighbors: [{ token: witnessToken, entity: witness }],
+              }
+            : {
+                token: witnessToken,
+                gridSettings: GRID,
+                neighbors: [{ token: hurtToken, entity: hurt }],
+              },
+        ...(facts ? { getSightBetween: () => facts } : {}),
+      };
+    };
+
+    const clearSight = sightFacts({ distance: 10 });
+
+    /**
+     * Бьёт раненого и отвечает, сработал ли эффект свидетеля.
+     *
+     * @param {string} disposition - отношение фишки раненого
+     * @param {object | undefined} facts - факты ядра
+     * @returns {{ fired: boolean, related: string[] }} исход
+     */
+    const strike = (disposition, facts) => {
+      const witness = createWitness();
+      const hurt = createHurt(disposition);
+
+      const result = strikeEntity(system, hurt, 5, 'slashing', {
+        details: { critical: false },
+        context: contextOf(hurt, witness, facts),
+      });
+
+      return {
+        fired: hasFired(witness),
+        related: (result.related ?? []).map((related) => related.entity.id),
+      };
+    };
+
+    assert.deepEqual(
+      strike('friendly', clearSight),
+      { fired: true, related: ['actor_witness'] },
+      'союзника ранили на глазах — событие пришло на эффектах свидетеля, а '
+        + 'его правки ушли в мир «другой стороной»',
+    );
+
+    assert.equal(
+      strike('friendly', { ...clearSight, lineOfSight: false }).fired,
+      false,
+      'между свидетелем и раненым стена — он ничего не видел',
+    );
+
+    assert.equal(
+      strike('friendly', { ...clearSight, seenLight: 'dark' }).fired,
+      false,
+      'раненый в темноте, тёмного зрения у свидетеля нет',
+    );
+
+    assert.equal(
+      strike('hostile', clearSight).fired,
+      false,
+      'ранили врага — событие про союзников',
+    );
+
+    assert.equal(
+      strike('friendly', undefined).fired,
+      false,
+      'старое ядро видимости не отдаёт — событие молчит',
+    );
+  });
+
+  it.todo('[E15] Носитель пересёк границу своей области');
+  it.todo('[E16] Срабатывание по игровому времени');
+  it.todo('[E18] Отложенное начало эффекта');
+});

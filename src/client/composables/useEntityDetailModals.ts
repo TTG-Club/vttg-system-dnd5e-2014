@@ -1,0 +1,194 @@
+import type { EntityDetailOptions } from '@/core/registries';
+import type { SourceDefinition } from '@vtt/shared';
+import type {
+  ClassDefinition,
+  DnDGameItem,
+  SpeciesDefinition,
+  Spell,
+} from '@vtt/shared/system/dnd.js';
+
+import { useModalManager } from '@/shared_ui/composables/useModalManager';
+
+/** Запись существа компендиума в объёме, нужном для открытия его листа. */
+export interface CreatureEntry {
+  id: string;
+  [key: string]: unknown;
+}
+
+/** Определение класса/предыстории: адресуется по `key`, `id` может отсутствовать. */
+export interface KeyedDefinition {
+  key: string;
+  id?: string;
+  [key: string]: unknown;
+}
+
+/** Термин глоссария в объёме, нужном для открытия его описания. */
+export interface GlossaryEntry {
+  id: string;
+  name: string;
+  nameEn?: string;
+  /** Раздел глоссария («Состояния», «Действия») */
+  category?: string;
+  description?: string;
+  sourceKey?: string;
+  source?: SourceDefinition;
+  isSRD?: boolean;
+}
+
+/**
+ * Окно детального просмотра предмета по его типу.
+ *
+ * Оружие и инструменты показываются своими окнами, всё остальное снаряжение —
+ * общим: у него нет ни свойств оружия, ни владения инструментом.
+ *
+ * @param itemType - тип записи предмета
+ */
+function itemDetailModalName(itemType: DnDGameItem['type']): string {
+  if (itemType === 'weapon') {
+    return 'WeaponDetailModal';
+  }
+
+  if (itemType === 'tool') {
+    return 'ToolDetailModal';
+  }
+
+  return 'EquipmentDetailModal';
+}
+
+/**
+ * Открытие детального просмотра записей D&D 5e — какой модалкой показывать
+ * заклинание, оружие, класс и т.д.
+ *
+ * Живёт в системе: ядро (панель предметов, компендиум, переход по ссылке из
+ * описания) вызывает эти функции только через хук `openDetail` реестра карточек,
+ * не зная D&D. Один и тот же набор используют браузер компендиума (с кнопкой
+ * копирования в инвентарь) и разрешение ссылок (без неё) — отсюда `options`
+ * вместо зашитого `showCopyButton: true`.
+ */
+export function useEntityDetailModals() {
+  const { openModal } = useModalManager();
+
+  /**
+   * Открывает предмет: тип окна выбирается по типу записи.
+   *
+   * @param item - оружие, снаряжение или инструмент
+   * @param options - кнопка копирования в инвентарь и её колбэк
+   */
+  function openItemDetail(
+    item: DnDGameItem,
+    options?: EntityDetailOptions,
+  ): void {
+    openModal(itemDetailModalName(item.type), { item, ...options });
+  }
+
+  /**
+   * Открывает заклинание.
+   *
+   * @param spell - заклинание
+   * @param options - кнопка копирования в инвентарь и её колбэк
+   */
+  function openSpellDetail(spell: Spell, options?: EntityDetailOptions): void {
+    openModal('SpellDetailModal', { spell, ...options });
+  }
+
+  /**
+   * Открывает класс.
+   *
+   * @param classDef - определение класса
+   * @param options - кнопка копирования в «Мастерскую» и её колбэк
+   * @param packId - пак записи: по нему окно берёт подклассы своего
+   *   компендиума, и их копии помнят, к какому классу относятся
+   */
+  function openClassDetail(
+    classDef: ClassDefinition | KeyedDefinition,
+    options?: EntityDetailOptions,
+    packId?: string,
+  ): void {
+    openModal('ClassDetailModal', {
+      classDefinition: classDef,
+      packId,
+      ...options,
+    });
+  }
+
+  /**
+   * Открывает вид.
+   *
+   * @param species - определение вида
+   * @param options - кнопка копирования в «Мастерскую» и её колбэк
+   * @param packId - пак записи: по нему окно берёт подвиды своего компендиума
+   */
+  function openSpeciesDetail(
+    species: SpeciesDefinition,
+    options?: EntityDetailOptions,
+    packId?: string,
+  ): void {
+    openModal('SpeciesDetailModal', {
+      speciesDefinition: species,
+      packId,
+      ...options,
+    });
+  }
+
+  /**
+   * Открывает предысторию.
+   *
+   * @param backgroundDef - определение предыстории
+   * @param options - кнопка копирования в инвентарь и её колбэк
+   */
+  function openBackgroundDetail(
+    backgroundDef: KeyedDefinition,
+    options?: EntityDetailOptions,
+  ): void {
+    openModal('BackgroundDetailModal', {
+      backgroundDefinition: backgroundDef,
+      ...options,
+    });
+  }
+
+  /**
+   * Открывает лист существа в режиме просмотра.
+   *
+   * @param creatureEntry - запись существа компендиума
+   */
+  function openCreatureDetail(creatureEntry: CreatureEntry): void {
+    openModal('CreatureSheet', {
+      creatureId: creatureEntry.id,
+      initialData: creatureEntry,
+    });
+  }
+
+  /**
+   * Открывает описание термина глоссария.
+   *
+   * `options` здесь нет намеренно: копировать термин в инвентарь некуда — это
+   * справочный текст, а не сущность листа. Раздел глоссария показываем бейджем
+   * над описанием, если он у записи есть.
+   *
+   * @param entry - термин глоссария
+   */
+  function openGlossaryDetail(entry: GlossaryEntry): void {
+    openModal('ActorDescriptionModal', {
+      _modalKey: entry.id,
+      title: entry.name,
+      subtitle: entry.nameEn,
+      description: entry.description,
+      sourceKey: entry.sourceKey,
+      source: entry.source,
+      isSRD: entry.isSRD,
+      fields: entry.category
+        ? [{ badges: [{ text: entry.category, color: 'neutral' }] }]
+        : undefined,
+    });
+  }
+
+  return {
+    openItemDetail,
+    openSpellDetail,
+    openClassDetail,
+    openSpeciesDetail,
+    openBackgroundDetail,
+    openCreatureDetail,
+    openGlossaryDetail,
+  };
+}

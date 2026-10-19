@@ -4,20 +4,39 @@
    * Отображает имя, подзаголовок (header) и показатель опасности.
    * Поддерживает контекстное меню (ПКМ) для копирования.
    */
-  import { useContextMenu } from '@/systems/dnd5e/composables/useContextMenu';
-  import ContextMenuOverlay from '@/systems/dnd5e/ui/actor/ContextMenuOverlay.vue';
+  import type { SourceDefinition } from '@vtt/shared';
+
+  import { useContextMenu } from '../../composables/useContextMenu';
+  import { useListRowClass } from '../../composables/useListRowClass';
+  import ContextMenuOverlay from '../actor/ContextMenuOverlay.vue';
+  import EntityRowBody from '../actor/EntityRowBody.vue';
+  import { CREATURE_ICON, CREATURE_LIST_ITEM_LABELS } from './constants';
 
   interface Props {
     /** Название существа */
     name: string;
     /** Английское название существа */
     nameEn?: string;
-    /** Подзаголовок (размер, тип, мировоззрение) */
-    header?: string;
     /** Показатель опасности (из system.challengeRating) */
     challengeRating?: string;
     /** Показать кнопку «Скопировать» в ПКМ-меню */
     showCopy?: boolean;
+    /** Показать «Редактировать» в ПКМ-меню (запись своего компендиума) */
+    showEdit?: boolean;
+    /** Показать «Удалить» в ПКМ-меню (запись своего компендиума) */
+    showDelete?: boolean;
+    /** Картинка токена — вместо значка в строке списка */
+    imageUrl?: string;
+    /** Ключ источника-книги — бейджем справа в строке списка */
+    sourceKey?: string;
+    /** Определение источника, вписанное вместе с записью */
+    source?: SourceDefinition;
+    /**
+     * Плоская строка списка: без своей плашки и скругления. Так строка встаёт в
+     * список с разделителями (компендиум и окна выбора); на листе персонажа
+     * строки стоят порознь, и плашка им нужна.
+     */
+    flat?: boolean;
   }
 
   const props = defineProps<Props>();
@@ -29,48 +48,46 @@
     delete: [];
   }>();
 
+  /** Оформление строки: плоская в списке, плашкой на листе персонажа */
+  const rowClass = useListRowClass(() => Boolean(props.flat));
+
   const { isMenuOpen, menuX, menuY, openContextMenu, handleAction, closeMenu } =
     useContextMenu(props, emit);
 </script>
 
 <template>
   <div
-    class="flex cursor-pointer items-center gap-3 rounded-lg bg-elevated/30 px-3 py-2 transition-colors hover:bg-accented/40"
+    class="flex cursor-pointer items-center gap-3 py-2 transition-colors"
+    :class="rowClass"
     @click.left.exact.prevent="emit('click')"
     @contextmenu="openContextMenu"
   >
-    <UIcon
-      name="tabler:alien"
-      class="size-5 shrink-0 text-muted"
-    />
-
-    <div class="min-w-0 flex-1">
-      <div class="truncate text-sm font-medium text-toned">
-        {{ name }}
-        <span
-          v-if="nameEn"
-          class="ml-1 text-xs font-normal text-muted"
-          >/ {{ nameEn }}</span
-        >
-      </div>
-
-      <div
-        v-if="header"
-        class="truncate text-xs text-dimmed"
-      >
-        {{ header }}
-      </div>
-    </div>
-
-    <UBadge
-      v-if="challengeRating"
-      color="neutral"
-      variant="subtle"
-      size="xs"
-      class="shrink-0"
+    <!-- Морда токена вместо значка: одинаковый значок строки не различал.
+      Картинки у существа может и не быть — тогда значок-лапка остаётся, но уже
+      внутри кругляша токена, чтобы строка не разъезжалась с соседними -->
+    <EntityRowBody
+      avatar
+      :image-url="imageUrl"
+      :icon="CREATURE_ICON"
+      :name="name"
+      :name-en="nameEn"
+      :source-key="sourceKey"
+      :source="source"
     >
-      ПО {{ challengeRating }}
-    </UBadge>
+      <template #badges>
+        <!-- Показатель опасности — по нему существ и подбирают -->
+        <UBadge
+          v-if="challengeRating"
+          color="neutral"
+          variant="subtle"
+          size="xs"
+          class="shrink-0"
+        >
+          {{ CREATURE_LIST_ITEM_LABELS.challengeRatingPrefix
+          }}{{ challengeRating }}
+        </UBadge>
+      </template>
+    </EntityRowBody>
   </div>
 
   <ContextMenuOverlay
@@ -78,7 +95,9 @@
     :pos-x="menuX"
     :pos-y="menuY"
     :show-copy="showCopy"
-    copy-label="существа"
+    :copy-label="CREATURE_LIST_ITEM_LABELS.copyTarget"
+    :show-edit="showEdit"
+    :show-delete="showDelete"
     @action="handleAction"
     @close="closeMenu"
   />

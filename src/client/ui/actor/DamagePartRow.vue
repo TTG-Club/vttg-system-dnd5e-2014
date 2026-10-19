@@ -1,10 +1,28 @@
 <script setup lang="ts">
   import type { DamagePart, DamagePartTarget } from '@vtt/shared';
+  import type {
+    DamageTypeChoiceMode,
+    StatusTokenSide,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { damagePartIsHealing } from '@vtt/shared/system/dnd.js';
   import { computed, nextTick, ref } from 'vue';
 
+  import { typedObjectEntries } from '@vtt/shared';
+  import {
+    buildStatusToken,
+    CREATURE_CATEGORIES,
+    damagePartIsHealing,
+    listSelectableConditions,
+    targetTypeToken,
+  } from '@vtt/shared/system/dnd.js';
+
+  import {
+    DAMAGE_PART_LABELS,
+    DAMAGE_TYPE_CHOICE_MIN_OPTIONS,
+  } from './constants';
+  import DamageFormulaPreview from './DamageFormulaPreview.vue';
   import FormSection from './FormSection.vue';
+  import { buildPickedDamageTypeChoiceToken } from './utils/damageTypeChoiceToken';
 
   const props = withDefaults(
     defineProps<{
@@ -29,6 +47,12 @@
        * добавляется автоматически — ручные `@mod.*` привели бы к двойному учёту.
        */
       hideModifiers?: boolean;
+      /**
+       * Считать состояния в формуле выполненными (итог под формулой). Так у
+       * варианта «или»: он берётся, только когда все его состояния есть, и
+       * ветка «без состояния» у него не бросается никогда.
+       */
+      assumeStatuses?: boolean;
     }>(),
     {
       includeSpellModifier: true,
@@ -36,6 +60,7 @@
       hideHealing: false,
       hideConditions: false,
       hideModifiers: false,
+      assumeStatuses: false,
     },
   );
 
@@ -46,9 +71,9 @@
 
   /** Опции цели части */
   const TARGET_OPTIONS: Array<{ label: string; value: DamagePartTarget }> = [
-    { label: 'Выбранная цель', value: 'selected' },
-    { label: 'На себя', value: 'self' },
-    { label: 'Указать отдельно', value: 'choose' },
+    { label: DAMAGE_PART_LABELS.targetSelected, value: 'selected' },
+    { label: DAMAGE_PART_LABELS.targetSelf, value: 'self' },
+    { label: DAMAGE_PART_LABELS.targetSeparate, value: 'choose' },
   ];
 
   /**
@@ -69,6 +94,17 @@
     get: () => props.modelValue.versatileFormula ?? '',
     set: (value) => patch({ versatileFormula: value || undefined }),
   });
+
+  /**
+   * Часть при хвате двумя руками: бросок подменяет формулу, а тип части и
+   * цель остаются прежними (`getWeaponDamageParts`). Итог считается по ней,
+   * чтобы было видно, какого типа урон уйдёт при двуручном хвате.
+   */
+  const versatilePart = computed<DamagePart | null>(() =>
+    props.modelValue.versatileFormula
+      ? { ...props.modelValue, formula: props.modelValue.versatileFormula }
+      : null,
+  );
 
   /**
    * Лечит ли часть: токен `@heal`/`@heal.temp` в формуле (единственный
@@ -98,27 +134,87 @@
     set: (value) => patch({ requiresDamage: value || undefined }),
   });
 
-  const inputRef = ref<any>(null);
+  /** Ссылка на поле ввода формулы: у компонента поля читается его корневой узел */
+  const inputRef = ref<{ $el?: Element } | null>(null);
 
-  /** Вкладки для ввода формулы (лечение/условия скрываются пропами) */
+  /** Кнопка-вставка токена в формулу */
+  type TokenButton = { label: string; value: string };
+
+  /**
+   * Вкладки для ввода формулы (лечение/условия скрываются пропами). Две
+   * вкладки состояний делят один слот: разница у них — только сторона токена
+   * и подсказка, их и несёт сама вкладка.
+   */
   type DamageTab = {
     label: string;
-    slot: 'modifiers' | 'damageTypes' | 'healing' | 'conditions';
+    slot:
+      | 'modifiers'
+      | 'damageTypes'
+      | 'damageTypeChoice'
+      | 'healing'
+      | 'conditions'
+      | 'statuses'
+      | 'creatureTypes';
+    /** Кнопки состояний стороны — у вкладки состояний */
+    statusButtons?: TokenButton[];
+    /** Подсказка под кнопками состояний */
+    statusHint?: string;
   };
 
+  /**
+   * Кнопки состояний стороны: канон и состояния мира. Список читается из
+   * реестра на каждый показ — состояние, заведённое за столом, появляется без
+   * перезагрузки.
+   *
+   * @param side - чьё состояние проверяет токен
+   * @returns подписи и токены кнопок
+   */
+  function buildStatusButtons(side: StatusTokenSide): TokenButton[] {
+    return listSelectableConditions().map((condition) => ({
+      label: condition.nameRu,
+      value: buildStatusToken(side, condition.key),
+    }));
+  }
+
   const tabsList = computed<DamageTab[]>(() => {
-    const tabs: DamageTab[] = [{ label: 'Тип урона', slot: 'damageTypes' }];
+    const tabs: DamageTab[] = [
+      { label: DAMAGE_PART_LABELS.damageType, slot: 'damageTypes' },
+      { label: DAMAGE_PART_LABELS.typeChoiceTab, slot: 'damageTypeChoice' },
+    ];
 
     if (!props.hideModifiers) {
-      tabs.unshift({ label: 'Добавить мод', slot: 'modifiers' });
+      tabs.unshift({
+        label: DAMAGE_PART_LABELS.addModifier,
+        slot: 'modifiers',
+      });
     }
 
     if (!props.hideHealing) {
-      tabs.push({ label: 'Лечение', slot: 'healing' });
+      tabs.push({ label: DAMAGE_PART_LABELS.healing, slot: 'healing' });
     }
 
     if (!props.hideConditions) {
-      tabs.push({ label: 'Условия', slot: 'conditions' });
+      tabs.push(
+        { label: DAMAGE_PART_LABELS.conditions, slot: 'conditions' },
+        // Состояния и тип существа — такие же условия на слагаемое, как хиты
+        // цели, поэтому прячутся тем же пропом
+        {
+          label: DAMAGE_PART_LABELS.targetStatuses,
+          slot: 'statuses',
+          statusButtons: buildStatusButtons('target'),
+          statusHint: DAMAGE_PART_LABELS.targetStatusesHint,
+        },
+        {
+          label: DAMAGE_PART_LABELS.selfStatuses,
+          slot: 'statuses',
+          statusButtons: buildStatusButtons('self'),
+          statusHint: DAMAGE_PART_LABELS.selfStatusesHint,
+        },
+        {
+          label: DAMAGE_PART_LABELS.creatureTypes,
+          slot: 'creatureTypes',
+        },
+      );
     }
 
     return tabs;
@@ -126,21 +222,24 @@
 
   /** Кнопки модификаторов (@mod.spell — только для заклинаний) */
   const modifierButtons = computed(() => {
-    const buttons: Array<{ label: string; value: string }> = [];
+    const buttons = [];
 
     if (props.includeSpellModifier) {
-      buttons.push({ label: 'Заклинание (@mod.spell)', value: '@mod.spell' });
+      buttons.push({
+        label: DAMAGE_PART_LABELS.modSpell,
+        value: '@mod.spell',
+      });
     }
 
     buttons.push(
-      { label: 'Сила (@mod.str)', value: '@mod.str' },
-      { label: 'Ловкость (@mod.dex)', value: '@mod.dex' },
-      { label: 'Телосложение (@mod.con)', value: '@mod.con' },
-      { label: 'Интеллект (@mod.int)', value: '@mod.int' },
-      { label: 'Мудрость (@mod.wis)', value: '@mod.wis' },
-      { label: 'Харизма (@mod.cha)', value: '@mod.cha' },
-      { label: 'Мастерство (@prof)', value: '@prof' },
-      { label: 'Уровень (@level)', value: '@level' },
+      { label: DAMAGE_PART_LABELS.modStrength, value: '@mod.str' },
+      { label: DAMAGE_PART_LABELS.modDexterity, value: '@mod.dex' },
+      { label: DAMAGE_PART_LABELS.modConstitution, value: '@mod.con' },
+      { label: DAMAGE_PART_LABELS.modIntelligence, value: '@mod.int' },
+      { label: DAMAGE_PART_LABELS.modWisdom, value: '@mod.wis' },
+      { label: DAMAGE_PART_LABELS.modCharisma, value: '@mod.cha' },
+      { label: DAMAGE_PART_LABELS.modProficiency, value: '@prof' },
+      { label: DAMAGE_PART_LABELS.modLevel, value: '@level' },
     );
 
     return buttons;
@@ -152,22 +251,63 @@
    * `@heal.temp` даёт временные ХП (с текущими временными — большее).
    */
   const healingButtons = [
-    { label: 'Лечение (@heal)', value: '@heal' },
-    { label: 'Временные ХП (@heal.temp)', value: '@heal.temp' },
+    { label: DAMAGE_PART_LABELS.healFull, value: '@heal' },
+    { label: DAMAGE_PART_LABELS.healTemp, value: '@heal.temp' },
   ];
 
+  /**
+   * Кнопки типов существ. Свой список, а не готовые опции справочника: там
+   * ключ разобран как строка, а токену нужен именно тип существа.
+   */
+  const creatureTypeButtons = typedObjectEntries(CREATURE_CATEGORIES).map(
+    ([value, label]) => ({ value, label }),
+  );
+
+  /** Типы урона, из которых собирается токен «на выбор» или «случайно» */
+  const choiceTypes = ref<string[]>([]);
+
+  /** Токен «на выбор» имеет смысл от двух типов: из одного выбирать нечего */
+  const canInsertTypeChoice = computed(
+    () => choiceTypes.value.length >= DAMAGE_TYPE_CHOICE_MIN_OPTIONS,
+  );
+
+  /** Кнопки способа выбора типа: спросить бросающего или бросить случай */
+  const typeChoiceButtons: Array<{
+    label: string;
+    mode: DamageTypeChoiceMode;
+  }> = [
+    { label: DAMAGE_PART_LABELS.typeChoiceChoose, mode: 'choose' },
+    { label: DAMAGE_PART_LABELS.typeChoiceRandom, mode: 'random' },
+  ];
+
+  /**
+   * Вставляет токен типа урона на выбор (`@dmg.choice(…)`) или случайного
+   * (`@dmg.random(…)`) из отмеченных типов.
+   *
+   * @param mode - способ выбора типа
+   */
+  function insertTypeChoice(mode: DamageTypeChoiceMode): void {
+    const token = buildPickedDamageTypeChoiceToken(
+      mode,
+      choiceTypes.value,
+      props.damageTypeOptions.map((option) => option.value),
+    );
+
+    if (token) {
+      insertText(token);
+    }
+  }
+
   const conditionButtons = [
-    { label: 'Полное HP (@target.full)', value: '@target.full' },
-    { label: 'Неполное HP (@target.notFull)', value: '@target.notFull' },
+    { label: DAMAGE_PART_LABELS.targetFull, value: '@target.full' },
+    { label: DAMAGE_PART_LABELS.targetNotFull, value: '@target.notFull' },
   ];
 
   /** Вставка токена в формулу на текущую позицию курсора */
   function insertText(text: string): void {
-    const inputEl = inputRef.value?.$el?.querySelector(
-      'input',
-    ) as HTMLInputElement | null;
+    const inputEl = inputRef.value?.$el?.querySelector('input');
 
-    if (!inputEl) {
+    if (!(inputEl instanceof HTMLInputElement)) {
       formula.value = (formula.value || '') + text;
 
       return;
@@ -193,10 +333,7 @@
 </script>
 
 <template>
-  <FormSection
-    :title="`Часть ${index + 1}`"
-    title-color="warning"
-  >
+  <FormSection :title="`${DAMAGE_PART_LABELS.partPrefix}${index + 1}`">
     <template #actions>
       <UButton
         v-if="canRemove"
@@ -204,53 +341,73 @@
         color="error"
         variant="ghost"
         size="xs"
-        aria-label="Удалить часть"
+        :aria-label="DAMAGE_PART_LABELS.remove"
         @click.left.exact.prevent="emit('remove')"
       />
     </template>
 
     <div class="flex flex-col gap-3">
-      <!-- Строка формулы во всю ширину -->
-      <UFormField
-        label="Формула"
-        :error="
-          modifierTokenError
-            ? 'Убери @mod.* — модификатор характеристики добавляется автоматически'
-            : undefined
-        "
-      >
-        <UInput
-          ref="inputRef"
-          v-model="formula"
-          placeholder="8к6"
-          :color="modifierTokenError ? 'error' : undefined"
-          class="w-full font-mono"
+      <!-- Строка формулы во всю ширину, под ней — её итог словами -->
+      <div class="flex flex-col gap-1.5">
+        <UFormField
+          :label="DAMAGE_PART_LABELS.formula"
+          :error="
+            modifierTokenError ? DAMAGE_PART_LABELS.formulaModHint : undefined
+          "
+        >
+          <UInput
+            ref="inputRef"
+            v-model="formula"
+            :placeholder="DAMAGE_PART_LABELS.formulaPlaceholder"
+            :color="modifierTokenError ? 'error' : undefined"
+            class="w-full font-mono"
+          />
+        </UFormField>
+
+        <DamageFormulaPreview
+          :part="modelValue"
+          :damage-type-options="damageTypeOptions"
+          :assume-statuses="assumeStatuses"
         />
-      </UFormField>
+      </div>
 
       <!-- Versatile-формула (двуручный хват оружия) -->
-      <UFormField
+      <div
         v-if="showVersatile"
-        label="Двумя руками (versatile)"
-        help="Альтернативная формула при удержании двумя руками (напр. 1к10)"
+        class="flex flex-col gap-1.5"
       >
-        <UInput
-          v-model="versatileFormula"
-          placeholder="1к10"
-          class="w-full font-mono"
-        />
-      </UFormField>
+        <UFormField
+          :label="DAMAGE_PART_LABELS.versatile"
+          :help="DAMAGE_PART_LABELS.versatileHint"
+        >
+          <UInput
+            v-model="versatileFormula"
+            :placeholder="DAMAGE_PART_LABELS.versatilePlaceholder"
+            class="w-full font-mono"
+          />
+        </UFormField>
 
-      <!-- Вкладки-помощники ввода формулы -->
+        <DamageFormulaPreview
+          v-if="versatilePart"
+          :part="versatilePart"
+          :damage-type-options="damageTypeOptions"
+          :assume-statuses="assumeStatuses"
+        />
+      </div>
+
+      <!-- Вкладки-помощники ввода формулы. Вкладок бывает восемь, и в узком окне
+        они переносятся на вторую строку, а не режут подписи; полоса-указатель
+        при переносе съезжает, поэтому активную выделяет цвет текста -->
       <UTabs
         :items="tabsList"
         variant="link"
         class="w-full"
         :ui="{
-          list: 'border-b border-default mb-2',
-          trigger: 'justify-center py-1 text-xs',
+          list: 'border-b border-default mb-2 flex-wrap',
+          trigger: 'justify-center py-1 text-xs shrink-0',
+          indicator: 'hidden',
           content:
-            'p-2 bg-elevated/20 rounded-lg border border-default/50 min-h-[60px]',
+            'p-2 bg-elevated/20 rounded-lg border border-default/50 min-h-15',
         }"
       >
         <template #modifiers>
@@ -283,6 +440,41 @@
           </div>
         </template>
 
+        <!-- Один тип из списка: несколько «@dmg.<тип>» подряд — это урон
+          всеми сразу, а токен на выбор бросает ровно один -->
+        <template #damageTypeChoice>
+          <div class="flex flex-col gap-2">
+            <div class="flex flex-wrap items-end gap-2">
+              <USelectMenu
+                v-model="choiceTypes"
+                :items="damageTypeOptions"
+                value-key="value"
+                label-key="label"
+                multiple
+                size="xs"
+                :placeholder="DAMAGE_PART_LABELS.typeChoicePlaceholder"
+                class="min-w-56 flex-1"
+              />
+
+              <UButton
+                v-for="button in typeChoiceButtons"
+                :key="button.mode"
+                :label="button.label"
+                size="xs"
+                color="neutral"
+                variant="subtle"
+                class="cursor-pointer font-medium"
+                :disabled="!canInsertTypeChoice"
+                @click.left.exact.prevent="insertTypeChoice(button.mode)"
+              />
+            </div>
+
+            <p class="text-xs text-muted">
+              {{ DAMAGE_PART_LABELS.typeChoiceHint }}
+            </p>
+          </div>
+        </template>
+
         <template #healing>
           <div class="flex flex-wrap gap-1.5">
             <UButton
@@ -312,11 +504,52 @@
             />
           </div>
         </template>
+
+        <!-- Слагаемое — только при состоянии цели или атакующего: сторону
+          несёт вкладка -->
+        <template #statuses="{ item }">
+          <div class="flex flex-col gap-2">
+            <div class="flex flex-wrap gap-1.5">
+              <UButton
+                v-for="status in item.statusButtons"
+                :key="status.value"
+                :label="status.label"
+                size="xs"
+                color="neutral"
+                variant="subtle"
+                class="cursor-pointer font-medium"
+                @click.left.exact.prevent="insertText(status.value)"
+              />
+            </div>
+
+            <p class="text-xs text-muted">
+              {{ item.statusHint }}
+            </p>
+          </div>
+        </template>
+
+        <!-- Слагаемое достаётся только целям названного типа -->
+        <template #creatureTypes>
+          <div class="flex flex-wrap gap-1.5">
+            <UButton
+              v-for="creatureType in creatureTypeButtons"
+              :key="creatureType.value"
+              :label="creatureType.label"
+              size="xs"
+              color="neutral"
+              variant="subtle"
+              class="cursor-pointer font-medium"
+              @click.left.exact.prevent="
+                insertText(targetTypeToken(creatureType.value))
+              "
+            />
+          </div>
+        </template>
       </UTabs>
 
       <div class="mt-1 grid grid-cols-2 items-center gap-4">
         <!-- Цель части -->
-        <UFormField label="Цель">
+        <UFormField :label="DAMAGE_PART_LABELS.target">
           <USelect
             v-model="target"
             :items="TARGET_OPTIONS"
@@ -332,7 +565,7 @@
         >
           <UCheckbox
             v-model="requiresDamage"
-            label="Только если нанесён урон"
+            :label="DAMAGE_PART_LABELS.onlyIfDamaged"
           />
         </div>
       </div>

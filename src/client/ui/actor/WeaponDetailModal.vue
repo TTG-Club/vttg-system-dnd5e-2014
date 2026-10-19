@@ -1,27 +1,51 @@
 <script setup lang="ts">
-  import type { GameItem } from '@vtt/shared/system/dnd.js';
+  import type { DnDGameItem, DnDSceneEntity } from '@vtt/shared/system/dnd.js';
 
   import type { ItemPropertyBadge } from './ItemPropertyBadges.vue';
 
-  import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
-  import { getWeaponDamageParts } from '@vtt/shared/system/dnd.js';
-  import { computed } from 'vue';
+  import { computed, toRef } from 'vue';
 
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+  import { DISTANCE_UNIT_SHORT } from '@vtt/shared';
+  import {
+    describeWeaponAttack,
+    describeWeaponDamage,
+    formatDiceLetters,
+    getWeaponDamageParts,
+    sumWeaponModifierParts,
+    WEAPON_MASTERY_MAP,
+    withLoadedAmmunition,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { useResolvedStats } from '../../composables/useResolvedStats';
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import {
+    COPY_TO_ITEMS_LABEL,
+    FORM_FIELD_LABELS,
+    WEAPON_DETAIL_LABELS,
+    WEAPON_FORM_LABELS,
+  } from './constants';
   import DamagePartsSummary from './DamagePartsSummary.vue';
   import ItemCostWeightRarity from './ItemCostWeightRarity.vue';
   import ItemDetailModalShell from './ItemDetailModalShell.vue';
   import ItemDetailTabs from './ItemDetailTabs.vue';
   import ItemEffectsView from './ItemEffectsView.vue';
   import ItemPropertyBadges from './ItemPropertyBadges.vue';
+  import { formatSignedNumber } from './utils/formatSignedNumber';
+  import { formatWeaponModifierParts } from './utils/formatWeaponModifierParts';
 
   const props = defineProps<{
     /** Открыто ли модальное окно */
     open: boolean;
     /** Оружие для отображения */
-    item: GameItem | null;
+    item: DnDGameItem | null;
+    /**
+     * Владелец оружия: с ним карточка показывает итоговые атаку и урон с
+     * разбором слагаемых. Без владельца (компендиум) — только бонус самого
+     * оружия: считать итог не от кого.
+     */
+    /** Владелец оружия: и персонаж, и существо — разбор атаки у них общий */
+    actor?: DnDSceneEntity;
     /** Z-index модалки (управляется родителем) */
     zIndex?: number;
     /** Смещение позиции для каскадного расположения */
@@ -45,15 +69,64 @@
     props.item ? JSON.stringify(props.item) : '',
   );
 
-  /** Части урона оружия (read-only сводка через общий DamagePartsSummary) */
+  const { resolvedStats } = useResolvedStats(toRef(() => props.actor));
+
+  /**
+   * Части урона оружия (read-only сводка через общий DamagePartsSummary). У
+   * владельца — с заменами от эффектов («Дубинка»: к8 вместо к6).
+   */
   const weaponDamageParts = computed(() =>
-    props.item ? getWeaponDamageParts(props.item) : [],
+    props.item ? getWeaponDamageParts(props.item, resolvedStats.value) : [],
   );
 
-  /** Versatile-формула первой части (двуручный хват), если задана */
-  const versatileFormula = computed(
-    () => props.item?.damageParts?.[0]?.versatileFormula,
-  );
+  /**
+   * Versatile-формула первой части (двуручный хват) для показа: кости
+   * по-русски («1d10» → «1к10»). Пустая строка — хват не задан или кость
+   * заменена эффектом, которому хват не важен.
+   */
+  const versatileLabel = computed(() => {
+    const formula = weaponDamageParts.value[0]?.versatileFormula;
+
+    return formula ? formatDiceLetters(formula) : '';
+  });
+
+  /**
+   * Разбор атаки и урона для владельца: итог со знаком и слагаемые строкой —
+   * как у выстрела, с бонусом заряженного боеприпаса. Без владельца — `null`,
+   * и карточка показывает бонус самого оружия.
+   */
+  const ownerModifiers = computed(() => {
+    const actor = props.actor;
+
+    if (!actor || !props.item) {
+      return null;
+    }
+
+    const weapon = withLoadedAmmunition(actor.equipment ?? [], props.item);
+
+    const attackParts = describeWeaponAttack(
+      actor,
+      weapon,
+      resolvedStats.value,
+    );
+
+    // Не `damageParts`: так в этом окне называются части урона оружия (кости),
+    // а здесь — слагаемые статической прибавки
+    const damageModifierParts = describeWeaponDamage(
+      actor,
+      weapon,
+      resolvedStats.value,
+    );
+
+    return {
+      attackTotal: formatSignedNumber(sumWeaponModifierParts(attackParts)),
+      attackDetails: formatWeaponModifierParts(attackParts),
+      damageTotal: formatSignedNumber(
+        sumWeaponModifierParts(damageModifierParts),
+      ),
+      damageDetails: formatWeaponModifierParts(damageModifierParts),
+    };
+  });
 
   /** Карта key → definition для названия и описания свойства оружия */
   const propertyMap = computed(() => {
@@ -111,21 +184,34 @@
 
     return map;
   });
+
+  /** Детали оружейного приёма текущего оружия */
+  const masteryDetail = computed(() => {
+    const key = props.item?.mastery;
+
+    if (!key) {
+      return undefined;
+    }
+
+    return WEAPON_MASTERY_MAP.get(key);
+  });
 </script>
 
 <template>
   <ItemDetailModalShell
     :open="open"
-    :title="item?.name ?? 'Оружие'"
+    :title="item?.name ?? WEAPON_DETAIL_LABELS.fallbackTitle"
     :subtitle="item?.nameEn || undefined"
     :source-key="item?.sourceKey"
+    :source="item?.source"
     :is-srd="item?.isSRD"
+    :automation="item?.automation"
     card-type="equipment"
     :chat-payload="chatPayload"
     :z-index="zIndex"
     :position-offset="positionOffset"
     :show-copy-button="showCopyButton"
-    copy-tooltip="Скопировать в предметы"
+    :copy-tooltip="COPY_TO_ITEMS_LABEL"
     @update:open="emit('update:open', $event)"
     @copy="emit('copy')"
     @bring-to-front="emit('bring-to-front')"
@@ -141,27 +227,65 @@
                 <!-- Урон / Лечение (части) — общий со заклинаниями компонент -->
                 <DamagePartsSummary :parts="weaponDamageParts" />
 
-                <!-- Бонус атаки -->
-                <div>
-                  <span class="text-xs text-dimmed">Бонус атаки</span>
+                <!-- Атака: у владельца — итог с разбором, иначе бонус оружия -->
+                <div v-if="ownerModifiers">
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.attack
+                  }}</span>
+
+                  <p class="text-highlighted">
+                    {{ ownerModifiers.attackTotal }}
+                  </p>
+
+                  <p class="text-xs leading-relaxed text-dimmed">
+                    {{ ownerModifiers.attackDetails }}
+                  </p>
+                </div>
+
+                <div v-else>
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.attackBonus
+                  }}</span>
 
                   <p class="text-highlighted">+{{ item.attackBonus ?? 0 }}</p>
                 </div>
 
+                <!-- Прибавка к урону владельца -->
+                <div v-if="ownerModifiers">
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.damageModifier
+                  }}</span>
+
+                  <p class="text-highlighted">
+                    {{ ownerModifiers.damageTotal }}
+                  </p>
+
+                  <p
+                    v-if="ownerModifiers.damageDetails"
+                    class="text-xs leading-relaxed text-dimmed"
+                  >
+                    {{ ownerModifiers.damageDetails }}
+                  </p>
+                </div>
+
                 <!-- Универсальное -->
-                <div v-if="versatileFormula">
-                  <span class="text-xs text-dimmed">Двумя руками</span>
+                <div v-if="versatileLabel">
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.versatile
+                  }}</span>
 
                   <p class="flex items-center gap-1.5 text-highlighted">
                     <span class="font-mono font-semibold">{{
-                      versatileFormula.replace(/(\d+)d(\d+)/gi, '$1к$2')
+                      versatileLabel
                     }}</span>
                   </p>
                 </div>
 
-                <!-- Дальность -->
+                <!-- {{ WEAPON_DETAIL_LABELS.range }} -->
                 <div v-if="item.range">
-                  <span class="text-xs text-dimmed">Дальность</span>
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.range
+                  }}</span>
 
                   <p class="text-highlighted">
                     {{ item.range.normal }}
@@ -170,9 +294,11 @@
                   </p>
                 </div>
 
-                <!-- Категория -->
+                <!-- {{ WEAPON_DETAIL_LABELS.category }} -->
                 <div>
-                  <span class="text-xs text-dimmed">Категория</span>
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.category
+                  }}</span>
 
                   <p class="text-highlighted">
                     {{
@@ -184,16 +310,20 @@
 
                 <!-- Базовый тип -->
                 <div v-if="item.baseType">
-                  <span class="text-xs text-dimmed">Тип оружия</span>
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.weaponType
+                  }}</span>
 
                   <p class="text-highlighted">
                     {{ baseTypeMap.get(item.baseType) ?? item.baseType }}
                   </p>
                 </div>
 
-                <!-- Боеприпасы -->
+                <!-- {{ WEAPON_DETAIL_LABELS.ammunition }} -->
                 <div v-if="item.ammunitionType">
-                  <span class="text-xs text-dimmed">Боеприпасы</span>
+                  <span class="text-xs text-dimmed">{{
+                    WEAPON_DETAIL_LABELS.ammunition
+                  }}</span>
 
                   <p class="text-highlighted">
                     {{
@@ -202,13 +332,40 @@
                     }}
                   </p>
                 </div>
+
+                <!-- {{ WEAPON_FORM_LABELS.mastery }} -->
+                <div v-if="item.mastery && masteryDetail">
+                  <span class="block text-xs text-dimmed">{{
+                    WEAPON_FORM_LABELS.mastery
+                  }}</span>
+
+                  <UPopover
+                    mode="hover"
+                    :ui="{ content: 'max-w-xs p-3' }"
+                  >
+                    <UBadge
+                      color="warning"
+                      variant="subtle"
+                      size="sm"
+                      class="mt-1 cursor-help"
+                    >
+                      {{ masteryDetail.name.ru }} ({{ masteryDetail.name.en }})
+                    </UBadge>
+
+                    <template #content>
+                      <p class="text-xs leading-relaxed text-toned">
+                        {{ masteryDetail.description.ru }}
+                      </p>
+                    </template>
+                  </UPopover>
+                </div>
               </div>
             </div>
 
             <!-- Свойства оружия -->
             <ItemPropertyBadges :properties="weaponPropertyBadges" />
 
-            <!-- Особое правило -->
+            <!-- {{ WEAPON_DETAIL_LABELS.special }} -->
             <div
               v-if="item.special"
               class="rounded-lg border border-default/50 bg-elevated/30 p-3"
@@ -216,7 +373,7 @@
               <span
                 class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
               >
-                Особое правило
+                {{ WEAPON_DETAIL_LABELS.special }}
               </span>
 
               <p class="text-sm leading-relaxed text-toned">
@@ -229,7 +386,7 @@
               <span
                 class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
               >
-                Описание
+                {{ FORM_FIELD_LABELS.description }}
               </span>
 
               <ItemDescriptionRenderer :content="item.description" />
@@ -246,7 +403,10 @@
 
         <!-- Вкладка «Эффекты» — только просмотр -->
         <template #effects>
-          <ItemEffectsView :effects="item.activeEffects ?? []" />
+          <ItemEffectsView
+            :effects="item.activeEffects ?? []"
+            :owner-name="item.name"
+          />
         </template>
       </ItemDetailTabs>
     </template>

@@ -3,9 +3,13 @@
  * (`featData` + `activeEffects`).
  *
  * Описание черты остаётся чистой прозой; механические дары (владения, языки,
- * защиты, повышение характеристик, заклинания, эффекты, предусловия) выводятся
+ * защиты, повышение характеристик, заклинания, предусловия) выводятся
  * отдельным авто-блоком Markdown в просмотре черты — чтобы мастер сразу видел,
  * как черта настроена, без ручного дублирования в описании.
+ *
+ * Активные эффекты сюда НЕ входят: у них своя вкладка «Эффекты» в просмотре, где
+ * каждый эффект открывается карточкой с полным разбором. Строкой в сводке они
+ * лишь дублировали бы её название.
  *
  * Логика системо-зависима (форма `FeatData` D&D 5e), поэтому живёт в системе и
  * вызывается Ядром через контракт `VttSystem.getFeatGrantsSummary`.
@@ -13,21 +17,24 @@
  * @module system/dnd/featGrantsSummary
  */
 
-import type { AbilityType, Feature } from '@vtt/shared';
-import type { BackgroundDefinition } from './backgroundTypes.js';
-import type { GameItem } from './dndEntities.js';
-import type { FeatData } from './featTypes.js';
+import type { Feature } from '@vtt/shared';
 
-import {
-  ABILITY_LABELS,
-  CONDITIONS,
-  SKILLS_LABELS,
-  TOOLS_LABELS,
-} from './consts.js';
+import type { BackgroundDefinition } from './backgroundTypes.js';
+import type { CounterRecovery } from './classTypes.js';
+import type { DnDGameItem } from './dndEntities.js';
+import type { FeatCounterDefinition, FeatData } from './featTypes.js';
+
+import { SENSE_LABELS } from './actorSenses.js';
+import { getConditionEntry } from './conditionTemplates.js';
+import { ABILITY_LABELS, isAbilityType, SKILLS_LABELS } from './consts.js';
 import {
   DAMAGE_DEFENSE_KIND_LABELS,
   DAMAGE_TYPE_LABELS,
 } from './damageConstants.js';
+import { listFeatDamageDefenseChoices } from './featChoices.js';
+import { CLASS_FEATURE_NAMES } from './featPrerequisites.js';
+import { toolProficiencyLabel } from './toolProficiency.js';
+import { WEAPON_MASTERY_MAP } from './weaponMasteries.js';
 
 /** Подписи владения доспехами (нет в shared — компактно дублируем). */
 const ARMOR_LABELS: Record<string, string> = {
@@ -45,13 +52,20 @@ const WEAPON_LABELS: Record<string, string> = {
 
 /** Подпись характеристики по ключу. */
 function abilityLabel(ability: string): string {
-  return ABILITY_LABELS[ability as AbilityType] ?? ability;
+  return isAbilityType(ability) ? ABILITY_LABELS[ability] : ability;
 }
 
-/** Строка повышения характеристик. */
-function abilityScoreLine(featData: FeatData): string | null {
-  const asi = featData.abilityScoreIncrease;
-
+/**
+ * Повышение характеристик одной строкой: «+2 Телосложение, +1 к 2× любая
+ * характеристика (на выбор)». Общая для сводки даров и карточки расы — в
+ * редакции 2014 повышение даёт раса, и показывать его надо одинаково.
+ *
+ * @param asi - повышение характеристик блока даров
+ * @returns строка либо `null`, если повышать нечего
+ */
+export function formatAbilityScoreIncrease(
+  asi: FeatData['abilityScoreIncrease'],
+): string | null {
   if (!asi) {
     return null;
   }
@@ -75,7 +89,20 @@ function abilityScoreLine(featData: FeatData): string | null {
     parts.push(`+${asi.choice.amount} к ${count}${from} (на выбор)`);
   }
 
-  return parts.length > 0 ? `- **Характеристики:** ${parts.join(', ')}` : null;
+  // Предел показываем справкой: сам лист характеристики нигде не ограничивает, и
+  // мастеру важно видеть, докуда черта поднимает — 20 у обычных, 30 у эпических даров
+  if (parts.length > 0 && asi.upto) {
+    parts.push(`не выше ${asi.upto}`);
+  }
+
+  return parts.length > 0 ? parts.join(', ') : null;
+}
+
+/** Строка повышения характеристик. */
+function abilityScoreLine(featData: FeatData): string | null {
+  const line = formatAbilityScoreIncrease(featData.abilityScoreIncrease);
+
+  return line ? `- **Характеристики:** ${line}` : null;
 }
 
 /** Строка владений. */
@@ -114,10 +141,26 @@ function proficiencyLine(featData: FeatData): string | null {
     );
   }
 
+  if (featData.weaponMasteries?.length) {
+    parts.push(
+      `приёмы оружия: ${featData.weaponMasteries
+        .map((weapon) => WEAPON_LABELS[weapon] ?? weapon)
+        .join(', ')}`,
+    );
+  }
+
+  if (featData.masteryProperties?.length) {
+    parts.push(
+      `приёмы: ${featData.masteryProperties
+        .map((key) => WEAPON_MASTERY_MAP.get(key)?.name.ru ?? key)
+        .join(', ')}`,
+    );
+  }
+
   if (featData.toolProficiencies?.length) {
     parts.push(
       featData.toolProficiencies
-        .map((tool) => TOOLS_LABELS[tool] ?? tool)
+        .map((tool) => toolProficiencyLabel(tool))
         .join(', '),
     );
   }
@@ -135,9 +178,16 @@ function defenseLine(featData: FeatData): string | null {
     parts.push(`${kind}: ${DAMAGE_TYPE_LABELS[defense.damageType]}`);
   }
 
+  // Защита по выбору: тип урона называет игрок при взятии черты, поэтому в
+  // сводке самой черты его нет — виден только исход
+  for (const choice of listFeatDamageDefenseChoices(featData)) {
+    const kind = DAMAGE_DEFENSE_KIND_LABELS[choice.kind].toLowerCase();
+
+    parts.push(`${kind}: тип урона на выбор`);
+  }
+
   for (const condition of featData.conditionImmunities ?? []) {
-    const label =
-      CONDITIONS.find((entry) => entry.key === condition)?.nameRu ?? condition;
+    const label = getConditionEntry(condition)?.nameRu ?? condition;
 
     parts.push(`иммунитет к состоянию «${label}»`);
   }
@@ -145,7 +195,248 @@ function defenseLine(featData: FeatData): string | null {
   return parts.length > 0 ? `- **Защиты:** ${parts.join(', ')}` : null;
 }
 
-/** Строка предусловий. */
+/**
+ * Строка расширения списка заклинаний класса — таблицы «Заклинания метки».
+ *
+ * Ступени показаны как есть, без учёта уровня персонажа: сводка описывает саму
+ * черту, а что из неё уже открыто, видно по книге заклинаний листа. Количество
+ * показано формулой источника по той же причине, что и максимум ресурса.
+ */
+function spellListLine(featData: FeatData): string | null {
+  const groups = featData.spellList?.groups ?? [];
+
+  if (groups.length === 0) {
+    return null;
+  }
+
+  const parts = groups
+    .filter((group) => group.spells?.length)
+    .map((group) => {
+      const names = group.spells.map((spell) => spell.name).join(', ');
+
+      const conditions = [
+        group.requiredLevel && group.requiredLevel > 1
+          ? fromLevelLabel(group.requiredLevel)
+          : null,
+        group.count?.trim() ? `выбрать ${group.count.trim()}` : null,
+      ].filter(Boolean);
+
+      return conditions.length > 0
+        ? `${names} (${conditions.join(', ')})`
+        : names;
+    });
+
+  if (parts.length === 0) {
+    return null;
+  }
+
+  const suffix = featData.spellList?.requiresSpellcasting
+    ? ' — при наличии способности творить заклинания'
+    : '';
+
+  return `- **Список заклинаний класса:** ${parts.join('; ')}${suffix}`;
+}
+
+/** Подписи отката ресурса в сводке даров. */
+const COUNTER_RECOVERY_SUMMARY: Record<CounterRecovery, string> = {
+  'short': 'короткий отдых',
+  'long': 'продолжительный отдых',
+  'short-one': 'один заряд за короткий отдых, все за продолжительный',
+};
+
+/**
+ * Строка ресурсов черты: название и способ восстановления. Максимум показан
+ * формулой источника либо ступенями, а не числом: у «Удачливого» он равен бонусу
+ * мастерства и зависит от уровня конкретного персонажа, а сводка описывает саму
+ * черту.
+ */
+function countersLine(featData: FeatData): string | null {
+  const counters = featData.counters ?? [];
+
+  if (counters.length === 0) {
+    return null;
+  }
+
+  const parts = counters.map(
+    (counter) =>
+      `${counter.name} (${counterMaxLine(counter)}${counterMinimumLine(counter.min)}, ${COUNTER_RECOVERY_SUMMARY[counter.recovery]})`,
+  );
+
+  return `- **Ресурсы:** ${parts.join('; ')}`;
+}
+
+/**
+ * Максимум ресурса для сводки: ступени, если заданы, иначе формула.
+ *
+ * Ступени старше формулы — так их считает и лист, — поэтому показывать формулу
+ * рядом с ними значило бы описать число, которое ни на что не влияет. Первая
+ * ступень и есть уровень, с которого ресурс появляется.
+ *
+ * @param counter - определение ресурса
+ * @returns «с 3 ур. — 1, с 5 ур. — 2» либо формула максимума
+ */
+function counterMaxLine(counter: FeatCounterDefinition): string {
+  const steps = Object.entries(counter.progression ?? {})
+    .map(([level, value]) => ({ level: Number(level), value }))
+    .sort((stepA, stepB) => stepA.level - stepB.level);
+
+  if (steps.length === 0) {
+    return counter.max?.trim() || '0';
+  }
+
+  return steps
+    .map((step) =>
+      step.level > 1
+        ? `${fromLevelLabel(step.level)} — ${step.value}`
+        : `${step.value}`,
+    )
+    .join(', ');
+}
+
+/**
+ * Подпись уровня, с которого открывается дар: «с 3 ур.».
+ *
+ * Одна на всю сводку: заклинания, списки классов и ступени ресурсов читаются
+ * рядом, и разнобой в написании уровня бросался бы в глаза.
+ *
+ * @param level - уровень персонажа
+ * @returns подпись вида «с 3 ур.»
+ */
+export function fromLevelLabel(level: number): string {
+  return `с ${level} ур.`;
+}
+
+/**
+ * Приписка о нижней границе максимума; пустая строка — границы нет.
+ *
+ * @param min - нижняя граница максимума
+ * @returns приписка к формуле максимума
+ */
+function counterMinimumLine(min: number | undefined): string {
+  return min && min > 0 ? `, минимум ${min}` : '';
+}
+
+/**
+ * Строка постоянных модификаторов листа (хиты, скорости, КД, инициатива).
+ * Прибавка к хитам показана формулой источника, а не итогом: итог зависит от
+ * уровня взятия, а сводка описывает саму черту, а не конкретное применение.
+ */
+function modifiersLine(featData: FeatData): string | null {
+  const modifiers = featData.modifiers;
+
+  if (!modifiers) {
+    return null;
+  }
+
+  const parts: string[] = [];
+  const hitPoints = modifiers.hitPoints;
+
+  if (hitPoints) {
+    const pieces: string[] = [];
+
+    if (hitPoints.flat) {
+      pieces.push(`${hitPoints.flat}`);
+    }
+
+    if (hitPoints.perAcquisitionLevel) {
+      pieces.push(`${hitPoints.perAcquisitionLevel} за уровень при взятии`);
+    }
+
+    if (hitPoints.perLevelAfterAcquisition) {
+      pieces.push(
+        `${hitPoints.perLevelAfterAcquisition} за каждый следующий уровень`,
+      );
+    }
+
+    if (pieces.length > 0) {
+      parts.push(`хиты +${pieces.join(', +')}`);
+    }
+  }
+
+  const speed = modifiers.speed;
+
+  if (speed) {
+    if (speed.walkBonus) {
+      parts.push(`скорость +${speed.walkBonus} фт.`);
+    }
+
+    const movementLabels: Array<
+      [number | undefined, boolean | undefined, string]
+    > = [
+      [speed.fly, speed.flyEqualsWalk, 'полёт'],
+      [speed.climb, speed.climbEqualsWalk, 'лазание'],
+      [speed.swim, speed.swimEqualsWalk, 'плавание'],
+    ];
+
+    for (const [value, equalsWalk, label] of movementLabels) {
+      if (value) {
+        parts.push(`${label} ${value} фт.`);
+      } else if (equalsWalk) {
+        parts.push(`${label} как скорость ходьбы`);
+      }
+    }
+  }
+
+  if (modifiers.armorClassBonus) {
+    parts.push(`КД +${modifiers.armorClassBonus}`);
+  }
+
+  for (const sense of modifiers.senses ?? []) {
+    if (sense.range > 0) {
+      parts.push(
+        `${SENSE_LABELS[sense.type].toLowerCase()} ${sense.range} фт.`,
+      );
+    }
+  }
+
+  if (modifiers.telepathyRange) {
+    parts.push(`телепатия ${modifiers.telepathyRange} фт.`);
+  }
+
+  if (modifiers.initiativeProficiencyBonus) {
+    parts.push('инициатива + бонус мастерства');
+  }
+
+  if (modifiers.initiativeBonus) {
+    const bonus = modifiers.initiativeBonus;
+
+    parts.push(`инициатива ${bonus > 0 ? '+' : ''}${bonus}`);
+  }
+
+  return parts.length > 0 ? `- **Модификаторы:** ${parts.join(', ')}` : null;
+}
+
+/**
+ * Подписи разделов требования, которые перечисляют записи справочника. Порядок задаёт
+ * порядок показа в строке требований.
+ */
+const REFERENCE_LABELS = {
+  feats: 'черта',
+  classes: 'класс',
+  species: 'вид',
+  backgrounds: 'предыстория',
+} as const;
+
+/** Требование метки дракона: конкретной черты оно не называет. */
+const ANY_DRAGONMARK_LABEL = 'любая черта метки дракона';
+
+/** Названия записей справочника через «или»: «Волшебник или Чародей». */
+function refNames(
+  refs: ReadonlyArray<{ name: string }> | undefined,
+): string | null {
+  const names = (refs ?? []).map((ref) => ref.name).filter(Boolean);
+
+  return names.length > 0 ? names.join(' или ') : null;
+}
+
+/**
+ * Строка предусловий.
+ *
+ * Разобранные поля и человекочитаемая строка идут вместе: разобрать удаётся не всё, а
+ * показать нужно целиком. Чтобы требование не двоилось («уровень 4+, Уровень 4+, Сила
+ * 13+» — строка из книги перечисляет и то, что уже разобрано), разобранная часть,
+ * которая в строке уже есть, из перечисления убирается.
+ */
 function prerequisiteLine(featData: FeatData): string | null {
   const prerequisite = featData.prerequisite;
 
@@ -161,60 +452,152 @@ function prerequisiteLine(featData: FeatData): string | null {
     }
   }
 
+  for (const requirement of prerequisite.abilityRequirements ?? []) {
+    const abilities = requirement.anyOf.map(abilityLabel).join(' или ');
+
+    parts.push(`${abilities} ${requirement.minValue}+`);
+  }
+
   if (prerequisite.minLevel) {
     parts.push(`уровень ${prerequisite.minLevel}+`);
   }
 
   if (prerequisite.spellcasting) {
-    parts.push('умение творить заклинания');
+    parts.push(CLASS_FEATURE_NAMES.spellcasting);
   }
 
-  if (prerequisite.text) {
-    parts.push(prerequisite.text);
+  for (const feature of prerequisite.classFeatures ?? []) {
+    parts.push(CLASS_FEATURE_NAMES[feature] ?? feature);
   }
 
-  return parts.length > 0 ? `- **Требования:** ${parts.join(', ')}` : null;
+  const references: Array<[string, string | null]> = [
+    [REFERENCE_LABELS.feats, refNames(prerequisite.feats)],
+    [REFERENCE_LABELS.classes, refNames(prerequisite.classes)],
+    [REFERENCE_LABELS.species, refNames(prerequisite.species)],
+    [REFERENCE_LABELS.backgrounds, refNames(prerequisite.backgrounds)],
+  ];
+
+  for (const [label, names] of references) {
+    if (names) {
+      parts.push(`${label}: ${names}`);
+    }
+  }
+
+  const armor = (prerequisite.armorProficiency ?? [])
+    .map((key) => ARMOR_LABELS[key] ?? key)
+    .join(' или ');
+
+  if (armor) {
+    parts.push(`владение: ${armor}`);
+  }
+
+  if (prerequisite.anyDragonmark) {
+    parts.push(ANY_DRAGONMARK_LABEL);
+  }
+
+  if (prerequisite.campaign) {
+    parts.push(prerequisite.campaign);
+  }
+
+  const text = prerequisite.text?.trim();
+  const normalizedText = text?.toLowerCase() ?? '';
+
+  const unique = text
+    ? parts.filter((part) => !normalizedText.includes(part.toLowerCase()))
+    : parts;
+
+  if (text) {
+    unique.push(text);
+  }
+
+  return unique.length > 0 ? `- **Требования:** ${unique.join(', ')}` : null;
 }
 
 /**
- * Строит Markdown-список даров черты из её настроек (для таба «Автоматизация»
- * в просмотре). Возвращает пустую строку, если черта не несёт механических
- * даров (тогда таб не показывается).
+ * Строка сводки о выдаче целых списков классов.
  *
- * @param feat - источник даров с настройками (`featData` / `activeEffects`):
- *   черта, предмет или предыстория.
+ * Заклинания здесь не перечисляются: их и нет — запись хранит правило, а список
+ * собирается при выдаче. Игроку важно другое: чей это список, какого круга и с
+ * какого уровня.
+ *
+ * @param featData - блоб даров записи
+ * @returns строка сводки; `null` — списки классов запись не выдаёт
+ */
+function classSpellsLine(featData: FeatData): string | null {
+  const groups = featData.grantedClassSpells ?? [];
+
+  if (groups.length === 0) {
+    return null;
+  }
+
+  const parts = groups.map((group) => {
+    const classes = group.classNames?.length
+      ? group.classNames.join(', ')
+      : group.classKeys.join(', ');
+
+    const details: string[] = [];
+
+    if (group.fromSlots) {
+      details.push('не выше доступного круга');
+    } else if (group.level !== undefined) {
+      details.push(group.level === 0 ? 'заговоры' : `${group.level} круг`);
+    } else if (group.maxLevel !== undefined) {
+      details.push(`не выше ${group.maxLevel} круга`);
+    }
+
+    if (group.requiredLevel && group.requiredLevel > 1) {
+      details.push(fromLevelLabel(group.requiredLevel));
+    }
+
+    return details.length > 0 ? `${classes} (${details.join(', ')})` : classes;
+  });
+
+  return `- **Списки классов целиком:** ${parts.join('; ')}`;
+}
+
+/**
+ * Собирает читаемую сводку даров записи — тот текст, который карточка
+ * показывает под описанием.
+ *
+ * @param feat - черта, особенность или предыстория
+ * @returns сводка в Markdown; пустая строка, когда механики у записи нет
  */
 export function buildFeatGrantsSummary(
-  feat: Feature | GameItem | BackgroundDefinition,
+  feat: Feature | DnDGameItem | BackgroundDefinition,
 ): string {
-  // `featData`/`activeEffects` есть у GameItem-черты и у применённой черты на
-  // акторе (несётся через AppliedFeatFeature). У обычной особенности (Feature)
-  // их нет — сводка тогда пустая.
+  // `featData` есть у GameItem-черты и у применённой черты на акторе (несётся
+  // через AppliedFeatFeature). У обычной особенности (Feature) его нет — сводка
+  // тогда пустая.
   const featData: FeatData | null =
     'featData' in feat ? (feat.featData ?? null) : null;
-
-  const activeEffects =
-    'activeEffects' in feat ? feat.activeEffects : undefined;
 
   const lines: string[] = [];
 
   if (featData?.grantedSpells?.length) {
     lines.push(
       `- **Заклинания:** ${featData.grantedSpells
-        .map((spell) => spell.name)
+        .map((spell) =>
+          spell.requiredLevel && spell.requiredLevel > 1
+            ? `${spell.name} (${fromLevelLabel(spell.requiredLevel)})`
+            : spell.name,
+        )
         .join(', ')}`,
     );
   }
 
-  if (activeEffects?.length) {
-    const effects = activeEffects
-      .map((effect) => effect.description.trim() || effect.name)
-      .join('; ');
-
-    lines.push(`- **Эффекты:** ${effects}`);
-  }
-
   if (featData) {
+    const classSpells = classSpellsLine(featData);
+
+    if (classSpells) {
+      lines.push(classSpells);
+    }
+
+    const spellList = spellListLine(featData);
+
+    if (spellList) {
+      lines.push(spellList);
+    }
+
     const asiLine = abilityScoreLine(featData);
 
     if (asiLine) {
@@ -239,6 +622,18 @@ export function buildFeatGrantsSummary(
 
     if (featData.darkvision && featData.darkvision > 0) {
       lines.push(`- **Чувства:** тёмное зрение ${featData.darkvision} фт.`);
+    }
+
+    const modifiers = modifiersLine(featData);
+
+    if (modifiers) {
+      lines.push(modifiers);
+    }
+
+    const counters = countersLine(featData);
+
+    if (counters) {
+      lines.push(counters);
     }
 
     const prereq = prerequisiteLine(featData);

@@ -23,6 +23,16 @@
 @import '@nuxt/ui';
 
 @theme {
+  /* Основной шрифт — зеркало хоста, и держать его здесь ОБЯЗАТЕЛЬНО.
+   * Без этой строки наш `@import 'tailwindcss'` объявляет `--font-sans` со
+   * своим системным стеком в том же слое `theme`, что и хост, а грузимся мы
+   * позже — и всё приложение теряет Open Sans, стоит открыть мир с системой.
+   * Ровно тот случай, о котором предупреждает правило про СУПЕРНАБОР:
+   * значение обязано совпадать с `tailwind.css` хоста. */
+  --font-sans:
+    'Open Sans', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+
   /* ── Семантические цвета приложения (зеркало хоста) ────────── */
 
   /* Опасность / ошибка / отрицательное значение */
@@ -43,11 +53,10 @@
   --color-warning-border: var(--color-yellow-500);
   --color-warning-muted: var(--color-yellow-300);
 
-  /* Золото / стоимость / монеты (D&D) */
-  --color-gold: var(--color-amber-400);
-  --color-gold-subtle: var(--color-amber-950);
-  --color-gold-border: var(--color-amber-500);
-  --color-gold-muted: var(--color-amber-300);
+  /* Золотого алиаса здесь БОЛЬШЕ НЕТ — как и у хоста, зеркало сходится.
+   * Он указывал на amber Tailwind, тему приложения не слушал и жил рядом с
+   * primary вторым, более жёлтым акцентом: лист персонажа отличался по цвету
+   * от остального интерфейса. Всё, что было на нём, переведено на `primary`. */
 
   /* Информация / статы / свойства */
   --color-info: var(--color-blue-400);
@@ -75,4 +84,37 @@
 
   /* Временные ОЗ (temp HP) / щиты */
   --color-shield: var(--color-sky-400);
+}
+
+/* ── Собственные классы системы (НЕ зеркало хоста) ───────────────────────────
+ *
+ * Здесь живёт только то, что нужно НЕСКОЛЬКИМ компонентам сразу: `<style scoped>`
+ * виден исключительно своему шаблону, поэтому `.custom-scrollbar` оформлялся лишь
+ * в двух файлах из пяти, где он стоит в разметке — карточкам существа не
+ * доставалось ничего.
+ *
+ * Имя безопасно: глобального `.custom-scrollbar` у хоста нет, его собственный
+ * лежит внутри scoped-стиля `PlaylistItem.vue` и с нашим не пересекается.
+ * Ширину компонент задаёт переменной — у листа целиком полоса шире, чем у
+ * панелей внутри него. */
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: var(--dnd5e-scrollbar-width, 4px);
+  /* Горизонтальной полосе ширина не указ — её толщину задаёт высота. Без этого
+     лента вкладок и таблица прогрессии получали системную полосу в полтора
+     сантиметра. */
+  height: var(--dnd5e-scrollbar-width, 4px);
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklch, var(--ui-text-muted) 50%, transparent);
+  border-radius: 20px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklch, var(--ui-text-toned) 60%, transparent);
 }

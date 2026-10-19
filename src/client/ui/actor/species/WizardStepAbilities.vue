@@ -1,138 +1,212 @@
 <script setup lang="ts">
   import type { AbilityType } from '@vtt/shared';
-  import type { SpeciesAbilityIncreases } from '@vtt/shared/system/dnd.js';
+  import type {
+    DnDAbilityScores,
+    SpeciesAbilityIncrease,
+    SpeciesAbilityIncreaseChoice,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { typedObjectEntries } from '@vtt/shared';
-  import { ABILITY_LABELS, ABILITY_OPTIONS } from '@vtt/shared/system/dnd.js';
+  import type { SpeciesWizardState } from './useSpeciesWizard';
+
   import { computed } from 'vue';
 
+  import {
+    ABILITY_LABELS,
+    ABILITY_OPTIONS,
+    isAbilityType,
+    sumSpeciesAbilityIncreases,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { SPECIES_WIZARD_LABELS, WIZARD_ASI_LABELS } from '../constants';
+
   const props = defineProps<{
-    /** Повышения вида: фиксированные и группы выбора. */
-    increases: SpeciesAbilityIncreases;
-    /** Выбор игрока по каждой группе (индекс группы → характеристики). */
-    selections: Record<number, AbilityType[]>;
+    /** Повышения характеристик расы, подрасы и особенностей */
+    increases: SpeciesAbilityIncrease[];
+    state: SpeciesWizardState;
+    currentAbilities: DnDAbilityScores;
   }>();
 
   const emit = defineEmits<{
-    'update:selections': [value: Record<number, AbilityType[]>];
+    'update:state': [value: SpeciesWizardState];
   }>();
 
-  /** Фиксированные прибавки вида и подвида — их игрок не меняет. */
-  const fixedRows = computed(() =>
-    typedObjectEntries<AbilityType, number>(props.increases.fixed)
-      .filter(([, bonus]) => Boolean(bonus))
-      .map(([ability, bonus]) => ({
-        label: ABILITY_LABELS[ability] ?? ability,
-        bonus: bonus ?? 0,
-      })),
+  /** Итоговые прибавки: фиксированные плюс уже выбранные */
+  const totals = computed(() =>
+    sumSpeciesAbilityIncreases(props.increases, props.state.featDataChoices),
   );
 
   /**
-   * Варианты для группы выбора: заданный автором набор или все характеристики,
-   * если набор не сужен.
+   * Фиксированные прибавки источника одной строкой: «+2 Телосложение».
    *
-   * @param groupIndex - номер группы выбора
+   * @param increase - повышение источника
    */
-  function optionsForGroup(groupIndex: number) {
-    const allowed = props.increases.choices[groupIndex]?.from;
+  function formatFixed(increase: SpeciesAbilityIncrease): string {
+    return Object.entries(increase.fixed)
+      .map(([ability, bonus]) => {
+        const label = isAbilityType(ability)
+          ? ABILITY_LABELS[ability]
+          : ability;
 
-    if (!allowed || allowed.length === 0) {
-      return ABILITY_OPTIONS;
-    }
-
-    return ABILITY_OPTIONS.filter((option) => allowed.includes(option.value));
-  }
-
-  /** Выбрана ли характеристика в этой группе. */
-  function isPicked(groupIndex: number, ability: AbilityType): boolean {
-    return (props.selections[groupIndex] ?? []).includes(ability);
+        return `+${bonus} ${label}`;
+      })
+      .join(', ');
   }
 
   /**
-   * Нельзя ли ещё выбирать в этой группе: набрано нужное количество, а эта
-   * характеристика не выбрана.
+   * Выбранные характеристики группы.
+   *
+   * @param increase - повышение источника с выбором
+   * @param choice - выбор прибавки
    */
-  function isLocked(groupIndex: number, ability: AbilityType): boolean {
-    const choice = props.increases.choices[groupIndex];
-    const picked = props.selections[groupIndex] ?? [];
-
-    return !!choice && picked.length >= choice.count && !picked.includes(ability);
+  function chosenAbilities(
+    increase: SpeciesAbilityIncrease,
+    choice: SpeciesAbilityIncreaseChoice,
+  ): string[] {
+    return props.state.featDataChoices[increase.sourceKey]?.[choice.key] ?? [];
   }
 
   /**
-   * Переключает характеристику в группе выбора.
+   * Отмечает или снимает характеристику в группе выбора. Сверх положенного
+   * числа отметить нельзя — сначала снимите одну из выбранных.
    *
-   * @param groupIndex - номер группы
+   * @param increase - повышение источника с выбором
+   * @param choice - выбор прибавки
    * @param ability - характеристика
    */
-  function togglePick(groupIndex: number, ability: AbilityType): void {
-    const choice = props.increases.choices[groupIndex];
+  function toggleAbility(
+    increase: SpeciesAbilityIncrease,
+    choice: SpeciesAbilityIncreaseChoice,
+    ability: AbilityType,
+  ): void {
+    const chosen = chosenAbilities(increase, choice);
 
-    if (!choice) {
+    let next: string[];
+
+    if (chosen.includes(ability)) {
+      next = chosen.filter((value) => value !== ability);
+    } else if (chosen.length < choice.count) {
+      next = [...chosen, ability];
+    } else {
       return;
     }
 
-    const picked = props.selections[groupIndex] ?? [];
-
-    const next = picked.includes(ability)
-      ? picked.filter((entry) => entry !== ability)
-      : [...picked, ability];
-
-    if (next.length > choice.count) {
-      return;
-    }
-
-    emit('update:selections', { ...props.selections, [groupIndex]: next });
+    emit('update:state', {
+      ...props.state,
+      featDataChoices: {
+        ...props.state.featDataChoices,
+        [increase.sourceKey]: {
+          ...props.state.featDataChoices[increase.sourceKey],
+          [choice.key]: next,
+        },
+      },
+    });
   }
 </script>
 
 <template>
-  <div class="space-y-4">
-    <div
-      v-if="fixedRows.length > 0"
-      class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5"
-    >
-      <span
-        class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-        >Даёт вид</span
-      >
+  <div class="space-y-3">
+    <span class="mb-2 block text-sm font-medium text-toned">
+      {{ WIZARD_ASI_LABELS.title }}
+    </span>
 
-      <div class="mt-1.5 flex flex-wrap gap-1.5">
-        <UBadge
-          v-for="row in fixedRows"
-          :key="row.label"
-          variant="subtle"
-          color="neutral"
-          size="sm"
+    <p class="text-sm text-muted">
+      {{ SPECIES_WIZARD_LABELS.abilitiesHint }}
+    </p>
+
+    <div
+      v-for="increase in increases"
+      :key="increase.sourceKey"
+      class="space-y-2 rounded-md border border-default/50 bg-elevated/30 px-3 py-2"
+    >
+      <div class="flex items-baseline justify-between gap-2">
+        <span class="text-sm font-medium text-highlighted">
+          {{ increase.sourceName }}
+        </span>
+
+        <span
+          v-if="Object.keys(increase.fixed).length > 0"
+          class="text-sm font-bold text-healing"
         >
-          {{ row.label }} +{{ row.bonus }}
-        </UBadge>
+          {{ formatFixed(increase) }}
+        </span>
       </div>
+
+      <template v-if="increase.choice">
+        <div class="flex items-center justify-between">
+          <span class="text-sm text-muted">
+            {{ SPECIES_WIZARD_LABELS.abilitiesChoicePrefix }}+{{
+              increase.choice.amount
+            }}
+          </span>
+
+          <span
+            class="text-sm font-bold"
+            :class="
+              chosenAbilities(increase, increase.choice).length
+              < increase.choice.count
+                ? 'text-warning'
+                : 'text-healing'
+            "
+          >
+            {{ SPECIES_WIZARD_LABELS.abilitiesChosenPrefix
+            }}{{ chosenAbilities(increase, increase.choice).length
+            }}{{ SPECIES_WIZARD_LABELS.abilitiesChosenOf
+            }}{{ increase.choice.count }}
+          </span>
+        </div>
+
+        <div class="flex flex-wrap gap-2">
+          <UButton
+            v-for="ability in increase.choice.from"
+            :key="ability"
+            size="sm"
+            :color="
+              chosenAbilities(increase, increase.choice).includes(ability)
+                ? 'primary'
+                : 'neutral'
+            "
+            :variant="
+              chosenAbilities(increase, increase.choice).includes(ability)
+                ? 'solid'
+                : 'outline'
+            "
+            :disabled="
+              !chosenAbilities(increase, increase.choice).includes(ability)
+              && chosenAbilities(increase, increase.choice).length
+                >= increase.choice.count
+            "
+            @click.left.exact.prevent="
+              toggleAbility(increase, increase.choice, ability)
+            "
+          >
+            {{ ABILITY_LABELS[ability] }}
+          </UButton>
+        </div>
+      </template>
     </div>
 
-    <div
-      v-for="(choice, groupIndex) in increases.choices"
-      :key="groupIndex"
-      class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5"
-    >
-      <span
-        class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+    <!-- Итог по всем характеристикам -->
+    <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+      <div
+        v-for="{ value: ability } in ABILITY_OPTIONS"
+        :key="ability"
+        class="flex items-baseline gap-1.5 rounded-md border border-default/50 bg-elevated/30 px-2.5 py-1.5"
       >
-        Выберите {{ choice.count }} — по +{{ choice.amount }}
-      </span>
+        <span class="truncate text-base font-medium text-toned">
+          {{ ABILITY_LABELS[ability] }}
+        </span>
 
-      <div class="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3">
-        <UButton
-          v-for="option in optionsForGroup(groupIndex)"
-          :key="option.value"
-          size="sm"
-          :color="isPicked(groupIndex, option.value) ? 'primary' : 'neutral'"
-          :variant="isPicked(groupIndex, option.value) ? 'solid' : 'subtle'"
-          :disabled="isLocked(groupIndex, option.value)"
-          @click.left.exact.prevent="togglePick(groupIndex, option.value)"
-        >
-          {{ option.label }}
-        </UButton>
+        <span class="text-base font-bold text-highlighted">
+          {{ currentAbilities[ability] ?? 10 }}
+        </span>
+
+        <template v-if="(totals[ability] ?? 0) !== 0">
+          <span class="text-base text-dimmed">→</span>
+
+          <span class="text-base font-bold text-healing">
+            {{ (currentAbilities[ability] ?? 10) + (totals[ability] ?? 0) }}
+          </span>
+        </template>
       </div>
     </div>
   </div>

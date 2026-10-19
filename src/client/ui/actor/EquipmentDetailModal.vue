@@ -1,11 +1,18 @@
 <script setup lang="ts">
-  import type { GameItem } from '@vtt/shared/system/dnd.js';
+  import type { DnDGameItem } from '@vtt/shared/system/dnd.js';
 
   import { computed } from 'vue';
 
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
 
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import {
+    COPY_TO_ITEMS_LABEL,
+    EQUIPMENT_DETAIL_LABELS,
+    EQUIPMENT_FORM_LABELS,
+    FORM_FIELD_LABELS,
+    ITEM_FORM_LABELS,
+  } from './constants';
   import ItemCostWeightRarity from './ItemCostWeightRarity.vue';
   import ItemDetailModalShell from './ItemDetailModalShell.vue';
   import ItemDetailTabs from './ItemDetailTabs.vue';
@@ -16,7 +23,7 @@
     /** Открыто ли модальное окно */
     open: boolean;
     /** Доспех для отображения */
-    item: GameItem | null;
+    item: DnDGameItem | null;
     /** Z-index модалки (управляется родителем) */
     zIndex?: number;
     /** Смещение позиции для каскадного расположения */
@@ -103,49 +110,45 @@
       props.item?.maxDexBonus === null
       || props.item?.maxDexBonus === undefined
     ) {
-      return '+ мод. Ловкости';
+      return EQUIPMENT_DETAIL_LABELS.dexBonus;
     }
 
     if (props.item.maxDexBonus === 0) {
       return '';
     }
 
-    return `+ мод. Ловкости (макс. ${props.item.maxDexBonus})`;
+    return `${EQUIPMENT_DETAIL_LABELS.dexBonusCappedPrefix}${props.item.maxDexBonus}${EQUIPMENT_DETAIL_LABELS.dexBonusCappedSuffix}`;
   });
 
   /** Конфигурация свойств экипировки */
   const ARMOR_PROPERTY_CONFIG = [
     {
       key: 'adamantine',
-      label: 'Адамантиновое',
+      label: EQUIPMENT_DETAIL_LABELS.adamantine,
       color: 'info' as const,
-      description:
-        'Критическое попадание по владельцу этого снаряжения считается обычным попаданием.',
-      check: (item: GameItem) => Boolean(item.isAdamantine),
+      description: EQUIPMENT_DETAIL_LABELS.adamantineHint,
+      check: (item: DnDGameItem) => Boolean(item.isAdamantine),
     },
     {
       key: 'magical',
-      label: 'Магическое',
+      label: EQUIPMENT_DETAIL_LABELS.magical,
       color: 'primary' as const,
-      description:
-        'Снаряжение обладает магическими свойствами, которые могут давать бонус к КД или иные эффекты.',
-      check: (item: GameItem) => Boolean(item.isMagical),
+      description: EQUIPMENT_DETAIL_LABELS.magicalHint,
+      check: (item: DnDGameItem) => Boolean(item.isMagical),
     },
     {
       key: 'stealth-disadvantage',
-      label: 'Помеха Скрытности',
+      label: EQUIPMENT_DETAIL_LABELS.stealthDisadvantage,
       color: 'error' as const,
-      description:
-        'Владелец совершает проверки Скрытности (Ловкость) с помехой.',
-      check: (item: GameItem) => Boolean(item.stealthDisadvantage),
+      description: EQUIPMENT_DETAIL_LABELS.stealthDisadvantageHint,
+      check: (item: DnDGameItem) => Boolean(item.stealthDisadvantage),
     },
     {
       key: 'focus',
-      label: 'Фокусирующее',
+      label: EQUIPMENT_DETAIL_LABELS.focus,
       color: 'warning' as const,
-      description:
-        'Может использоваться как магическая фокусировка для заклинаний.',
-      check: (item: GameItem) => Boolean(item.isFocus),
+      description: EQUIPMENT_DETAIL_LABELS.focusHint,
+      check: (item: DnDGameItem) => Boolean(item.isFocus),
     },
   ];
 
@@ -164,16 +167,18 @@
 <template>
   <ItemDetailModalShell
     :open="open"
-    :title="item?.name ?? 'Снаряжение'"
+    :title="item?.name ?? EQUIPMENT_DETAIL_LABELS.fallbackTitle"
     :subtitle="item?.nameEn || undefined"
     :source-key="item?.sourceKey"
+    :source="item?.source"
     :is-srd="item?.isSRD"
+    :automation="item?.automation"
     card-type="equipment"
     :chat-payload="chatPayload"
     :z-index="zIndex"
     :position-offset="positionOffset"
     :show-copy-button="showCopyButton"
-    copy-tooltip="Скопировать в предметы"
+    :copy-tooltip="COPY_TO_ITEMS_LABEL"
     @update:open="emit('update:open', $event)"
     @copy="emit('copy')"
     @bring-to-front="emit('bring-to-front')"
@@ -188,7 +193,9 @@
               <div class="grid grid-cols-2 gap-3 text-sm">
                 <!-- КД -->
                 <div v-if="displayAC">
-                  <span class="text-xs text-dimmed">Класс доспеха</span>
+                  <span class="text-xs text-dimmed">
+                    {{ EQUIPMENT_DETAIL_LABELS.armorClass }}
+                  </span>
 
                   <p class="text-highlighted">
                     <span class="font-mono text-lg font-bold text-info-muted">
@@ -206,7 +213,9 @@
 
                 <!-- Тип экипировки -->
                 <div v-if="item.equipmentCategory">
-                  <span class="text-xs text-dimmed">Тип экипировки</span>
+                  <span class="text-xs text-dimmed">
+                    {{ EQUIPMENT_FORM_LABELS.category }}
+                  </span>
 
                   <p class="text-highlighted">
                     {{
@@ -218,7 +227,9 @@
 
                 <!-- Базовый тип -->
                 <div v-if="item.baseType">
-                  <span class="text-xs text-dimmed">Базовый тип</span>
+                  <span class="text-xs text-dimmed">
+                    {{ ITEM_FORM_LABELS.baseType }}
+                  </span>
 
                   <p class="text-highlighted">
                     {{ armorBaseTypeMap.get(item.baseType) ?? item.baseType }}
@@ -231,7 +242,9 @@
                     item.strengthRequirement && item.strengthRequirement > 0
                   "
                 >
-                  <span class="text-xs text-dimmed">Требование Силы</span>
+                  <span class="text-xs text-dimmed">
+                    {{ EQUIPMENT_FORM_LABELS.strengthRequirement }}
+                  </span>
 
                   <p class="text-highlighted">
                     {{ item.strengthRequirement }}+
@@ -248,7 +261,7 @@
               <span
                 class="mb-1.5 block text-xs font-semibold tracking-wider text-dimmed uppercase"
               >
-                Описание
+                {{ FORM_FIELD_LABELS.description }}
               </span>
 
               <ItemDescriptionRenderer :content="item.description" />
@@ -265,7 +278,10 @@
 
         <!-- Вкладка «Эффекты» — только просмотр -->
         <template #effects>
-          <ItemEffectsView :effects="item.activeEffects ?? []" />
+          <ItemEffectsView
+            :effects="item.activeEffects ?? []"
+            :owner-name="item.name"
+          />
         </template>
       </ItemDetailTabs>
     </template>

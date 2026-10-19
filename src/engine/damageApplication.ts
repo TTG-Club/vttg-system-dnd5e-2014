@@ -8,20 +8,56 @@
  * `applyDamageToEntity` / `applyEffectsToEntity` / `getEntityArmorClass` /
  * `getEntityActiveFlags`. Стор отвечает лишь за выбор цели и WS-отправку.
  *
+ * Здесь же живёт БОЕВОЕ СОСТОЯНИЕ — `pickCombatState` / `applyCombatState`:
+ * пара, которой ядро переносит исход боя на чужую цель узким каналом
+ * `entity:apply-combat-state` вместо полной замены сущности.
+ *
  * @module system/dnd/damageApplication
  */
 
+import type { DamagePart, DefensibleDamageType } from '@vtt/shared';
+
 import type { ActiveEffect, EffectOrigin } from './activeEffectTypes.js';
-import type { ConditionKey } from './consts.js';
-import type { DamageApplyResult, DamageDefenseOutcome } from './damageUtils.js';
+import type { EffectChanges } from './combatEffectChanges.js';
+import type { DamageHit } from './damageHits.js';
+import type {
+  DamageDefenseOutcome,
+  DamageDefenses,
+  DndDamageApplyResult,
+} from './damageUtils.js';
 import type { DnDSceneEntity } from './dndEntities.js';
 import type { IncomingAttackContext } from './effectPipeline.js';
+import type {
+  EffectTriggerUsageLedger,
+  TriggerUsageChanges,
+} from './effectTriggerUsage.js';
 
-import { isActorEntity, isCreatureEntity } from '@vtt/shared';
-import { generateId } from '@vtt/shared';
-import { buildConditionActiveEffect } from './conditionTemplates.js';
-import { CONDITIONS } from './consts.js';
-import { applyDamageDefenses, applyHpChange } from './damageUtils.js';
+import { generateId, isRecord } from '@vtt/shared';
+
+import { ActiveEffectsArraySchema } from './activeEffectTypes.js';
+import {
+  applyEffectChanges,
+  diffEffects,
+  EffectChangesSchema,
+  readCombatBaseline,
+} from './combatEffectChanges.js';
+import {
+  buildConditionActiveEffect,
+  resolveEffectConditionKey,
+} from './conditionTemplates.js';
+import {
+  parseDamageHitDetails,
+  parseDamageHits,
+  readDamageHits,
+  recordDamageHit,
+} from './damageHits.js';
+import {
+  applyDamageDefenses,
+  applyHpChange,
+  withoutIgnoredResistances,
+} from './damageUtils.js';
+import { cloneEntityData } from './dataClone.js';
+import { rollDamageFormula } from './diceFormula.js';
 import {
   isImmuneToCondition,
   mergeAppliedEffects,
@@ -32,39 +68,82 @@ import {
   getEntityConditionImmunities,
   resolveActorStats,
 } from './effectPipeline.js';
+import {
+  applyTriggerUsageChanges,
+  diffTriggerUsage,
+  hasTriggerUsageChanges,
+  parseTriggerUsage,
+  readTriggerUsage,
+  TriggerUsageChangesSchema,
+  writeTriggerUsage,
+} from './effectTriggerUsage.js';
+import { stripDamageTypeTokens } from './formulaTokens.js';
+import { limitEntityHealing } from './healingLimits.js';
+import {
+  isEntityHpShownToPlayers,
+  resolveEntityCurrentHp,
+  resolveEntityMaxHp,
+  resolveEntityTempHp,
+  writeEntityHitPoints,
+} from './hitPoints.js';
+import { buildResolvedFormulaContext } from './resolvedFormulaContext.js';
 import { withInitializedDuration } from './turnEffects.js';
 
+/** Флаг «защиты от урона не действуют» */
+export const DEFENSES_SUPPRESSED_FLAG = 'defense.suppressAll';
+
+/** Флаг «сопротивления урону не действуют» — иммунитеты остаются */
+export const RESISTANCES_SUPPRESSED_FLAG = 'defense.suppressResistances';
+
+/** Защиты снятого флагом существа: ни сопротивлений, ни иммунитетов */
+const NO_DAMAGE_DEFENSES: DamageDefenses = {
+  resistances: new Set(),
+  immunities: new Set(),
+  vulnerabilities: new Set(),
+};
+
 /**
- * Опознаёт ключ состояния эффекта: по явному `conditionKey` либо по совпадению
- * `id`/имени с записью состояния (легаси-данные без `conditionKey`).
+ * Защиты цели от урона без сопротивлений, которые игнорирует урон атакующего
+ * («Сила могилы»).
  *
- * @param effect - эффект
- * @returns ключ состояния или `undefined`, если эффект не является состоянием
+ * @param entity - цель
+ * @param ignoredResistances - типы урона, чьё сопротивление не действует; нет —
+ *   действуют все
+ * @returns защиты цели
  */
-function resolveEffectConditionKey(
-  effect: ActiveEffect,
-): ConditionKey | undefined {
-  if (effect.conditionKey) {
-    return effect.conditionKey;
+export function resolveTargetDamageDefenses(
+  entity: DnDSceneEntity,
+  ignoredResistances: readonly string[] | undefined,
+): DamageDefenses {
+  const stats = resolveActorStats(entity);
+
+  // «Защиты не действуют» («Изгоняющая кара»): сопротивления и иммунитеты цели
+  // сняты целиком, а не по одному типу
+  if (stats.activeFlags.has(DEFENSES_SUPPRESSED_FLAG)) {
+    return NO_DAMAGE_DEFENSES;
   }
 
-  const entry = CONDITIONS.find(
-    (conditionEntry) =>
-      conditionEntry.key === effect.id
-      || conditionEntry.nameRu === effect.name
-      || conditionEntry.nameEn === effect.name,
-  );
+  // «Теряет все сопротивления урону» («Увядающая кара»): иммунитеты и
+  // уязвимости остаются
+  const defenses = stats.activeFlags.has(RESISTANCES_SUPPRESSED_FLAG)
+    ? { ...stats.damageDefenses, resistances: new Set<DefensibleDamageType>() }
+    : stats.damageDefenses;
 
-  return entry?.key;
+  return withoutIgnoredResistances(defenses, ignoredResistances);
 }
 
 /**
  * Строит `ActiveEffect` для наложения на цель.
  *
- * Если эффект опознан как состояние D&D 5e — собирает полноценный
- * condition-эффект через общий хелпер `buildConditionActiveEffect`, СОХРАНЯЯ
- * авторскую длительность и цель применения (а не хардкодя «постоянно»).
- * Иначе — копирует эффект как есть с переданным `origin`.
+ * Эффект, опознанный как состояние D&D 5e, получает источник `condition` и
+ * ключ состояния — по ним лист и значок на токене узнают состояние. Нагрузка
+ * при этом берётся у АВТОРА эффекта: имя, модификаторы, флаги, повторный
+ * спасбросок и снятие после атаки. Раньше состояние пересобиралось из шаблона
+ * целиком, и «Отравлен с −2 к КД и спасброском в конце хода» ложился на цель
+ * голым «Отравлен». Из шаблона собирается только заготовка — эффект, у которого
+ * нет ни модификаторов, ни флагов (узнан по одному имени).
+ *
+ * Длительность и цель применения всегда авторские.
  *
  * @param effect - исходный эффект из действия/оружия
  * @param fallbackOrigin - origin для не-condition эффектов
@@ -89,70 +168,34 @@ function buildEffectForTarget(
     effectTarget: effect.effectTarget,
   });
 
-  return withInitializedDuration(
-    conditionEffect ?? {
+  if (!conditionEffect) {
+    return withInitializedDuration({
       ...effect,
       id: generateId('effect'),
       origin: fallbackOrigin,
-    },
-  );
-}
-
-/**
- * Извлекает текущие ХП из сущности (актор или существо).
- * У обоих типов HP хранятся в `system.hitPoints.current`.
- *
- * @param entity - сущность (актор или существо)
- * @returns текущие ХП
- */
-function getEntityCurrentHp(entity: DnDSceneEntity): number {
-  if (isCreatureEntity(entity)) {
-    return entity.system.hitPoints.current ?? 0;
+    });
   }
 
-  return entity.system.hitPoints.current;
-}
+  const hasAuthorPayload = effect.changes.length > 0 || effect.flags.length > 0;
 
-/**
- * Извлекает максимальные ХП из сущности (актор или существо).
- *
- * @param entity - сущность (актор или существо)
- * @returns максимальные ХП
- */
-function getEntityMaxHp(entity: DnDSceneEntity): number {
-  if (isCreatureEntity(entity)) {
-    return entity.system.hitPoints.max ?? 0;
-  }
-
-  return entity.system.hitPoints.max;
-}
-
-/**
- * Устанавливает текущие ХП для сущности (мутация).
- *
- * @param entity - сущность (актор или существо)
- * @param hp - новое значение текущих ХП
- */
-function setEntityCurrentHp(entity: DnDSceneEntity, hp: number): void {
-  if (isCreatureEntity(entity)) {
-    entity.system.hitPoints.current = hp;
-  } else if (isActorEntity(entity)) {
-    entity.system.hitPoints.current = hp;
-  }
-}
-
-/**
- * Устанавливает временные ХП для сущности (мутация).
- *
- * @param entity - сущность (актор или существо)
- * @param temp - новое значение временных ХП
- */
-function setEntityTempHp(entity: DnDSceneEntity, temp: number): void {
-  if (isCreatureEntity(entity)) {
-    entity.system.hitPoints.temp = temp;
-  } else if (isActorEntity(entity)) {
-    entity.system.hitPoints.temp = temp;
-  }
+  // Остальные поля автора (повторный спасбросок, урон каждый ход, снятие после
+  // атаки) переживают и заготовку: шаблон их не знает
+  return withInitializedDuration({
+    ...effect,
+    id: conditionEffect.id,
+    origin: conditionEffect.origin,
+    conditionKey,
+    description: effect.description || conditionEffect.description,
+    icon: effect.icon ?? conditionEffect.icon,
+    changes: hasAuthorPayload ? effect.changes : conditionEffect.changes,
+    flags: hasAuthorPayload ? effect.flags : conditionEffect.flags,
+    conditionImmunities:
+      effect.conditionImmunities ?? conditionEffect.conditionImmunities,
+    exhaustionLevel: effect.exhaustionLevel ?? conditionEffect.exhaustionLevel,
+    // Автор выхода не описал — действует выход самого состояния: из захвата
+    // вырываются по правилам, чем бы его ни наложили
+    escape: effect.escape ?? conditionEffect.escape,
+  });
 }
 
 /**
@@ -160,10 +203,14 @@ function setEntityTempHp(entity: DnDSceneEntity, temp: number): void {
  * (иммунитет/сопротивление/уязвимость) и правила временных ХП (урон снимает temp
  * первым, лечение их не трогает). Возвращает сводку изменения для UI/чата.
  *
+ * Урон записывается ударом в сущность (`recordDamageHit`): боевой снимок
+ * увезёт его на сервер, и там сработают «получил урон» и «хиты упали до 0».
+ *
  * @param entity - сущность-цель (обычно глубокая копия для безопасной WS-отправки)
  * @param amount - величина изменения ХП (положительное число)
  * @param isHealing - true = лечение (прибавить), false = урон (вычесть)
  * @param damageType - тип урона (для проверки защит); только для урона
+ * @param details - подробности удара от вызывающего: крит, кто бил
  * @returns сводка результата применения
  */
 export function applyTargetDamage(
@@ -171,28 +218,38 @@ export function applyTargetDamage(
   amount: number,
   isHealing: boolean,
   damageType?: string,
-): DamageApplyResult {
-  const hpBefore = getEntityCurrentHp(entity);
-  const maxHp = getEntityMaxHp(entity);
+  details?: unknown,
+): DndDamageApplyResult {
+  const hpBefore = resolveEntityCurrentHp(entity);
+  const maxHp = resolveEntityMaxHp(entity);
 
   let finalAmount = amount;
   let defenseOutcome: DamageDefenseOutcome = 'normal';
 
+  // Запрет лечения: «не может восстанавливать хиты»
+  if (isHealing) {
+    finalAmount = limitEntityHealing(entity, {
+      hitPoints: amount,
+      temporary: 0,
+    }).hitPoints;
+  }
+
   // Учитываем защиты цели: иммунитет (урон 0), сопротивление (½), уязвимость (×2)
   if (!isHealing && damageType) {
-    const stats = resolveActorStats(entity);
-
     const defenseResult = applyDamageDefenses(
       amount,
       damageType,
-      stats.damageDefenses,
+      resolveTargetDamageDefenses(
+        entity,
+        parseDamageHitDetails(details).ignoredResistances,
+      ),
     );
 
     finalAmount = defenseResult.finalDamage;
     defenseOutcome = defenseResult.outcome;
   }
 
-  const tempBefore = entity.system.hitPoints.temp ?? 0;
+  const tempBefore = resolveEntityTempHp(entity);
 
   // Урон сначала снимает временные ХП (правило 5e), лечение их не трогает
   const hpChange = applyHpChange({
@@ -203,8 +260,24 @@ export function applyTargetDamage(
     heal: isHealing ? finalAmount : 0,
   });
 
-  setEntityCurrentHp(entity, hpChange.hpAfter);
-  setEntityTempHp(entity, hpChange.tempAfter);
+  writeEntityHitPoints(entity, {
+    current: hpChange.hpAfter,
+    temp: hpChange.tempAfter,
+  });
+
+  if (!isHealing) {
+    const { critical, sourceId } = parseDamageHitDetails(details);
+
+    recordDamageHit(entity, {
+      amount: hpBefore + tempBefore - hpChange.hpAfter - hpChange.tempAfter,
+      // Урон по хитам без того, что сняли временные: на нуле хитов потеря
+      // ноль, а спасброски от смерти считают удар
+      dealt: finalAmount - (tempBefore - hpChange.tempAfter),
+      types: damageType ? [damageType] : [],
+      critical,
+      sourceId,
+    });
+  }
 
   return {
     actorName: entity.name,
@@ -212,6 +285,14 @@ export function applyTargetDamage(
     hpAfter: hpChange.hpAfter,
     tempAbsorbed: hpChange.tempAbsorbed,
     defenseOutcome,
+    ...(isHealing ? {} : { damageDealt: Math.max(0, finalAmount) }),
+    hpChange: {
+      hpBefore,
+      hpAfter: hpChange.hpAfter,
+      tempBefore,
+      tempAfter: hpChange.tempAfter,
+      isPublic: isEntityHpShownToPlayers(entity),
+    },
   };
 }
 
@@ -238,13 +319,20 @@ export function applyEffectsToEntity(
   // состояниям эффект не накладывается.
   const conditionImmunities = getEntityConditionImmunities(entity);
 
-  // Иммунные состояния отсеиваем
+  // Иммунные состояния отсеиваем. Иммунитет «только от существ этих типов»
+  // считается по тому, кто накладывает, — у каждого эффекта он свой
   const applicableEffects = effects.filter((effect) => {
     const conditionKey = resolveEffectConditionKey(effect);
 
-    return !(
-      conditionKey && isImmuneToCondition(conditionImmunities, conditionKey)
-    );
+    if (!conditionKey) {
+      return true;
+    }
+
+    const immunities = effect.sourceCreatureType
+      ? getEntityConditionImmunities(entity, [], effect.sourceCreatureType)
+      : conditionImmunities;
+
+    return !isImmuneToCondition(immunities, conditionKey);
   });
 
   // Один и тот же статус не стакается: повтор ЗАМЕНЯЕТ прежний (5e 2024);
@@ -253,6 +341,299 @@ export function applyEffectsToEntity(
     existing,
     applicableEffects.map((effect) => buildEffectForTarget(effect, origin)),
   );
+}
+
+/**
+ * Боевое состояние цели D&D 5e — единственное, что участник боя вправе изменить
+ * у ЧУЖОЙ сущности: очки здоровья (текущие и временные) и активные эффекты.
+ *
+ * Максимум ХП, характеристики, инвентарь, владелец и прочий лист в снимок НЕ
+ * входят и каналом `entity:apply-combat-state` недосягаемы — на этом держится
+ * его безопасность.
+ */
+export interface DndCombatState {
+  /** Текущие очки здоровья после применения исхода боя */
+  hpCurrent: number;
+  /** Временные очки здоровья после применения исхода боя */
+  hpTemp: number;
+  /**
+   * Полный список активных эффектов цели после применения исхода боя.
+   * Остаётся обязательным: старый сервер разницу не знает и берёт его
+   */
+  activeEffects: ActiveEffect[];
+  /**
+   * Разница эффектов относительно копии, от которой клиент считал снимок.
+   * Есть поле — сервер сливает её со СВОИМ списком, а `activeEffects` не
+   * берёт: конец каста, снявший эффекты после копии, иначе откатился бы.
+   * Нет поля (старый клиент, копия без основы) — полная замена, как раньше.
+   */
+  effectChanges?: EffectChanges;
+  /**
+   * Счётчики лимитов срабатываний («не чаще раза в ход») целиком. Остаётся
+   * для старого сервера: разницу журнала он не знает. Нет поля — счётчики не
+   * трогаются.
+   */
+  effectUsage?: EffectTriggerUsageLedger;
+  /**
+   * Разница журнала относительно копии: расход приращением, сброс снятием
+   * ключа. Есть поле — сервер сливает его со СВОИМ журналом, а `effectUsage`
+   * не берёт: расход «раз в ход», записанный после копии, иначе откатился бы
+   * и лимит сработал бы второй раз. Нет поля — полная замена, как раньше.
+   */
+  effectUsageChanges?: TriggerUsageChanges;
+  /**
+   * Удары, от которых изменились хиты: по ним сервер прогоняет «получил урон»
+   * и «хиты упали до 0». Нет поля — событий урона нет (отмена, правка хитов).
+   */
+  damage?: DamageHit[];
+}
+
+/**
+ * Меняет ли копия хоть что-нибудь в боевом состоянии относительно основы:
+ * хиты, эффекты, журнал срабатываний либо удар с потерей хитов (удар по
+ * лежащему на нуле хиты не меняет, но двигает спасброски от смерти).
+ *
+ * Тот же перечень, по которому сервер решает, принять ли снимок
+ * ({@link writeCombatState}): снимок без изменений он не записывает и отвечает
+ * `'unchanged'`. Такой снимок клиент не шлёт вовсе — незачем гонять по сети
+ * то, что ничего не меняет.
+ *
+ * @param base - сущность, от которой считали копию
+ * @param next - копия после действия
+ * @returns `false`, если снимку нечего нести
+ */
+export function changesCombatState(
+  base: DnDSceneEntity,
+  next: DnDSceneEntity,
+): boolean {
+  const effectChanges = diffEffects(
+    base.activeEffects ?? [],
+    next.activeEffects ?? [],
+  );
+
+  return (
+    resolveEntityCurrentHp(next) !== resolveEntityCurrentHp(base)
+    || resolveEntityTempHp(next) !== resolveEntityTempHp(base)
+    || effectChanges.add.length > 0
+    || effectChanges.update.length > 0
+    || effectChanges.removeIds.length > 0
+    || hasTriggerUsageChanges(
+      diffTriggerUsage(readTriggerUsage(base), readTriggerUsage(next)),
+    )
+    || readDamageHits(next).some((hit) => (hit.dealt ?? 0) > 0)
+  );
+}
+
+/**
+ * Снимает с сущности её боевое состояние для отправки на сервер.
+ *
+ * @param entity - сущность-цель с уже применённым исходом боя
+ * @returns снимок боевого состояния
+ */
+export function pickCombatState(entity: DnDSceneEntity): DndCombatState {
+  const damage = readDamageHits(entity);
+  const activeEffects = entity.activeEffects ?? [];
+  const baseline = readCombatBaseline(entity);
+
+  return {
+    hpCurrent: resolveEntityCurrentHp(entity),
+    hpTemp: resolveEntityTempHp(entity),
+    activeEffects,
+    // Разница журнала — всегда, когда есть основа, даже пустая: без неё
+    // сервер взял бы журнал копии целиком
+    ...(baseline === undefined
+      ? {}
+      : {
+          effectChanges: diffEffects(baseline.activeEffects, activeEffects),
+          effectUsageChanges: diffTriggerUsage(
+            baseline.effectUsage,
+            readTriggerUsage(entity),
+          ),
+        }),
+    ...(entity.system.effectUsage === undefined
+      ? {}
+      : { effectUsage: entity.system.effectUsage }),
+    ...(damage.length > 0 ? { damage: [...damage] } : {}),
+  };
+}
+
+/**
+ * Чем кончилась запись боевого снимка. «Менять нечего» и «снимок негоден»
+ * различаются: первое — штатный случай (удар по цели с нулём хитов), о
+ * втором ядро предупреждает в журнале.
+ */
+export type CombatStateWrite = 'applied' | 'unchanged' | 'invalid';
+
+/**
+ * Записывает боевое состояние в сущность на сервере, мутируя её.
+ *
+ * Снимок пришёл от клиента, поэтому доверия ему нет: ХП проходят через границы
+ * СЕРВЕРНОЙ сущности (максимум ХП каналом не меняется, значит лечением за предел
+ * не выйти и отрицательных хитов не выставить), а эффекты — через ту же
+ * Zod-схему, что и обычное сохранение актёра.
+ *
+ * @param entity - сущность-цель из состояния мира (мутируется)
+ * @param state - снимок боевого состояния от клиента
+ * @returns `'applied'` — снимок записан; `'unchanged'` — форма верная, но
+ *   менять нечего; `'invalid'` — снимок негоден
+ */
+export function writeCombatState(
+  entity: DnDSceneEntity,
+  state: unknown,
+): CombatStateWrite {
+  if (!isRecord(state)) {
+    return 'invalid';
+  }
+
+  const { hpCurrent, hpTemp, activeEffects, effectUsage } = state;
+
+  if (typeof hpCurrent !== 'number' || !Number.isFinite(hpCurrent)) {
+    return 'invalid';
+  }
+
+  if (typeof hpTemp !== 'number' || !Number.isFinite(hpTemp)) {
+    return 'invalid';
+  }
+
+  const parsedEffects = ActiveEffectsArraySchema.safeParse(activeEffects);
+
+  if (!parsedEffects.success) {
+    return 'invalid';
+  }
+
+  const nextHp = Math.max(
+    0,
+    Math.min(resolveEntityMaxHp(entity), Math.trunc(hpCurrent)),
+  );
+
+  const nextTemp = Math.max(0, Math.trunc(hpTemp));
+
+  const nextEffects = resolveNextEffects(
+    entity.activeEffects ?? [],
+    parsedEffects.data,
+    state.effectChanges,
+  );
+
+  // Негодная разница — снимок целиком отвергнут: полный список от копии
+  // клиента затёр бы то, что сервер изменил после неё
+  if (nextEffects === null) {
+    return 'invalid';
+  }
+
+  const nextUsage = resolveNextTriggerUsage(
+    readTriggerUsage(entity),
+    effectUsage,
+    state.effectUsageChanges,
+  );
+
+  // Негодная разница журнала — снимок отвергнут, как и с негодной разницей
+  // эффектов
+  if (nextUsage === null) {
+    return 'invalid';
+  }
+
+  const usageChanged =
+    nextUsage !== undefined
+    && JSON.stringify(readTriggerUsage(entity)) !== JSON.stringify(nextUsage);
+
+  // Удар по лежащему на нуле хитов ничего не меняет в хитах, но двигает
+  // серию спасбросков от смерти
+  const dealtOnly = parseDamageHits(state.damage).some(
+    (hit) => (hit.dealt ?? 0) > 0,
+  );
+
+  const changed =
+    dealtOnly
+    || nextHp !== resolveEntityCurrentHp(entity)
+    || nextTemp !== resolveEntityTempHp(entity)
+    || JSON.stringify(entity.activeEffects ?? [])
+      !== JSON.stringify(nextEffects)
+    || usageChanged;
+
+  if (!changed) {
+    return 'unchanged';
+  }
+
+  writeEntityHitPoints(entity, { current: nextHp, temp: nextTemp });
+  entity.activeEffects = nextEffects;
+
+  if (nextUsage !== undefined) {
+    writeTriggerUsage(entity, nextUsage);
+  }
+
+  return 'applied';
+}
+
+/**
+ * Записывает боевое состояние в сущность на сервере — как
+ * {@link writeCombatState}, но отвечает одним признаком: изменилась ли она.
+ *
+ * @param entity - сущность-цель из состояния мира (мутируется)
+ * @param state - снимок боевого состояния от клиента
+ * @returns true, если снимок принят и сущность изменилась
+ */
+export function applyCombatState(
+  entity: DnDSceneEntity,
+  state: unknown,
+): boolean {
+  return writeCombatState(entity, state) === 'applied';
+}
+
+/**
+ * Журнал срабатываний, который ляжет на сервере: разница от клиента, слитая с
+ * журналом сервера, либо (без разницы) журнал снимка целиком.
+ *
+ * @param current - журнал сущности на сервере
+ * @param fullLedger - поле `effectUsage` снимка
+ * @param rawChanges - поле `effectUsageChanges` снимка
+ * @returns новый журнал; `undefined` — журнал не трогается (старый клиент
+ *   его не прислал); `null` — разница негодна
+ */
+function resolveNextTriggerUsage(
+  current: EffectTriggerUsageLedger,
+  fullLedger: unknown,
+  rawChanges: unknown,
+): EffectTriggerUsageLedger | null | undefined {
+  if (rawChanges === undefined) {
+    // Счётчики целиком — только если клиент их прислал: снимок без поля не
+    // должен стирать счётчики сервера
+    return fullLedger === undefined ? undefined : parseTriggerUsage(fullLedger);
+  }
+
+  const parsedChanges = TriggerUsageChangesSchema.safeParse(rawChanges);
+
+  return parsedChanges.success
+    ? applyTriggerUsageChanges(current, parsedChanges.data)
+    : null;
+}
+
+/**
+ * Список эффектов, который ляжет на сервере: разница от клиента, слитая со
+ * списком сервера, либо (без разницы) полный список снимка.
+ *
+ * @param current - эффекты сущности на сервере
+ * @param fullList - полный список снимка, уже проверенный схемой
+ * @param rawChanges - поле `effectChanges` снимка
+ * @returns новый список; `null` — разница негодна или итог выходит за предел
+ */
+function resolveNextEffects(
+  current: readonly ActiveEffect[],
+  fullList: ActiveEffect[],
+  rawChanges: unknown,
+): ActiveEffect[] | null {
+  if (rawChanges === undefined) {
+    return fullList;
+  }
+
+  const parsedChanges = EffectChangesSchema.safeParse(rawChanges);
+
+  if (!parsedChanges.success) {
+    return null;
+  }
+
+  const merged = applyEffectChanges(current, parsedChanges.data);
+
+  return ActiveEffectsArraySchema.safeParse(merged).success ? merged : null;
 }
 
 /**
@@ -275,7 +656,11 @@ export function getEntityArmorClass(
   if (attackContext) {
     const effects = collectActiveEffects(entity);
 
-    totalAC += evaluateDefensiveACBonus(effects, attackContext);
+    totalAC += evaluateDefensiveACBonus(
+      effects,
+      attackContext,
+      buildResolvedFormulaContext(entity, { stats }),
+    );
   }
 
   return totalAC;
@@ -292,4 +677,43 @@ export function getEntityActiveFlags(
   entity: DnDSceneEntity,
 ): ReadonlySet<string> {
   return resolveActorStats(entity).activeFlags;
+}
+
+/** Сущность после урона частями и сколько хитов он снял на деле */
+export interface DamagedEntityCopy<Entity extends DnDSceneEntity> {
+  /** Копия сущности с нанесённым уроном */
+  entity: Entity;
+  /** Снято хитов после защит цели, вместе с временными */
+  dealt: number;
+}
+
+/**
+ * Бросает части урона и наносит их КОПИИ сущности: исходная не меняется.
+ * Нужна клиенту, которому нельзя править сущность мира на месте («урон за
+ * неудачную попытку вырваться»): копию увозит боевой снимок.
+ *
+ * @param entity - кто получает урон
+ * @param parts - части урона
+ * @returns копия с уроном и снятые хиты
+ */
+export function applyDamagePartsToCopy<Entity extends DnDSceneEntity>(
+  entity: Entity,
+  parts: readonly DamagePart[],
+): DamagedEntityCopy<Entity> {
+  const hurt = cloneEntityData(entity);
+
+  for (const part of parts) {
+    const rolled = rollDamageFormula(stripDamageTypeTokens(part.formula));
+
+    applyTargetDamage(hurt, Math.max(0, rolled.total), false, part.type);
+  }
+
+  return {
+    entity: hurt,
+    dealt:
+      resolveEntityCurrentHp(entity)
+      + resolveEntityTempHp(entity)
+      - resolveEntityCurrentHp(hurt)
+      - resolveEntityTempHp(hurt),
+  };
 }

@@ -1,28 +1,29 @@
 <script setup lang="ts">
   import type {
     AbilityType,
+    BaseCreature,
     ProficiencyLevel,
     SkillType,
     TypedWebSocketClient,
   } from '@vtt/shared';
-  import type { Creature, RestType, Spell } from '@vtt/shared/system/dnd.js';
+  import type {
+    AttackRollMode,
+    DnDCreature,
+    DnDCustomBonusContext,
+    DnDSavingThrowSettings,
+    DnDSkillSettings,
+    RestTriggerOptions,
+    RestType,
+    Spell,
+  } from '@vtt/shared/system/dnd.js';
+
+  import type { RollBonusEvaluator } from '../../composables/rollBonusEvaluator';
+  import type { ItemTransferResult } from '../../composables/useItemTransfer';
+  import type { SheetTabEntry } from '../actor/sheetTabsModel';
 
   import { useToast } from '@nuxt/ui/composables';
-  import { generateId } from '@vtt/shared';
-  import {
-    applyCreatureRest,
-    calculateAbilityModifier,
-    calculateSkillModifier,
-    CONDITIONS,
-    CR_TABLE,
-    CREATURE_ENVIRONMENTS,
-    DEFAULT_CREATURE,
-    getProficiencyContribution,
-    getSkillAbility,
-    normalizeCreature,
-    SKILLS_LABELS,
-  } from '@vtt/shared/system/dnd.js';
-  import { computed, ref, toRef, watch } from 'vue';
+  import { createReusableTemplate } from '@vueuse/core';
+  import { computed, ref, toRef, useTemplateRef, watch } from 'vue';
 
   import { generateEntityId, requireSocket } from '@/core/entityUtils';
   import FieldsetLabel from '@/shared_ui/components/FieldsetLabel.vue';
@@ -32,27 +33,125 @@
   import { useModalManager } from '@/shared_ui/composables/useModalManager';
   import { Z_INDEX } from '@/shared_ui/consts';
   import { useWorldStore } from '@/stores/worldStore';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+  import { generateId, isEntityOwner } from '@vtt/shared';
+  import {
+    applyCreatureRest,
+    calculateAbilityModifier,
+    CR_TABLE,
+    createInventoryItem,
+    CREATURE_ENVIRONMENTS,
+    CREATURE_HIT_DICE_RULE_KEYS,
+    CREATURE_SIZE_TO_TOKEN_SCALE,
+    DEFAULT_CREATURE,
+    DEFAULT_PROFICIENCY_BONUS,
+    ensureCreatureSpellsInBlocks,
+    formatVisionRange,
+    getActorAbilityModifiers,
+    getCreatureHitDiceBonusContext,
+    getCreatureProficiencyBonus,
+    getCustomBonusesValue,
+    getCustomSkillValue,
+    getEntityExhaustionLevel,
+    getProficiencyContribution,
+    getSkillCheckBonusKeys,
+    getSkillSetting,
+    getSkillSettingAbility,
+    isDndCreature,
+    isDndCreatureRecord,
+    isDnDGameItem,
+    isProficiencyLevel,
+    isSpell,
+    listConditions,
+    mergeEntityDraft,
+    normalizeCreature,
+    PASSIVE_SKILL_BASE,
+    resolveAbilityCheckRollMode,
+    resolveCreatureHitPointsByRules,
+    SKILLS_LIST,
+    syncCreatureSpellcastingUses,
+    withExhaustionLevel,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { runRestWithTriggers } from '../../composables/restTriggerPrompt';
+  import { buildRollBonusEvaluator } from '../../composables/rollBonusEvaluator';
+  import {
+    refuseWhileSheetEditing,
+    useSheetEditLock,
+  } from '../../composables/sheetEditLock';
+  import { useEntityDraftWrite } from '../../composables/useEntityDraftWrite';
+  import {
+    describeItemTransfer,
+    isItemTransferDrop,
+    useItemTransfer,
+  } from '../../composables/useItemTransfer';
   import { useResolvedStats } from '../../composables/useResolvedStats';
-  import { SPELL_MIME } from '../actor/constants';
+  import { useSheetLayout } from '../../composables/useSheetLayout';
+  import { useSheetMinimize } from '../../composables/useSheetMinimize';
+  import { useWorldSheetSync } from '../../composables/useWorldSheetSync';
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import {
+    ABILITY_CHECK_ROLL_LABELS,
+    CREATURE_SHEET_WIDE_MIN_WIDTH_REM,
+    DICE_ROLL_DEFAULT_BUTTON,
+    DRAG_OVER_RESET_DELAY_MS,
+    FEET_UNIT_LABEL,
+    FORM_FIELD_LABELS,
+    FORM_TAB_LABELS,
+    GAME_ITEM_MIME,
+    GAME_ITEM_TRANSFER_MIME,
+    GRANT_FIELD_LABELS,
+    GRANT_SECTION_LABELS,
+    MODAL_BUTTON_LABELS,
+    PROFICIENCY_MODAL_LABELS,
+    REST_LABELS,
+    SAVING_THROW_ABILITIES,
+    SAVING_THROW_ROLL_LABELS,
+    SAVING_THROW_SETTINGS_LABELS,
+    SHEET_BLOCK_VIEW_BORDER_CLASS,
+    SHEET_FRAME_CLASSES,
+    SHEET_MAIN_TAB_ID,
+    SHEET_TABS_LABELS,
+    SHEET_WINDOW_MIN_WIDTH,
+    SKILL_SETTINGS_LABELS,
+    SPELL_MIME,
+    UNSAVED_CHANGES_LABELS,
+  } from '../actor/constants';
+  import DiceRollModal from '../actor/DiceRollModal.vue';
+  import ExhaustionPanel from '../actor/ExhaustionPanel.vue';
   import LanguageProficiencyModal from '../actor/LanguageProficiencyModal.vue';
+  import SavingThrowSettingsModal from '../actor/SavingThrowSettingsModal.vue';
+  import SheetSettingsGear from '../actor/SheetSettingsGear.vue';
+  import SheetTabs from '../actor/SheetTabs.vue';
+  import SkillSettingsModal from '../actor/SkillSettingsModal.vue';
+  import { formatSignedNumber } from '../actor/utils/formatSignedNumber';
+  import { getSheetBlockClass } from '../actor/utils/sheetBlockClass';
+  import {
+    CREATURE_SHEET_DEFAULT_TAB_ID,
+    CREATURE_SHEET_LABELS,
+    CREATURE_SHEET_LAYOUT_CLASSES,
+    CREATURE_SHEET_LOG_PREFIX,
+  } from './constants';
   import CreatureAbilities from './CreatureAbilities.vue';
-  import CreatureActionsBlock from './CreatureActionsBlock.vue';
   import CreatureCombatBlock from './CreatureCombatBlock.vue';
   import CreatureConditionImmunitiesModal from './CreatureConditionImmunitiesModal.vue';
   import CreatureDefensesModal from './CreatureDefensesModal.vue';
   import CreatureEffectsBlock from './CreatureEffectsBlock.vue';
   import CreatureEnvironmentsModal from './CreatureEnvironmentsModal.vue';
+  import CreatureEquipmentBlock from './CreatureEquipmentBlock.vue';
   import CreatureHeader from './CreatureHeader.vue';
-  import CreatureSkillsModal from './CreatureSkillsModal.vue';
   import CreatureSpellsBlock from './CreatureSpellsBlock.vue';
+  import CreatureActionsTab from './tabs/CreatureActionsTab.vue';
+  import CreatureTraitsTab from './tabs/CreatureTraitsTab.vue';
+  import {
+    applyPersistedCreatureSettings,
+    mergeCreatureSettingsIntoDraft,
+  } from './utils/applyPersistedCreatureSettings';
 
   interface Props {
     open: boolean;
     creatureId?: string;
     worldId?: string;
-    creatures?: Creature[];
+    creatures?: DnDCreature[];
     socket?: TypedWebSocketClient | null;
     zIndex?: number;
     modalId?: string;
@@ -64,29 +163,42 @@
       id: string;
       name: string;
       description?: string;
-      system: Creature['system'];
+      system: DnDCreature['system'];
       nameEn?: string;
       header?: string;
-      token?: Creature['token'];
+      token?: DnDCreature['token'];
       spells?: Spell[];
-      activeEffects?: Creature['activeEffects'];
+      equipment?: DnDCreature['equipment'];
+      activeEffects?: DnDCreature['activeEffects'];
       [key: string]: unknown;
     };
+    /**
+     * Лист правит не существо мира, а черновик: каждое сохранение уходит сюда,
+     * а в мир не пишется ничего. Так правят запись существа в своём
+     * компендиуме: `initialData` — запись (у новой её нет), `creatureId` и
+     * `creatures` не задаются.
+     */
+    draftSave?: (creature: DnDCreature) => void;
   }
 
   const props = defineProps<Props>();
 
   const worldStore = useWorldStore();
 
-  /** Режим только просмотр (компендиум, без сокета) */
+  /**
+   * Режим только просмотр (компендиум, без сокета). Черновик своего
+   * компендиума — не просмотр: его правят, просто сохранение идёт в `draftSave`.
+   */
   const isReadOnly = computed(
-    () => !props.socket || (!props.creatures && !!props.initialData),
+    () =>
+      !props.socket
+      || (!props.creatures && !!props.initialData && !props.draftSave),
   );
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
-    'update:creature': [creature: Creature];
-    'save': [creature: Creature];
+    'update:creature': [creature: DnDCreature];
+    'save': [creature: DnDCreature];
     'close': [];
     'bring-to-front': [];
   }>();
@@ -96,21 +208,82 @@
 
   // Состояние
   const isEditMode = ref(false);
-  const localCreature = ref<Creature | null>(null);
-  const savedSnapshot = ref<Creature | null>(null);
+
+  /**
+   * Оформление блоков левой колонки. Правило общее с листом персонажа: в правке
+   * рамка горит цветом настройки, а настраиваемый блок нажимается целиком.
+   * Цвет свой только у защит — тот же, что у значков внутри блока, иначе
+   * уязвимость, сопротивление и иммунитет перестали бы различаться с одного
+   * взгляда.
+   */
+  const blockClasses = computed(() => {
+    const editMode = isEditMode.value;
+
+    return {
+      /** Блок без своего нажатия: настройка живёт в шестерёнке или её нет */
+      plain: getSheetBlockClass({ isEditMode: editMode }),
+      /** Блок, который в правке открывает своё окно нажатием целиком */
+      editable: getSheetBlockClass({
+        isEditMode: editMode,
+        isClickable: editMode,
+      }),
+      vulnerabilities: getSheetBlockClass({
+        isEditMode: editMode,
+        isClickable: editMode,
+        accent: 'error',
+      }),
+      resistances: getSheetBlockClass({
+        isEditMode: editMode,
+        isClickable: editMode,
+        accent: 'info',
+      }),
+      immunities: getSheetBlockClass({
+        isEditMode: editMode,
+        isClickable: editMode,
+        accent: 'warning',
+      }),
+      environments: getSheetBlockClass({
+        isEditMode: editMode,
+        isClickable: editMode,
+        accent: 'success',
+      }),
+    };
+  });
+
+  const localCreature = ref<DnDCreature | null>(null);
+  const savedSnapshot = ref<DnDCreature | null>(null);
   const isDirty = ref(false);
   const isSaving = ref(false);
   const isCreated = ref(false);
 
   /**
-   * Является ли текущий пользователь владельцем существа
-   * (существо передано игроку под контроль ГМом).
+   * Лист создаёт новое существо, а не правит готовое. Черновик записи
+   * компендиума с данными (`initialData`) — уже готовое существо, хотя
+   * идентификатора мира у него нет.
    */
+  const isCreating = computed(
+    () =>
+      !props.creatureId
+      && !isCreated.value
+      && !(props.draftSave && props.initialData),
+  );
+
+  /** Актуальное существо из хоста: локальный черновик не определяет права. */
+  const storeCreature = computed(() => {
+    if (!props.creatureId || !props.creatures) {
+      return null;
+    }
+
+    return props.creatures.find((entry) => entry.id === props.creatureId);
+  });
+
   const isOwner = computed(() => {
-    const ownerId = localCreature.value?.ownerId;
     const userId = worldStore.connectionState.loggedAsUserId;
 
-    return Boolean(ownerId && userId && ownerId === userId);
+    return isEntityOwner(
+      props.creatureId ? storeCreature.value : localCreature.value,
+      userId,
+    );
   });
 
   /** Может ли пользователь управлять существом (ГМ или владелец) */
@@ -131,20 +304,130 @@
   const isConfirmOpen = ref(false);
   const pendingAction = ref<'close' | null>(null);
 
-  // Вкладки
-  const tabs = [
-    { id: 'actions', label: 'Действия' },
-    { id: 'traits', label: 'Особенности' },
-    { id: 'spells', label: 'Заклинания' },
-    { id: 'effects', label: 'Эффекты' },
-    { id: 'description', label: 'Описание' },
-  ];
+  // Раскладку выбирает ширина самого листа, а не экрана: окно листа сужают и
+  // на большом экране, и тогда он обязан перестроиться так же, как на телефоне.
+  const sheetBodyRef = useTemplateRef<HTMLElement>('sheetBody');
 
-  const activeTab = ref('actions');
+  const { isMeasured, isWide } = useSheetLayout(
+    sheetBodyRef,
+    CREATURE_SHEET_WIDE_MIN_WIDTH_REM,
+  );
+
+  const [DefineSummary, ReuseSummary] = createReusableTemplate();
+
+  /** Классы раскладки листа: колонками на широком, столбцом на узком */
+  const sheetLayoutClasses = computed(() =>
+    isWide.value
+      ? CREATURE_SHEET_LAYOUT_CLASSES.wide
+      : CREATURE_SHEET_LAYOUT_CLASSES.compact,
+  );
+
+  const sheetFrameClass = computed(() =>
+    isWide.value ? SHEET_FRAME_CLASSES.wide : SHEET_FRAME_CLASSES.compact,
+  );
+
+  // Вкладки: «Основное» есть только у узкого листа — в ней живёт сводка
+  const tabs = computed<SheetTabEntry[]>(() => {
+    const mainTabs = isWide.value
+      ? []
+      : [{ id: SHEET_MAIN_TAB_ID, label: SHEET_TABS_LABELS.main }];
+
+    return [
+      ...mainTabs,
+      { id: 'actions', label: CREATURE_SHEET_LABELS.tabActions },
+      { id: 'equipment', label: CREATURE_SHEET_LABELS.tabEquipment },
+      { id: 'traits', label: GRANT_SECTION_LABELS.features },
+      { id: 'spells', label: GRANT_SECTION_LABELS.spells },
+      { id: 'effects', label: FORM_TAB_LABELS.effects },
+      { id: 'description', label: FORM_FIELD_LABELS.description },
+    ];
+  });
+
+  /** Вкладка, выбранная пользователем или листом; `null` — ещё не выбирали */
+  const pickedTab = ref<string | null>(null);
+
+  /**
+   * Показанная вкладка. Пока её не выбирали, узкий лист открывается на
+   * «Основном», а широкий — на действиях. Выбранное «Основное» на широком
+   * листе показать негде, и там встают действия — сам выбор не затирается и
+   * вернётся, когда окно снова сузят.
+   */
+  const activeTab = computed<string>({
+    get: () => {
+      if (pickedTab.value === null) {
+        return isWide.value ? CREATURE_SHEET_DEFAULT_TAB_ID : SHEET_MAIN_TAB_ID;
+      }
+
+      if (pickedTab.value === SHEET_MAIN_TAB_ID && isWide.value) {
+        return CREATURE_SHEET_DEFAULT_TAB_ID;
+      }
+
+      return pickedTab.value;
+    },
+    set: (tabId) => {
+      pickedTab.value = tabId;
+    },
+  });
+
+  const { resolvedStats, combinedEffects } = useResolvedStats(
+    toRef(() => localCreature.value),
+  );
+
+  const { receiveTransferredItem } = useItemTransfer();
+
+  const isDiceRollOpen = ref(false);
+
+  /** Настройка окна броска: собирается перед каждым открытием */
+  interface DiceRollConfig {
+    modifier: number;
+    title: string;
+    rollLabel: string;
+    rollButtonText: string;
+    initialRollMode: AttackRollMode;
+    evaluateBonusRollFormulas?: RollBonusEvaluator;
+  }
+
+  const diceRollConfig = ref<DiceRollConfig>({
+    modifier: 0,
+    title: '',
+    rollLabel: '',
+    rollButtonText: DICE_ROLL_DEFAULT_BUTTON,
+    initialRollMode: 'normal',
+  });
+
+  /**
+   * Открывает окно броска кубиков.
+   *
+   * @param config - настройка броска
+   * @param config.modifier - модификатор броска
+   * @param config.title - заголовок окна
+   * @param config.rollLabel - подпись броска
+   * @param config.rollButtonText - надпись на кнопке броска
+   * @param config.initialRollMode - режим броска при открытии окна
+   */
+  function openDiceRoll(
+    config: Partial<DiceRollConfig>
+      & Pick<DiceRollConfig, 'modifier' | 'title' | 'rollLabel'>,
+  ): void {
+    diceRollConfig.value = {
+      ...config,
+      rollButtonText: config.rollButtonText ?? DICE_ROLL_DEFAULT_BUTTON,
+      initialRollMode: config.initialRollMode ?? 'normal',
+    };
+
+    isDiceRollOpen.value = true;
+  }
 
   const isOpen = computed({
     get: () => props.open,
     set: (value) => emit('update:open', value),
+  });
+
+  // Основа черновика: от неё считается то, что сохранение шлёт серверу
+  const { draftBase, rebaseDraft, saveDraft } = useEntityDraftWrite({
+    readDraft: () => localCreature.value,
+    readWorld: () => storeCreature.value,
+    isEntity: isDndCreatureRecord,
   });
 
   /**
@@ -153,7 +436,7 @@
   function initializeCreature() {
     // Режим компендиума — берём данные из initialData
     if (props.initialData) {
-      const creature: Creature = {
+      const creature: DnDCreature = {
         entityType: 'creature',
         id: props.initialData.id,
         name: props.initialData.name,
@@ -163,15 +446,23 @@
         header: props.initialData.header,
         token: props.initialData.token,
         spells: props.initialData.spells,
+        equipment: props.initialData.equipment,
         activeEffects: props.initialData.activeEffects,
       };
 
-      localCreature.value = normalizeCreature(
-        JSON.parse(JSON.stringify(creature)),
-      );
+      const draft: BaseCreature = JSON.parse(JSON.stringify(creature));
 
-      isEditMode.value = false;
-      isDirty.value = false;
+      normalizeCreature(draft);
+
+      // Гвард — постусловие миграции: после неё форма собрана целиком
+      if (isDndCreature(draft)) {
+        localCreature.value = draft;
+        isEditMode.value = false;
+        isDirty.value = false;
+        rebaseDraft();
+      } else {
+        console.error(CREATURE_SHEET_LOG_PREFIX, props.initialData.id);
+      }
 
       return;
     }
@@ -182,11 +473,17 @@
       );
 
       if (creature) {
-        localCreature.value = normalizeCreature(
-          JSON.parse(JSON.stringify(creature)),
-        );
+        const draft: BaseCreature = JSON.parse(JSON.stringify(creature));
 
-        isEditMode.value = false;
+        normalizeCreature(draft);
+
+        // Гвард — постусловие миграции: после неё форма собрана целиком
+        if (isDndCreature(draft)) {
+          localCreature.value = draft;
+          isEditMode.value = false;
+        } else {
+          console.error(CREATURE_SHEET_LOG_PREFIX, props.creatureId);
+        }
       } else {
         console.error(
           '[CreatureSheet] Creature not found with id:',
@@ -196,7 +493,7 @@
     } else if (!props.creatureId) {
       const newId = generateEntityId('creature');
 
-      const newCreature: Creature = JSON.parse(
+      const newCreature: DnDCreature = JSON.parse(
         JSON.stringify({ ...DEFAULT_CREATURE, id: newId }),
       );
 
@@ -205,6 +502,7 @@
     }
 
     isDirty.value = false;
+    rebaseDraft();
   }
 
   // Автоматическое обновление бонуса мастерства при смене CR
@@ -228,15 +526,6 @@
     }
   });
 
-  // Синхронизация при внешнем обновлении
-  const storeCreature = computed(() => {
-    if (!props.creatureId || !props.creatures) {
-      return null;
-    }
-
-    return props.creatures.find((entry) => entry.id === props.creatureId);
-  });
-
   watch(
     () => storeCreature.value,
     (newCreature, oldCreature) => {
@@ -254,72 +543,100 @@
   );
 
   /**
-   * Синхронизация token из store в localCreature.
-   * Позволяет обновлять визуал/зрение, если они были изменены через настройки токена.
+   * Разделы, которые система пишет в мир во время игры (ресурсы листа,
+   * предметы, заклинания, эффекты, хиты), подтягиваются из стора в
+   * localCreature — тем же помощником, что у листа персонажа. Пока лист
+   * открыт, их меняют снаружи: каст списывает заряд «N/день», бой накладывает
+   * и снимает эффекты, передача предмета правит инвентарь. Без этого лист
+   * показывал бы прежнее. Пришедшее из мира кладётся и в основу черновика:
+   * сохранение шлёт серверу только разницу с ней, и чужое изменение не должно
+   * уйти как правка листа. Токен подтягивает тот же помощник: его меняют окно
+   * настроек и сцена.
    */
-  watch(
-    () => storeCreature.value?.token,
-    (newToken) => {
-      if (localCreature.value && newToken && !isEditMode.value) {
-        localCreature.value.token = JSON.parse(JSON.stringify(newToken));
-      }
-    },
-    { deep: true },
+  const { pullFromWorld } = useWorldSheetSync({
+    readWorld: () => storeCreature.value,
+    draft: localCreature,
+    base: draftBase,
+    isPaused: () => isEditMode.value,
+  });
+
+  // Пока лист в правке, существо не действует ни с листа, ни с панелей.
+  // Отметка — на id черновика, как у листа персонажа: с ним действуют блоки
+  // листа, а у нового, ещё не сохранённого существа `props.creatureId` пуст
+  useSheetEditLock(
+    () => localCreature.value?.id,
+    () => isEditMode.value,
   );
 
   /**
-   * Синхронизация system из store в localCreature.
+   * Что лист показывает после «Сохранить». Черновик правки сливается с миром:
+   * правки владельца — из черновика, всё, что он не трогал, — из мира (урон,
+   * снятый эффект, списанный заряд). На сервер при этом уходят только правки
+   * владельца — разница со снимком входа в правку.
+   *
+   * @param draft - черновик листа
+   * @returns существо, каким оно станет после записи
    */
-  watch(
-    () => storeCreature.value?.system,
-    (newSystem) => {
-      if (localCreature.value && newSystem && !isEditMode.value) {
-        localCreature.value.system = JSON.parse(JSON.stringify(newSystem));
-      }
-    },
-    { deep: true },
-  );
+  function resolveCreatureToSave(draft: DnDCreature): DnDCreature {
+    const world = storeCreature.value;
 
-  /**
-   * Синхронизация activeEffects из store в localCreature: наложенные в бою
-   * эффекты (статус/DoT по цели) и снятые повторным спасом должны появляться
-   * в списке существа сразу, без перезагрузки страницы.
-   */
-  watch(
-    () => storeCreature.value?.activeEffects,
-    (newActiveEffects) => {
-      if (localCreature.value && newActiveEffects && !isEditMode.value) {
-        localCreature.value.activeEffects = JSON.parse(
-          JSON.stringify(newActiveEffects),
-        );
-      }
-    },
-    { deep: true },
-  );
+    return isEditMode.value && savedSnapshot.value && world
+      ? mergeEntityDraft(savedSnapshot.value, draft, world, isDndCreatureRecord)
+      : draft;
+  }
 
   function handleImmediateSave() {
-    if (isEditMode.value || !localCreature.value || !isDirty.value) {
+    if (
+      isEditMode.value
+      || !localCreature.value
+      || !isDirty.value
+      || !canControl.value
+    ) {
       return;
     }
 
     emit('update:creature', localCreature.value);
 
-    if (props.socket && props.creatureId) {
-      const cleanCreature = JSON.parse(JSON.stringify(localCreature.value));
-
-      props.socket.emit('creature:updated', cleanCreature);
+    if (props.draftSave) {
+      props.draftSave(JSON.parse(JSON.stringify(localCreature.value)));
+    } else if (props.socket && props.creatureId) {
+      saveDraft(props.socket);
     }
 
     savedSnapshot.value = JSON.parse(JSON.stringify(localCreature.value));
     isDirty.value = false;
   }
 
-  function handleCreatureUpdate(updates: Partial<Creature>) {
+  function handleCreatureUpdate(updates: Partial<DnDCreature>) {
     if (localCreature.value) {
       Object.assign(localCreature.value, updates);
       isDirty.value = true;
       handleImmediateSave();
     }
+  }
+
+  /** Текущая степень Истощения — её несёт эффект-состояние */
+  const exhaustionLevel = computed(() =>
+    getEntityExhaustionLevel(localCreature.value?.activeEffects),
+  );
+
+  /**
+   * Ставит степень Истощения: движок пересобирает эффект со штрафами этой
+   * степени, нулевая — снимает состояние.
+   *
+   * @param level - выбранная степень (0–6)
+   */
+  function handleExhaustionSelect(level: number): void {
+    if (!localCreature.value) {
+      return;
+    }
+
+    handleCreatureUpdate({
+      activeEffects: withExhaustionLevel(
+        localCreature.value.activeEffects ?? [],
+        level,
+      ),
+    });
   }
 
   /**
@@ -330,9 +647,47 @@
     handleCreatureUpdate({ description });
   }
 
-  function handleSystemUpdate(updates: Partial<Creature['system']>) {
+  /**
+   * Пересобирает хиты по правилам после правки размера или Телосложения.
+   * Движок отдаёт тот же объект, когда менять нечего, а у существа без блока
+   * хитов (запись старого мира или компендиума) — ничего: тогда запись не
+   * трогается, и смена размера не спотыкается об отсутствующую формулу.
+   */
+  function syncHitPointsWithRules(): void {
+    if (!localCreature.value) {
+      return;
+    }
+
+    const ruledHitPoints = resolveCreatureHitPointsByRules(localCreature.value);
+
+    if (ruledHitPoints) {
+      localCreature.value.system.hitPoints = ruledHitPoints;
+    }
+  }
+
+  function handleSystemUpdate(updates: Partial<DnDCreature['system']>) {
     if (localCreature.value) {
       Object.assign(localCreature.value.system, updates);
+
+      // Размер существа и масштаб его токена — одна величина. Без этой
+      // синхронизации выбранный «Огромный» остаётся токеном 1×1 на сцене, а
+      // сохранение настроек токена возвращает размер обратно в «Средний»
+      // (там size выводится из scale через TOKEN_SCALE_TO_CREATURE_SIZE).
+      if (updates.size) {
+        localCreature.value.token = {
+          ...localCreature.value.token,
+          scale: CREATURE_SIZE_TO_TOKEN_SCALE[updates.size],
+        };
+      }
+
+      // Формула хитов — производная от размера и Телосложения (D&D 2024):
+      // Большое существо с Тел. 16 не может жить с «2к8 + 2» из заготовки
+      if (
+        CREATURE_HIT_DICE_RULE_KEYS.some((key) => updates[key] !== undefined)
+      ) {
+        syncHitPointsWithRules();
+      }
+
       isDirty.value = true;
       handleImmediateSave();
     }
@@ -374,16 +729,16 @@
   const defenseLabelMap = computed(() => {
     const labelMap: Record<string, string> = {
       // Ключи физического пробивания
-      'bypass-adamantine': 'Пробивание: Адамантиновое',
-      'bypass-magical': 'Пробивание: Магическое',
-      'bypass-silvered': 'Пробивание: Посеребрённое',
+      'bypass-adamantine': CREATURE_SHEET_LABELS.bypassAdamantine,
+      'bypass-magical': CREATURE_SHEET_LABELS.bypassMagical,
+      'bypass-silvered': CREATURE_SHEET_LABELS.bypassSilvered,
     };
 
     for (const dt of systemDataStore.damageTypes) {
       labelMap[dt.key] = dt.name;
     }
 
-    for (const condition of CONDITIONS) {
+    for (const condition of listConditions()) {
       labelMap[condition.key] = condition.nameRu;
     }
 
@@ -431,55 +786,286 @@
     }
   }
 
-  function onSkillsApply(skills: Partial<Record<SkillType, ProficiencyLevel>>) {
-    if (localCreature.value) {
-      localCreature.value.system.skills = skills;
-      isDirty.value = true;
-      handleImmediateSave();
+  /**
+   * Открывает окно иммунитета к состояниям — только в правке, как и остальные
+   * блоки защит: вне её блок ничего не настраивает и нажатия не ждёт.
+   */
+  function openConditionImmunitiesModal(): void {
+    if (isEditMode.value) {
+      isConditionImmunitiesOpen.value = true;
     }
   }
 
-  const formattedSkills = computed(() => {
-    if (!localCreature.value) {
+  /**
+   * Применяет владения и настройку навыков: их правят одним окном и одной
+   * таблицей, поэтому и приходят они вместе.
+   *
+   * @param payload - настройка из окна
+   * @param payload.skills - уровни владения навыками правил
+   * @param payload.settings - поправки расчёта и свои навыки
+   */
+  function onSkillsApply(payload: {
+    skills: Partial<Record<SkillType, ProficiencyLevel>>;
+    settings: DnDSkillSettings;
+  }) {
+    handleSystemUpdate({
+      skills: payload.skills,
+      skillSettings: payload.settings,
+    });
+  }
+
+  /**
+   * Уровень владения навыком. Записи существа держат владения на корне
+   * системы, а не в блоке владений, как у листа персонажа.
+   *
+   * @param key - ключ навыка
+   * @returns уровень владения
+   */
+  function getSkillProficiency(key: SkillType): ProficiencyLevel {
+    const rawLevel = localCreature.value?.system.skills[key];
+
+    return isProficiencyLevel(rawLevel) ? rawLevel : 'none';
+  }
+
+  /**
+   * Модификаторы характеристик существа — по ним считаются свои навыки,
+   * спасброски и запасной расчёт навыков правил.
+   *
+   * Берутся из разрешённых статов: там уже учтены активные эффекты и свои
+   * бонусы к самим характеристикам. Пока статы не сошлись — расчёт по записи,
+   * иначе числа мигали бы нулями.
+   */
+  const skillAbilityMods = computed<Record<AbilityType, number>>(
+    () =>
+      resolvedStats.value?.abilityMods
+      ?? getActorAbilityModifiers(localCreature.value),
+  );
+
+  /**
+   * Бонус мастерства существа: по опасности, с поправками своей настройки и с
+   * учётом активных эффектов. Считать его нужно именно так везде — числа в
+   * навыках, спасбросках и заклинательстве идут от него.
+   */
+  const creatureProficiencyBonus = computed(() =>
+    localCreature.value
+      ? getCreatureProficiencyBonus(localCreature.value, resolvedStats.value)
+      : DEFAULT_PROFICIENCY_BONUS,
+  );
+
+  /** Числа листа, от которых считается вклад своих бонусов */
+  const bonusContext = computed<DnDCustomBonusContext>(() => ({
+    abilityMods: skillAbilityMods.value,
+    proficiencyBonus: creatureProficiencyBonus.value,
+  }));
+
+  /**
+   * Числа листа для формулы хитов: модификаторы по записи листа со своими
+   * бонусами, но без активных эффектов — формула описывает стат-блок, а
+   * эффект временно двигает итог поверх него.
+   */
+  const hitDiceBonusContext = computed<DnDCustomBonusContext | null>(() =>
+    localCreature.value
+      ? getCreatureHitDiceBonusContext(localCreature.value)
+      : null,
+  );
+
+  /**
+   * Поля, чей итог задан активным эффектом целиком. Окно настройки берёт
+   * отсюда навыки под перезаписью: их число задаёт эффект, а не расчёт.
+   */
+  const overriddenSkillKeys = computed(
+    () => resolvedStats.value?.overriddenKeys ?? new Set<string>(),
+  );
+
+  /** Навык существа бейджем: и подпись, и всё, чем катится его проверка */
+  interface CreatureSkillBadge {
+    /** Ключ списка: у навыка правил — его ключ, у своего — id записи */
+    id: string;
+    /** Подпись бейджа: название и значение со знаком */
+    label: string;
+    /** Название навыка: им подписан бросок */
+    name: string;
+    /** Итог навыка — он же модификатор броска */
+    modifier: number;
+    /** Характеристика расчёта: по ней читаются флаги проверки */
+    ability: AbilityType;
+    /** Ключ навыка правил; не задан — навык заведён вручную */
+    key?: SkillType;
+  }
+
+  /**
+   * Навыки существа для показа бейджами: только те, которыми оно владеет, и
+   * все заведённые вручную — их в правилах нет, и отмечать их владением
+   * незачем. Значение берётся из разрешённых статов: там уже учтены и поправки
+   * расчёта, и активные эффекты.
+   */
+  const skillBadges = computed<CreatureSkillBadge[]>(() => {
+    const creature = localCreature.value;
+
+    if (!creature) {
       return [];
     }
 
-    const skills = localCreature.value.system.skills;
-    const profBonus = localCreature.value.system.proficiencyBonus || 0;
-    const result: string[] = [];
+    const settings = creature.system.skillSettings;
+    const mods = skillAbilityMods.value;
+    const profBonus = creatureProficiencyBonus.value;
+    const result: CreatureSkillBadge[] = [];
 
-    for (const [key, level] of Object.entries(skills)) {
+    for (const skill of SKILLS_LIST) {
+      const level = getSkillProficiency(skill.key);
+
       if (level === 'none') {
         continue;
       }
 
-      const ability = getSkillAbility(key as SkillType);
-      const abilityScore = localCreature.value.system.abilities[ability];
+      const setting = getSkillSetting(settings, skill.key);
+      const ability = getSkillSettingAbility(setting, skill.key);
 
-      const total = calculateSkillModifier(
-        abilityScore,
-        profBonus,
-        level as ProficiencyLevel,
-      );
+      const fallback =
+        mods[ability]
+        + getProficiencyContribution(profBonus, level)
+        + getCustomBonusesValue(bonusContext.value, setting.bonuses);
 
-      const formattedTotal = total >= 0 ? `+${total}` : `${total}`;
-      const label = SKILLS_LABELS[key as keyof typeof SKILLS_LABELS];
+      const total = resolvedStats.value?.skills[skill.key] ?? fallback;
 
-      if (label) {
-        result.push(`${label} ${formattedTotal}`);
-      }
+      result.push({
+        id: skill.key,
+        label: `${skill.label} ${formatSignedNumber(total)}`,
+        name: skill.label,
+        modifier: total,
+        ability,
+        key: skill.key,
+      });
     }
 
-    return result.sort();
+    for (const skill of settings?.custom ?? []) {
+      const total = getCustomSkillValue(bonusContext.value, skill);
+
+      result.push({
+        id: skill.id,
+        label: `${skill.name} ${formatSignedNumber(total)}`,
+        name: skill.name,
+        modifier: total,
+        ability: skill.ability,
+      });
+    }
+
+    return result.sort((first, second) =>
+      first.name.localeCompare(second.name),
+    );
+  });
+
+  /**
+   * Нажатие по бейджу навыка: вне правки катит проверку этого навыка — тем же
+   * окном, что и проверка характеристики. В правке бейдж ведёт в настройку
+   * навыков, как и нажатие по самому блоку: там числа правят, а не бросают.
+   *
+   * @param badge - навык бейджа
+   */
+  function handleSkillBadgeClick(badge: CreatureSkillBadge): void {
+    if (isEditMode.value) {
+      openSkillsModal();
+
+      return;
+    }
+
+    openDiceRoll({
+      modifier: badge.modifier,
+      evaluateBonusRollFormulas: buildRollBonusEvaluator(
+        () => localCreature.value ?? undefined,
+        getSkillCheckBonusKeys(badge.key),
+      ),
+      title: `${ABILITY_CHECK_ROLL_LABELS.titlePrefix}${badge.name}`,
+      rollLabel: `${ABILITY_CHECK_ROLL_LABELS.rollPrefix}${badge.name}`,
+      rollButtonText: ABILITY_CHECK_ROLL_LABELS.button,
+      initialRollMode: resolveAbilityCheckRollMode({
+        flags: resolvedStats.value?.activeFlags ?? new Set(),
+        ability: badge.ability,
+        skill: badge.key,
+      }),
+    });
+  }
+
+  /**
+   * Какие блоки левой колонки показывать.
+   *
+   * В просмотре пустые прячутся: в статблоке 2024-й строку «Уязвимости — нет»
+   * не пишут, и лист без семи прочерков читается как книга, а не как форма.
+   * В правке видны все — иначе пустой блок нечем было бы заполнить.
+   *
+   * Спасброски и чувства сюда не входят намеренно: они пустыми не бывают —
+   * шесть спасбросков и пассивная Внимательность есть у любого существа.
+   */
+  const visibleBlocks = computed(() => {
+    const system = localCreature.value?.system;
+    const defenses = system?.defenses;
+    const isEditing = isEditMode.value;
+
+    return {
+      exhaustion: isEditing || exhaustionLevel.value > 0,
+      vulnerabilities:
+        isEditing
+        || Boolean(defenses?.vulnerabilities.length)
+        || Boolean(defenses?.vulnerabilitiesText),
+      resistances:
+        isEditing
+        || Boolean(defenses?.resistances.length)
+        || Boolean(defenses?.resistancesText),
+      immunities:
+        isEditing
+        || Boolean(defenses?.immunities.length)
+        || Boolean(defenses?.immunitiesText),
+      conditionImmunities:
+        isEditing || Boolean(defenses?.conditionImmunities.length),
+      skills: isEditing || skillBadges.value.length > 0,
+      languages: isEditing || Boolean(system?.languages?.length),
+      environments:
+        isEditing
+        || Boolean(system?.environments?.length)
+        || Boolean(system?.customEnvironments),
+    };
   });
 
   function openSettings() {
     openModal('CreatureSettingsModal', {
       creatureId: props.creatureId,
       creatureData: localCreature.value,
-      onSave: (updates: Partial<Creature>) => {
+      onPersistedSave: (updates: Partial<DnDCreature>) => {
         if (localCreature.value) {
+          localCreature.value = mergeCreatureSettingsIntoDraft(
+            localCreature.value,
+            updates,
+          );
+
+          // Отмена основной формы откатывает только её черновик, а не уже сохранённые настройки.
+          if (savedSnapshot.value) {
+            savedSnapshot.value = applyPersistedCreatureSettings(
+              savedSnapshot.value,
+              updates,
+            );
+          }
+
+          // Настройки записало само окно — правкой листа они не считаются
+          if (draftBase.value) {
+            draftBase.value = applyPersistedCreatureSettings(
+              draftBase.value,
+              updates,
+            );
+          }
+        }
+      },
+      onSave: (updates: Partial<DnDCreature>) => {
+        if (localCreature.value) {
+          const previousSize = localCreature.value.system.size;
+
           Object.assign(localCreature.value, updates);
+
+          // Настройки токена меняют размер существа через масштаб — в обход
+          // `handleSystemUpdate`, и формула хитов обязана сойтись и здесь
+          if (localCreature.value.system.size !== previousSize) {
+            syncHitPointsWithRules();
+          }
+
           isDirty.value = true;
           handleImmediateSave();
         }
@@ -509,18 +1095,21 @@
 
       isEditMode.value = false;
       savedSnapshot.value = null;
+
+      // Правок нет — черновик догоняет мир: за время правки он мог измениться
+      pullFromWorld();
     }
   }
 
   function handleSave() {
-    if (!localCreature.value || isSaving.value) {
+    if (!localCreature.value || isSaving.value || !canControl.value) {
       return;
     }
 
     if (!localCreature.value.name || localCreature.value.name.trim() === '') {
       toast.add({
-        title: 'Ошибка валидации',
-        description: 'Имя существа обязательно',
+        title: CREATURE_SHEET_LABELS.validationErrorTitle,
+        description: CREATURE_SHEET_LABELS.validationNameRequired,
         color: 'error',
       });
 
@@ -532,14 +1121,26 @@
     try {
       requireSocket(props.socket);
 
-      const cleanCreature = JSON.parse(JSON.stringify(localCreature.value));
+      const wasCreating = isCreating.value;
 
-      if (props.creatureId) {
-        props.socket!.emit('creature:updated', cleanCreature);
+      if (props.draftSave) {
+        props.draftSave(JSON.parse(JSON.stringify(localCreature.value)));
+        isCreated.value = true;
+      } else if (props.creatureId) {
+        const saved = resolveCreatureToSave(localCreature.value);
+
+        // Основа правки — снимок входа в режим: синхронизация с миром на время
+        // правки стояла, и всё, чем черновик от него отличается, — правки листа
+        saveDraft(props.socket, isEditMode.value ? savedSnapshot.value : null);
+        localCreature.value = saved;
       } else {
+        const cleanCreature = JSON.parse(JSON.stringify(localCreature.value));
+
         props.socket!.emit('creature:created', cleanCreature);
         emit('save', cleanCreature);
         isCreated.value = true;
+        // Сервер получил лист целиком — дальнейшие правки считаются от него
+        rebaseDraft();
 
         if (props.modalId) {
           updateModalProps(props.modalId, { creatureId: cleanCreature.id });
@@ -547,11 +1148,10 @@
       }
 
       toast.add({
-        title: 'Успешно',
-        description:
-          props.creatureId || isCreated.value
-            ? 'Существо обновлено'
-            : 'Существо создано',
+        title: CREATURE_SHEET_LABELS.savedTitle,
+        description: wasCreating
+          ? CREATURE_SHEET_LABELS.savedCreated
+          : CREATURE_SHEET_LABELS.savedUpdated,
         color: 'success',
       });
 
@@ -562,11 +1162,11 @@
       console.error('Failed to save creature:', error);
 
       toast.add({
-        title: 'Ошибка сохранения',
+        title: CREATURE_SHEET_LABELS.saveErrorTitle,
         description:
           error instanceof Error
             ? error.message
-            : 'Не удалось сохранить существо',
+            : CREATURE_SHEET_LABELS.saveErrorText,
         color: 'error',
       });
     } finally {
@@ -585,6 +1185,31 @@
     isDirty.value = false;
     savedSnapshot.value = null;
     isOpen.value = false;
+  }
+
+  const {
+    sheetModalRef,
+    minimizedTitle,
+    minimizeSheet,
+    canPopOutSheet,
+    isSheetPoppedOut,
+    togglePopOutSheet,
+  } = useSheetMinimize(
+    () => localCreature.value?.name,
+    CREATURE_SHEET_LABELS.untitled,
+  );
+
+  /**
+   * Закрытие, пришедшее ОТ окна, а не от крестика в шапке листа: кнопка закрытия
+   * на шторке свёрнутого листа. Такое закрытие минует `handleCancel`, а с ним и
+   * вопрос о несохранённых правках, — поэтому заворачиваем его туда же.
+   *
+   * Окно шлёт это событие только чтобы закрыться (`update:open` всегда `false`),
+   * поэтому значение не проверяем. Выход из мира приходит сюда же, но лист он
+   * снимает не событием, а вычисткой реестра окон — вопрос показать не успеет.
+   */
+  function handleModalClose(): void {
+    handleCancel();
   }
 
   function onConfirmCancel() {
@@ -622,7 +1247,7 @@
   );
 
   function handleLegendaryActionsUpdate(
-    legendaryActions: Creature['system']['legendary']['actions'],
+    legendaryActions: DnDCreature['system']['legendary']['actions'],
   ) {
     if (!localCreature.value) {
       return;
@@ -646,79 +1271,270 @@
     });
   }
 
-  function handleActionsUpdate(actions: Creature['system']['actions']): void {
+  function handleActionsUpdate(
+    actions: DnDCreature['system']['actions'],
+  ): void {
     handleSystemUpdate({ actions });
   }
 
   function handleBonusActionsUpdate(
-    bonusActions: Creature['system']['bonusActions'],
+    bonusActions: DnDCreature['system']['bonusActions'],
   ): void {
     handleSystemUpdate({ bonusActions });
   }
 
   function handleReactionsUpdate(
-    reactions: Creature['system']['reactions'],
+    reactions: DnDCreature['system']['reactions'],
   ): void {
     handleSystemUpdate({ reactions });
   }
 
-  function handleTraitsUpdate(traits: Creature['system']['traits']): void {
+  function handleTraitsUpdate(traits: DnDCreature['system']['traits']): void {
     handleSystemUpdate({ traits });
   }
 
   /**
-   * Обновляет список заклинаний существа (верхний уровень).
-   * @param spells - новый список заклинаний
+   * Обновляет заклинания существа вместе с их раскладкой по блокам.
+   *
+   * Одним обработчиком, а не двумя: правка почти всегда задевает и список, и
+   * блоки (заклинание кладут в группу, режим группы меняет его заряды), а
+   * двумя вызовами лист сохранялся бы дважды подряд.
+   *
+   * @param value - заклинания и блоки существа
    */
-  function handleSpellsUpdate(spells: NonNullable<Creature['spells']>): void {
-    handleCreatureUpdate({ spells });
-  }
-
-  /**
-   * Обновляет параметры заклинательства существа (плоский DC/бонус/характеристика).
-   * @param spellcasting - новые параметры заклинательства
-   */
-  function handleSpellcastingUpdate(
-    spellcasting: NonNullable<Creature['system']['spellcasting']>,
-  ): void {
-    handleSystemUpdate({ spellcasting });
-  }
-
-  /**
-   * Применяет отдых к существу: восстанавливает заряды заклинаний (долгий
-   * отдых — также хиты), затем сохраняет.
-   * @param restType - тип отдыха
-   */
-  function handleRest(restType: RestType): void {
+  function handleSpellbookUpdate(value: {
+    spells: NonNullable<DnDCreature['spells']>;
+    blocks: NonNullable<DnDCreature['system']['spellcastingBlocks']>;
+  }): void {
     if (!localCreature.value) {
       return;
     }
 
-    handleCreatureUpdate(applyCreatureRest(localCreature.value, restType));
+    localCreature.value.spells = value.spells;
+    localCreature.value.system.spellcastingBlocks = value.blocks;
+
+    isDirty.value = true;
+    handleImmediateSave();
+  }
+
+  /**
+   * Применяет отдых к существу: восстанавливает заряды заклинаний (долгий
+   * отдых — также хиты), выполняет срабатывания «после отдыха» по ответам
+   * владельца, затем сохраняет.
+   * @param restType - тип отдыха
+   * @param triggerOptions - ответы владельца и сбор сводки срабатываний
+   */
+  function finishRest(
+    restType: RestType,
+    triggerOptions: RestTriggerOptions,
+  ): void {
+    // Лист перечитывается: пока владелец отвечал на вопросы, он мог измениться
+    if (!localCreature.value) {
+      return;
+    }
+
+    handleCreatureUpdate(
+      applyCreatureRest(localCreature.value, restType, triggerOptions),
+    );
 
     toast.add({
-      title: restType === 'long' ? 'Продолжительный отдых' : 'Короткий отдых',
+      title: restType === 'long' ? REST_LABELS.long : REST_LABELS.short,
       description:
         restType === 'long'
-          ? 'Заряды заклинаний и хиты восстановлены.'
-          : 'Заряды коротких заклинаний восстановлены.',
+          ? CREATURE_SHEET_LABELS.longRestDone
+          : CREATURE_SHEET_LABELS.shortRestDone,
       color: 'success',
     });
   }
 
   /**
-   * Разрешает перетаскивание заклинания из компендиума на лист существа.
+   * Отдых существа: сперва владельца спрашивают о срабатываниях «после
+   * отдыха» с ценой или согласием, затем идёт сам отдых.
+   * @param restType - тип отдыха
+   */
+  function handleRest(restType: RestType): void {
+    // Отдых в режиме правки ждёт «Сохранить» или отмены, как и действия
+    if (refuseWhileSheetEditing(localCreature.value?.id)) {
+      return;
+    }
+
+    if (!localCreature.value) {
+      return;
+    }
+
+    void runRestWithTriggers(
+      localCreature.value,
+      restType,
+      {},
+      (triggerOptions) => finishRest(restType, triggerOptions),
+    );
+  }
+
+  /** Тащат ли на лист предмет — для подсветки зоны приёма во вкладке */
+  const isItemDragOver = ref(false);
+
+  /**
+   * Отложенное гашение подсветки. `dragleave` срабатывает и при переходе между
+   * вложенными элементами листа, поэтому подсветку гасит не он, а пауза без
+   * единого `dragover`: каждое движение мыши над листом отодвигает её заново.
+   * Тот же приём, что на листе персонажа.
+   */
+  let itemDragLeaveTimeout: number | undefined;
+
+  /**
+   * Разрешает перетаскивание заклинания или предмета из панели «Предметы» и
+   * компендиума на лист существа.
    * @param event - событие dragover
    */
-  function handleSpellDragOver(event: DragEvent): void {
+  function handleSheetDragOver(event: DragEvent): void {
     if (isReadOnly.value || !event.dataTransfer) {
       return;
     }
 
-    if (event.dataTransfer.types.includes(SPELL_MIME)) {
-      event.preventDefault();
-      event.dataTransfer.dropEffect = 'copy';
+    const types = event.dataTransfer.types;
+
+    const hasItem =
+      types.includes(GAME_ITEM_MIME) || types.includes(GAME_ITEM_TRANSFER_MIME);
+
+    if (!types.includes(SPELL_MIME) && !hasItem) {
+      return;
     }
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+
+    if (hasItem) {
+      isItemDragOver.value = true;
+    }
+
+    window.clearTimeout(itemDragLeaveTimeout);
+
+    itemDragLeaveTimeout = window.setTimeout(() => {
+      isItemDragOver.value = false;
+    }, DRAG_OVER_RESET_DELAY_MS);
+  }
+
+  /** Гасит подсветку зоны приёма, когда предмет увели с листа */
+  function handleSheetDragLeave(): void {
+    isItemDragOver.value = false;
+  }
+
+  /**
+   * Принимает предмет, переданный с другого листа: предмет уходит из инвентаря
+   * отправителя и появляется здесь.
+   *
+   * Отправителя обновляет композабл переноса — его лист может быть закрыт.
+   * Сюда возвращается только новый инвентарь получателя, и он сохраняется
+   * обычным путём листа.
+   *
+   * @param event - событие drop
+   * @returns `true`, если нагрузка была передачей предмета — принята она или
+   *   отброшена. `false` значит «это не передача», и лист идёт дальше по цепочке
+   */
+  function handleItemTransferDrop(event: DragEvent): boolean {
+    // В режиме правки жест не принимается: здесь открыт черновик, и его
+    // «Сохранить» положило бы поверх пришедшего предмета прежний инвентарь
+    // Черновик своего компендиума предмет не принимает: у отправителя он ушёл бы
+    // из мира насовсем — в запись компендиума, а не к существу на столе
+    if (!localCreature.value || props.draftSave) {
+      return false;
+    }
+
+    // Причину говорим: молчаливый отказ выглядел поломкой жеста
+    if (isEditMode.value) {
+      return (
+        isItemTransferDrop(event)
+        && refuseWhileSheetEditing(localCreature.value.id)
+      );
+    }
+
+    const transfer = receiveTransferredItem(
+      event,
+      localCreature.value,
+      props.socket,
+    );
+
+    if (!transfer) {
+      return false;
+    }
+
+    void reportItemTransfer(transfer);
+
+    return true;
+  }
+
+  /**
+   * Дожидается ответа сервера на передачу и говорит игроку итог.
+   *
+   * @param transfer - обещание итога передачи
+   */
+  async function reportItemTransfer(
+    transfer: Promise<ItemTransferResult>,
+  ): Promise<void> {
+    const result = await transfer;
+
+    if (result.outcome.ok) {
+      activeTab.value = 'equipment';
+    }
+
+    toast.add(describeItemTransfer(result, CREATURE_SHEET_LABELS.itemReceived));
+  }
+
+  /**
+   * Добавляет перетащенный из панели «Предметы» или компендиума предмет в
+   * инвентарь существа: новый идентификатор, снятая пометка «только чтение» и
+   * снятая экипировка.
+   *
+   * Запись, которая уже лежит в этом мешке, игнорируется по идентификатору —
+   * так гасится перетаскивание предмета из списка на тот же лист. Одинаковые
+   * предметы из компендиума при этом кладутся сколько угодно раз: каждому
+   * достаётся свой новый идентификатор, а два кинжала в мешке — нормальный
+   * случай (для стопки есть счётчик количества в строке).
+   *
+   * @param event - событие drop
+   * @returns `true`, если нагрузка была предметом — принят он или отброшен.
+   *   `false` значит только «это не предмет», и лист идёт проверять заклинание
+   */
+  function handleCompendiumItemDrop(event: DragEvent): boolean {
+    const itemPayload = event.dataTransfer?.getData(GAME_ITEM_MIME);
+
+    if (!itemPayload || !localCreature.value) {
+      return false;
+    }
+
+    event.preventDefault();
+
+    try {
+      const dropped: unknown = JSON.parse(itemPayload);
+
+      // Испорченная нагрузка и предмет, уже лежащий в этом мешке, отбрасываются
+      // молча: событие всё равно наше, и передавать его дальше нечего
+      if (!isDnDGameItem(dropped)) {
+        return true;
+      }
+
+      const current = localCreature.value.equipment ?? [];
+
+      if (current.some((entry) => entry.id === dropped.id)) {
+        return true;
+      }
+
+      const newItem = createInventoryItem(dropped);
+
+      handleCreatureUpdate({ equipment: [...current, newItem] });
+
+      activeTab.value = 'equipment';
+
+      toast.add({
+        title: CREATURE_SHEET_LABELS.itemAdded,
+        description: dropped.name,
+        color: 'success',
+      });
+    } catch (error) {
+      console.error(CREATURE_SHEET_LABELS.itemDropFailed, error);
+    }
+
+    return true;
   }
 
   /**
@@ -726,21 +1542,33 @@
    * (новый id, дубликат по имени игнорируется).
    * @param event - событие drop
    */
-  function handleSpellDrop(event: DragEvent): void {
-    if (isReadOnly.value || !localCreature.value) {
+  function handleSheetDrop(event: DragEvent): void {
+    isItemDragOver.value = false;
+
+    if (isReadOnly.value || !canControl.value || !localCreature.value) {
       return;
     }
 
-    const data = event.dataTransfer?.getData(SPELL_MIME);
+    if (handleItemTransferDrop(event) || handleCompendiumItemDrop(event)) {
+      return;
+    }
 
-    if (!data) {
+    const spellPayload = event.dataTransfer?.getData(SPELL_MIME);
+
+    if (!spellPayload) {
       return;
     }
 
     event.preventDefault();
 
     try {
-      const dropped = JSON.parse(data) as Spell;
+      const dropped: unknown = JSON.parse(spellPayload);
+
+      // Данные приезжают из события браузера: без проверки испорченная
+      // нагрузка легла бы в запись существа и сломала бы его лист
+      if (!isSpell(dropped)) {
+        return;
+      }
 
       const current = localCreature.value.spells ?? [];
 
@@ -750,20 +1578,30 @@
 
       const newSpell: Spell = { ...dropped, id: generateId('spell') };
 
-      handleCreatureUpdate({ spells: [...current, newSpell] });
+      const spells = [...current, newSpell];
+
+      // Перетащенное заклинание сразу кладётся в группу: вне блока заклинание
+      // существа не живёт — блок задаёт, чем оно колдует. Группа подбирается по
+      // зарядам записи, а если блока нет — заводится вместе с ним
+      handleSpellbookUpdate(
+        syncCreatureSpellcastingUses(
+          spells,
+          ensureCreatureSpellsInBlocks(
+            spells,
+            localCreature.value.system.spellcastingBlocks ?? [],
+          ),
+        ),
+      );
 
       activeTab.value = 'spells';
 
       toast.add({
-        title: 'Заклинание добавлено',
+        title: CREATURE_SHEET_LABELS.spellAdded,
         description: dropped.name,
         color: 'success',
       });
     } catch (error) {
-      console.error(
-        'Не удалось разобрать заклинание при перетаскивании',
-        error,
-      );
+      console.error(CREATURE_SHEET_LABELS.spellDropFailed, error);
     }
   }
 
@@ -787,21 +1625,6 @@
 
   // ── Спасброски ──────────────────────────────────────────────────────────
 
-  const SAVING_THROW_ABILITIES: Array<{
-    key: AbilityType;
-    label: string;
-    shortLabel: string;
-  }> = [
-    { key: 'strength', label: 'Сила', shortLabel: 'Сил.' },
-    { key: 'intelligence', label: 'Интеллект', shortLabel: 'Инт.' },
-    { key: 'dexterity', label: 'Ловкость', shortLabel: 'Лов.' },
-    { key: 'wisdom', label: 'Мудрость', shortLabel: 'Мдр.' },
-    { key: 'constitution', label: 'Телосложение', shortLabel: 'Тел.' },
-    { key: 'charisma', label: 'Харизма', shortLabel: 'Хар.' },
-  ];
-
-  const { resolvedStats } = useResolvedStats(toRef(() => localCreature.value));
-
   /** Спасброски существа как массив AbilityType[] */
   const creatureSavingThrows = computed((): AbilityType[] => {
     return localCreature.value?.system.savingThrows ?? [];
@@ -823,44 +1646,103 @@
     const abilityMod = calculateAbilityModifier(abilityScore);
     const hasProficiency = creatureSavingThrows.value.includes(abilityKey);
 
-    const profBonus = hasProficiency
-      ? localCreature.value.system.proficiencyBonus || 0
-      : 0;
+    const profBonus = hasProficiency ? creatureProficiencyBonus.value : 0;
 
     return abilityMod + profBonus;
   }
 
   /**
-   * Вычисляет пассивную Внимательность на основе Мудрости и владения навыком Внимательность (perception).
+   * Пассивная Внимательность: основа плюс значение навыка. Значение берётся
+   * оттуда же, откуда его берёт строка списка навыков, — расходиться числа в
+   * двух местах листа не должны.
    */
   const passivePerception = computed(() => {
     if (!localCreature.value) {
-      return 10;
+      return PASSIVE_SKILL_BASE;
     }
 
-    const wisScore = localCreature.value.system.abilities.wisdom ?? 10;
-    const wisMod = calculateAbilityModifier(wisScore);
+    const fallback =
+      calculateAbilityModifier(
+        localCreature.value.system.abilities.wisdom ?? 10,
+      )
+      + getProficiencyContribution(
+        creatureProficiencyBonus.value,
+        getSkillProficiency('perception'),
+      );
 
-    const perceptionProf =
-      localCreature.value.system.skills.perception ?? 'none';
+    return (
+      PASSIVE_SKILL_BASE + (resolvedStats.value?.skills.perception ?? fallback)
+    );
+  });
 
-    const baseProf = localCreature.value.system.proficiencyBonus ?? 0;
-
-    const profBonus = getProficiencyContribution(baseProf, perceptionProf);
-
-    return 10 + wisMod + profBonus;
+  /**
+   * Подпись дальности обычного зрения. Незаданные настройки зрения
+   * равнозначны нулю — существо видит без ограничения по дистанции.
+   */
+  const creatureVisionRangeLabel = computed(() => {
+    return formatVisionRange(localCreature.value?.token?.vision?.range ?? 0);
   });
 
   /**
    * Форматирует модификатор со знаком (+/-)
    */
-  function formatModifier(value: number): string {
-    return value >= 0 ? `+${value}` : `${value}`;
+  /**
+   * Нажатие по строке спасброска: вне режима правки катит спасбросок — как на
+   * листе персонажа. В режиме правки строка ничего не бросает: там её кружком
+   * ставят владение.
+   *
+   * @param ability - характеристика спасброска
+   */
+  function handleSavingThrowClick(ability: {
+    key: AbilityType;
+    label: string;
+  }): void {
+    if (isEditMode.value) {
+      return;
+    }
+
+    openDiceRoll({
+      modifier: calculateSavingThrow(ability.key),
+      evaluateBonusRollFormulas: buildRollBonusEvaluator(
+        () => localCreature.value ?? undefined,
+        `save.${ability.key}`,
+      ),
+      title: `${SAVING_THROW_ROLL_LABELS.titlePrefix}${ability.label}`,
+      rollLabel: `${SAVING_THROW_ROLL_LABELS.rollPrefix}${ability.label}`,
+      rollButtonText: SAVING_THROW_ROLL_LABELS.button,
+    });
   }
 
   /**
    * Переключает владение спасброском для характеристики
    */
+  const isSavingThrowSettingsOpen = ref(false);
+
+  /** Открывает окно настройки спасбросков — только в правке */
+  function openSavingThrowSettings(): void {
+    if (isEditMode.value) {
+      isSavingThrowSettingsOpen.value = true;
+    }
+  }
+
+  /**
+   * Применяет настройку спасбросков: владения и поправки расчёта приходят из
+   * окна вместе — их правят там одной таблицей.
+   *
+   * @param payload - настройка из окна
+   * @param payload.savingThrows - характеристики, спасбросками которых владеют
+   * @param payload.settings - поправки расчёта спасбросков
+   */
+  function onSavingThrowSettingsApply(payload: {
+    savingThrows: AbilityType[];
+    settings: DnDSavingThrowSettings;
+  }): void {
+    handleSystemUpdate({
+      savingThrows: payload.savingThrows,
+      savingThrowSettings: payload.settings,
+    });
+  }
+
   function toggleSavingThrow(abilityKey: AbilityType): void {
     if (!isEditMode.value || !localCreature.value) {
       return;
@@ -880,29 +1762,501 @@
 </script>
 
 <template>
+  <!-- Сводка существа — боевой блок, защиты, спасброски, навыки, чувства,
+    языки — нужна в двух местах: на широком листе она стоит левой колонкой, на
+    узком уходит во вкладку «Основное». Одно определение держит обработчики
+    здесь и не плодит дубли разметки -->
+  <DefineSummary>
+    <!-- Свой `@container` у сводки узкого листа: в две колонки она встаёт по
+      собственной ширине. На широком листе обёртка — сама левая колонка -->
+    <div
+      v-if="localCreature"
+      :class="sheetLayoutClasses.summary"
+    >
+      <div :class="sheetLayoutClasses.summaryBlocks">
+        <!-- Боевой блок: КД, ХП, Скорость -->
+        <CreatureCombatBlock
+          :system="localCreature.system"
+          :is-edit-mode="isEditMode"
+          :ability-mods="skillAbilityMods"
+          :proficiency-bonus="creatureProficiencyBonus"
+          :armor-class="resolvedStats?.armorClass"
+          :resolved-movement="resolvedStats?.movement"
+          :active-effects="combinedEffects"
+          :hit-dice-bonus-context="hitDiceBonusContext"
+          @update:system="handleSystemUpdate"
+        />
+
+        <!-- Истощение: сразу под здоровьем — степень штрафует все тесты
+                к20 и скорость, и читается она вместе с хитами -->
+        <ExhaustionPanel
+          v-if="visibleBlocks.exhaustion"
+          :level="exhaustionLevel"
+          :is-edit-mode="isEditMode"
+          @select="handleExhaustionSelect"
+        />
+
+        <!-- Защиты -->
+        <FieldsetLabel
+          v-if="visibleBlocks.vulnerabilities"
+          :label="CREATURE_SHEET_LABELS.vulnerabilities"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.vulnerabilities"
+          @click.left.exact.prevent="openDefensesModal('vulnerabilities')"
+        >
+          <!-- Шестерёнка ведёт в то же окно, что и клик по блоку: значок
+                  называет настройку, а не прячет её за догадкой -->
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="CREATURE_SHEET_LABELS.vulnerabilitiesOpen"
+              @open="openDefensesModal('vulnerabilities')"
+            />
+          </template>
+
+          <div class="flex flex-wrap gap-1.5 p-2 pt-1">
+            <UBadge
+              v-for="key in localCreature.system.defenses.vulnerabilities"
+              :key="key"
+              :label="getDefenseLabel(key)"
+              color="error"
+              variant="subtle"
+              :ui="{
+                base: 'h-auto max-w-full',
+                label:
+                  'whitespace-normal wrap-break-word text-left leading-tight',
+              }"
+            />
+
+            <span
+              v-if="localCreature.system.defenses.vulnerabilities.length === 0"
+              class="text-xs text-dimmed italic"
+            >
+              {{ CREATURE_SHEET_LABELS.empty }}
+            </span>
+          </div>
+
+          <p
+            v-if="localCreature.system.defenses.vulnerabilitiesText"
+            class="px-2 pb-2 text-xs wrap-break-word text-toned"
+          >
+            {{ localCreature.system.defenses.vulnerabilitiesText }}
+          </p>
+        </FieldsetLabel>
+
+        <FieldsetLabel
+          v-if="visibleBlocks.resistances"
+          :label="CREATURE_SHEET_LABELS.resistances"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.resistances"
+          @click.left.exact.prevent="openDefensesModal('resistances')"
+        >
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="CREATURE_SHEET_LABELS.resistancesOpen"
+              @open="openDefensesModal('resistances')"
+            />
+          </template>
+
+          <div class="flex flex-wrap gap-1.5 p-2 pt-1">
+            <UBadge
+              v-for="key in localCreature.system.defenses.resistances"
+              :key="key"
+              :label="getDefenseLabel(key)"
+              color="info"
+              variant="subtle"
+              :ui="{
+                base: 'h-auto max-w-full',
+                label:
+                  'whitespace-normal wrap-break-word text-left leading-tight',
+              }"
+            />
+
+            <span
+              v-if="localCreature.system.defenses.resistances.length === 0"
+              class="text-xs text-dimmed italic"
+            >
+              {{ CREATURE_SHEET_LABELS.empty }}
+            </span>
+          </div>
+
+          <p
+            v-if="localCreature.system.defenses.resistancesText"
+            class="px-2 pb-2 text-xs wrap-break-word text-toned"
+          >
+            {{ localCreature.system.defenses.resistancesText }}
+          </p>
+        </FieldsetLabel>
+
+        <FieldsetLabel
+          v-if="visibleBlocks.immunities"
+          :label="CREATURE_SHEET_LABELS.immunities"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.immunities"
+          @click.left.exact.prevent="openDefensesModal('immunities')"
+        >
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="CREATURE_SHEET_LABELS.immunitiesOpen"
+              @open="openDefensesModal('immunities')"
+            />
+          </template>
+
+          <div class="flex flex-wrap gap-1.5 p-2 pt-1">
+            <UBadge
+              v-for="key in localCreature.system.defenses.immunities"
+              :key="key"
+              :label="getDefenseLabel(key)"
+              color="warning"
+              variant="subtle"
+              :ui="{
+                base: 'h-auto max-w-full',
+                label:
+                  'whitespace-normal wrap-break-word text-left leading-tight',
+              }"
+            />
+
+            <span
+              v-if="localCreature.system.defenses.immunities.length === 0"
+              class="text-xs text-dimmed italic"
+            >
+              {{ CREATURE_SHEET_LABELS.empty }}
+            </span>
+          </div>
+
+          <p
+            v-if="localCreature.system.defenses.immunitiesText"
+            class="px-2 pb-2 text-xs wrap-break-word text-toned"
+          >
+            {{ localCreature.system.defenses.immunitiesText }}
+          </p>
+        </FieldsetLabel>
+
+        <FieldsetLabel
+          v-if="visibleBlocks.conditionImmunities"
+          :label="GRANT_FIELD_LABELS.conditionImmunities"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.editable"
+          @click.left.exact.prevent="openConditionImmunitiesModal"
+        >
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="CREATURE_SHEET_LABELS.conditionImmunitiesOpen"
+              @open="openConditionImmunitiesModal"
+            />
+          </template>
+
+          <div class="flex flex-wrap gap-1.5 p-2 pt-1">
+            <UBadge
+              v-for="key in localCreature.system.defenses.conditionImmunities"
+              :key="key"
+              :label="getDefenseLabel(key)"
+              color="neutral"
+              variant="subtle"
+              :ui="{
+                base: 'h-auto max-w-full',
+                label:
+                  'whitespace-normal wrap-break-word text-left leading-tight',
+              }"
+            />
+
+            <span
+              v-if="
+                localCreature.system.defenses.conditionImmunities.length === 0
+              "
+              class="text-xs text-dimmed italic"
+            >
+              {{ CREATURE_SHEET_LABELS.empty }}
+            </span>
+          </div>
+        </FieldsetLabel>
+        <!-- Навыки, Чувства и Языки -->
+        <!-- Спасброски -->
+        <FieldsetLabel
+          :label="GRANT_SECTION_LABELS.savingThrows"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.plain"
+        >
+          <!-- Шестерёнка ведёт в настройку расчёта: кружки в самом блоке
+                  ставят только владение, а характеристику спасброска и свои
+                  бонусы правят в окне -->
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="SAVING_THROW_SETTINGS_LABELS.open"
+              @open="openSavingThrowSettings"
+            />
+          </template>
+
+          <div class="px-2 pb-1">
+            <div class="grid grid-cols-2 gap-x-2 gap-y-1">
+              <div
+                v-for="ability in SAVING_THROW_ABILITIES"
+                :key="ability.key"
+                class="flex cursor-pointer items-center gap-2 rounded p-1.5 transition-colors hover:bg-elevated"
+                @click.left.exact.prevent="handleSavingThrowClick(ability)"
+              >
+                <button
+                  class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border"
+                  :class="
+                    creatureSavingThrows.includes(ability.key)
+                      ? 'border-primary bg-primary'
+                      : 'border-accented bg-transparent'
+                  "
+                  @click.left.exact.prevent.stop="
+                    toggleSavingThrow(ability.key)
+                  "
+                />
+
+                <span class="flex-1 truncate text-sm font-medium text-toned">{{
+                  ability.shortLabel
+                }}</span>
+
+                <span
+                  class="rounded border border-default bg-elevated px-2 py-0.5 text-sm font-bold text-highlighted shadow-sm"
+                >
+                  {{ formatSignedNumber(calculateSavingThrow(ability.key)) }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </FieldsetLabel>
+
+        <!-- Навыки — бейджами, как в стат-блоке: у существа отмечены
+                считанные навыки, и полный список правил занимал бы всю колонку
+                ради трёх строк. Владения правят в своём окне, а нажатие по
+                бейджу вне правки катит проверку этого навыка -->
+        <FieldsetLabel
+          v-if="visibleBlocks.skills"
+          :label="GRANT_SECTION_LABELS.skills"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.editable"
+          @click.left.exact.prevent="openSkillsModal"
+        >
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="SKILL_SETTINGS_LABELS.open"
+              @open="openSkillsModal"
+            />
+          </template>
+
+          <div class="flex flex-wrap gap-1.5 p-2 pt-1">
+            <UBadge
+              v-for="badge in skillBadges"
+              :key="badge.id"
+              :label="badge.label"
+              color="neutral"
+              variant="subtle"
+              class="cursor-pointer transition-colors hover:bg-accented"
+              @click.left.exact.stop.prevent="handleSkillBadgeClick(badge)"
+            />
+
+            <span
+              v-if="skillBadges.length === 0"
+              class="text-xs text-dimmed italic"
+            >
+              {{ CREATURE_SHEET_LABELS.empty }}
+            </span>
+          </div>
+        </FieldsetLabel>
+
+        <!-- Восприятие только считает: зрение существа правят в его
+                настройках токена, поэтому блок не настраивается и в правке -->
+        <FieldsetLabel
+          :label="CREATURE_SHEET_LABELS.perception"
+          class="bg-default/20"
+          :class="SHEET_BLOCK_VIEW_BORDER_CLASS"
+        >
+          <div class="flex flex-col gap-1 p-2 pt-1 text-sm text-default">
+            <div class="flex items-center justify-between">
+              <span class="text-dimmed">
+                {{ CREATURE_SHEET_LABELS.visionPrefix }}
+              </span>
+
+              <span>{{ creatureVisionRangeLabel }}</span>
+            </div>
+
+            <div
+              v-if="localCreature.token?.vision?.darkvision"
+              class="flex items-center justify-between"
+            >
+              <span class="text-dimmed">
+                {{ CREATURE_SHEET_LABELS.darkvisionPrefix }}
+              </span>
+
+              <span>
+                {{ localCreature.token.vision.darkvision }}
+                {{ FEET_UNIT_LABEL }}
+              </span>
+            </div>
+
+            <div class="flex items-center justify-between">
+              <span class="text-dimmed">
+                {{ CREATURE_SHEET_LABELS.passivePerceptionPrefix }}
+              </span>
+
+              <span class="font-bold text-highlighted">{{
+                passivePerception
+              }}</span>
+            </div>
+          </div>
+        </FieldsetLabel>
+
+        <FieldsetLabel
+          v-if="visibleBlocks.languages"
+          :label="GRANT_SECTION_LABELS.languages"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.editable"
+          @click.left.exact.prevent="openLanguagesModal"
+        >
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="PROFICIENCY_MODAL_LABELS.languagesOpen"
+              @open="openLanguagesModal"
+            />
+          </template>
+
+          <div class="flex flex-wrap gap-1.5 p-2 pt-1">
+            <UBadge
+              v-for="language in localCreature.system.languages"
+              :key="language"
+              :label="language"
+              color="neutral"
+              variant="subtle"
+              :ui="{
+                base: 'h-auto max-w-full',
+                label:
+                  'whitespace-normal wrap-break-word text-left leading-tight',
+              }"
+            />
+
+            <span
+              v-if="
+                !localCreature.system.languages
+                || localCreature.system.languages.length === 0
+              "
+              class="text-xs text-dimmed italic"
+            >
+              {{ CREATURE_SHEET_LABELS.empty }}
+            </span>
+          </div>
+        </FieldsetLabel>
+
+        <FieldsetLabel
+          v-if="visibleBlocks.environments"
+          :label="CREATURE_SHEET_LABELS.environments"
+          class="bg-default/20 transition-colors"
+          :class="blockClasses.environments"
+          @click.left.exact.prevent="openEnvironmentsModal"
+        >
+          <template
+            v-if="isEditMode"
+            #actions
+          >
+            <SheetSettingsGear
+              :label="CREATURE_SHEET_LABELS.environmentsOpen"
+              @open="openEnvironmentsModal"
+            />
+          </template>
+
+          <div class="flex flex-col gap-1 p-2 pt-1">
+            <div class="flex flex-wrap gap-1.5">
+              <UBadge
+                v-for="env in localCreature.system.environments"
+                :key="env"
+                :label="
+                  CREATURE_ENVIRONMENTS.find((entry) => entry.key === env)
+                    ?.label || env
+                "
+                color="neutral"
+                variant="subtle"
+                :ui="{
+                  base: 'h-auto max-w-full',
+                  label:
+                    'whitespace-normal wrap-break-word text-left leading-tight',
+                }"
+              />
+
+              <span
+                v-if="
+                  (!localCreature.system.environments
+                    || localCreature.system.environments.length === 0)
+                  && !localCreature.system.customEnvironments
+                "
+                class="text-xs text-dimmed italic"
+              >
+                {{ CREATURE_SHEET_LABELS.empty }}
+              </span>
+            </div>
+
+            <div
+              v-if="localCreature.system.customEnvironments"
+              class="mt-1 text-sm text-toned"
+            >
+              <span class="mb-0.5 block text-xs text-dimmed">
+                {{ CREATURE_SHEET_LABELS.environmentSpecialPrefix }}
+              </span>
+              {{ localCreature.system.customEnvironments }}
+            </div>
+          </div>
+        </FieldsetLabel>
+      </div>
+    </div>
+  </DefineSummary>
+
+  <!--
+    `max-h-[100%]` в `ui.body` снимает дефолтный потолок тела окна в 90vh —
+    тот же приём, что в листе персонажа: без него на полной высоте под
+    содержимым оставалась пустая полоса.
+  -->
   <UDraggableModal
-    v-model:open="isOpen"
+    ref="sheetModalRef"
+    :open="isOpen"
+    :title="minimizedTitle"
     hide-header
+    poppable
     :initial-width="940"
     :initial-height="780"
-    :min-width="400"
+    :min-width="SHEET_WINDOW_MIN_WIDTH"
     :min-height="300"
     :z-index="zIndex"
     :modal-id="modalId"
     :saved-position="savedPosition"
     :saved-size="savedSize"
     :ui="{
-      content: 'bg-default rounded-2xl',
-      body: 'p-0 h-full flex flex-col',
+      content: 'bg-default rounded-xl',
+      body: 'p-0 h-full flex flex-col max-h-[100%]',
     }"
+    @update:open="handleModalClose"
     @bring-to-front="emit('bring-to-front')"
   >
     <template #body>
       <div
         v-if="localCreature"
+        ref="sheetBody"
         class="relative flex h-full flex-col"
-        @dragover="handleSpellDragOver"
-        @drop="handleSpellDrop"
+        @dragover="handleSheetDragOver"
+        @dragleave="handleSheetDragLeave"
+        @drop="handleSheetDrop"
       >
         <!-- Фоновая картинка с затуханием -->
         <img
@@ -910,474 +2264,107 @@
           alt=""
           class="pointer-events-none absolute inset-0 h-full w-full object-cover opacity-8"
         />
-        <!-- Шапка существа (Full bleed) -->
-        <CreatureHeader
-          :creature="localCreature"
-          :is-edit-mode="isEditMode"
-          :is-creating="!props.creatureId && !isCreated"
-          :can-edit="canControl && !isReadOnly"
-          @update="handleCreatureUpdate"
-          @update:system="handleSystemUpdate"
-          @toggle-edit-mode="toggleEditMode"
-          @open-settings="openSettings"
-          @short-rest="handleRest('short')"
-          @long-rest="handleRest('long')"
-          @close="handleCancel"
-          @save="handleSave"
-        />
 
-        <div class="custom-scrollbar flex-1 overflow-y-auto p-4">
-          <div class="flex gap-6">
-            <!-- Левая колонка -->
-            <div class="flex w-[250px] shrink-0 flex-col gap-3">
-              <!-- Боевой блок: КД, ХП, Скорость -->
-              <CreatureCombatBlock
-                :system="localCreature.system"
-                :is-edit-mode="isEditMode"
-                @update:system="handleSystemUpdate"
-              />
+        <div :class="sheetFrameClass">
+          <!-- Шапка существа (Full bleed) -->
+          <CreatureHeader
+            :creature="localCreature"
+            :is-edit-mode="isEditMode"
+            :is-creating="isCreating"
+            :can-edit="canControl && !isReadOnly"
+            :can-pop-out="canPopOutSheet"
+            :is-popped-out="isSheetPoppedOut"
+            @update="handleCreatureUpdate"
+            @update:system="handleSystemUpdate"
+            @toggle-edit-mode="toggleEditMode"
+            @open-settings="openSettings"
+            @short-rest="handleRest('short')"
+            @long-rest="handleRest('long')"
+            @close="handleCancel"
+            @minimize="minimizeSheet"
+            @toggle-pop-out="togglePopOutSheet"
+            @save="handleSave"
+          />
 
-              <!-- Защиты -->
-              <FieldsetLabel
-                label="Уязвимости"
-                class="bg-default/20 transition-colors"
-                :class="[
-                  isEditMode
-                    ? 'cursor-pointer border-error/30 hover:border-error/50'
-                    : 'border-muted',
-                ]"
-                @click.left.exact.prevent="openDefensesModal('vulnerabilities')"
-              >
-                <div class="flex flex-wrap gap-1.5 p-2 pt-1">
-                  <UBadge
-                    v-for="key in localCreature.system.defenses.vulnerabilities"
-                    :key="key"
-                    :label="getDefenseLabel(key)"
-                    color="error"
-                    variant="subtle"
-                    :ui="{
-                      base: 'h-auto max-w-full',
-                      label:
-                        'whitespace-normal wrap-break-word text-left leading-tight',
-                    }"
-                  />
+          <!-- Пока ширина листа не замерена, раскладка неизвестна, и рисовать
+          содержимое рано: угаданная раскладка на телефоне неверна, и лист
+          перестроился бы на глазах -->
+          <div :class="sheetLayoutClasses.content">
+            <div
+              v-if="isMeasured"
+              :class="sheetLayoutClasses.columns"
+            >
+              <!-- Широкий лист: сводка — левой колонкой -->
+              <ReuseSummary v-if="isWide" />
 
-                  <span
-                    v-if="
-                      localCreature.system.defenses.vulnerabilities.length === 0
-                    "
-                    class="text-xs text-dimmed italic"
-                  >
-                    Нет
-                  </span>
-                </div>
-              </FieldsetLabel>
+              <!-- Правая колонка -->
+              <div class="flex min-w-0 flex-1 flex-col gap-4">
+                <!-- Характеристики: 6 ячеек -->
+                <CreatureAbilities
+                  :creature="localCreature"
+                  :is-edit-mode="isEditMode"
+                  @update:system="handleSystemUpdate"
+                />
 
-              <FieldsetLabel
-                label="Сопротивления"
-                class="bg-default/20 transition-colors"
-                :class="[
-                  isEditMode
-                    ? 'cursor-pointer border-info/30 hover:border-info/50'
-                    : 'border-muted',
-                ]"
-                @click.left.exact.prevent="openDefensesModal('resistances')"
-              >
-                <div class="flex flex-wrap gap-1.5 p-2 pt-1">
-                  <UBadge
-                    v-for="key in localCreature.system.defenses.resistances"
-                    :key="key"
-                    :label="getDefenseLabel(key)"
-                    color="info"
-                    variant="subtle"
-                    :ui="{
-                      base: 'h-auto max-w-full',
-                      label:
-                        'whitespace-normal wrap-break-word text-left leading-tight',
-                    }"
-                  />
+                <!-- Вкладки. Промежутки те же, что и у вкладок листа персонажа:
+                строка вкладок у обоих листов одна и та же, и отступ до
+                содержимого не должен расходиться -->
+                <SheetTabs
+                  v-model="activeTab"
+                  :tabs="tabs"
+                  class="mt-2"
+                >
+                  <!-- Узкий лист: сводка — первой вкладкой -->
+                  <ReuseSummary v-if="activeTab === SHEET_MAIN_TAB_ID" />
 
-                  <span
-                    v-if="
-                      localCreature.system.defenses.resistances.length === 0
-                    "
-                    class="text-xs text-dimmed italic"
-                  >
-                    Нет
-                  </span>
-                </div>
-              </FieldsetLabel>
-
-              <FieldsetLabel
-                label="Иммунитеты"
-                class="bg-default/20 transition-colors"
-                :class="[
-                  isEditMode
-                    ? 'cursor-pointer border-warning/30 hover:border-warning/50'
-                    : 'border-muted',
-                ]"
-                @click.left.exact.prevent="openDefensesModal('immunities')"
-              >
-                <div class="flex flex-wrap gap-1.5 p-2 pt-1">
-                  <UBadge
-                    v-for="key in localCreature.system.defenses.immunities"
-                    :key="key"
-                    :label="getDefenseLabel(key)"
-                    color="warning"
-                    variant="subtle"
-                    :ui="{
-                      base: 'h-auto max-w-full',
-                      label:
-                        'whitespace-normal wrap-break-word text-left leading-tight',
-                    }"
-                  />
-
-                  <span
-                    v-if="localCreature.system.defenses.immunities.length === 0"
-                    class="text-xs text-dimmed italic"
-                  >
-                    Нет
-                  </span>
-                </div>
-              </FieldsetLabel>
-
-              <FieldsetLabel
-                label="Иммунитет к состояниям"
-                class="bg-default/20 transition-colors"
-                :class="[
-                  isEditMode
-                    ? 'cursor-pointer border-primary/30 hover:border-primary/50'
-                    : 'border-muted',
-                ]"
-                @click.left.exact.prevent="isConditionImmunitiesOpen = true"
-              >
-                <div class="flex flex-wrap gap-1.5 p-2 pt-1">
-                  <UBadge
-                    v-for="key in localCreature.system.defenses
-                      .conditionImmunities"
-                    :key="key"
-                    :label="getDefenseLabel(key)"
-                    color="neutral"
-                    variant="subtle"
-                    :ui="{
-                      base: 'h-auto max-w-full',
-                      label:
-                        'whitespace-normal wrap-break-word text-left leading-tight',
-                    }"
-                  />
-
-                  <span
-                    v-if="
-                      localCreature.system.defenses.conditionImmunities.length
-                      === 0
-                    "
-                    class="text-xs text-dimmed italic"
-                  >
-                    Нет
-                  </span>
-                </div>
-              </FieldsetLabel>
-              <!-- Навыки, Чувства и Языки -->
-              <FieldsetLabel
-                label="Спасброски"
-                class="bg-default/20"
-                :class="[isEditMode ? 'border-gold/30' : 'border-muted']"
-              >
-                <div class="px-2 pb-1">
-                  <div class="grid grid-cols-2 gap-x-2 gap-y-1">
-                    <div
-                      v-for="ability in SAVING_THROW_ABILITIES"
-                      :key="ability.key"
-                      class="flex items-center gap-2 rounded p-1.5 transition-colors"
-                      :class="[!isEditMode ? 'cursor-default' : '']"
-                    >
-                      <button
-                        class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border border-accented"
-                        :class="
-                          creatureSavingThrows.includes(ability.key)
-                            ? 'bg-inverted'
-                            : 'bg-transparent'
-                        "
-                        @click.left.exact.prevent.stop="
-                          toggleSavingThrow(ability.key)
-                        "
-                      >
-                        <div
-                          v-if="creatureSavingThrows.includes(ability.key)"
-                          class="h-1.5 w-1.5 rounded-full bg-inverted"
-                        />
-                      </button>
-
-                      <span
-                        class="flex-1 truncate text-sm font-medium text-toned"
-                        >{{ ability.shortLabel }}</span
-                      >
-
-                      <span
-                        class="rounded border border-default bg-elevated px-2 py-0.5 text-sm font-bold text-highlighted shadow-sm"
-                      >
-                        {{ formatModifier(calculateSavingThrow(ability.key)) }}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </FieldsetLabel>
-
-              <FieldsetLabel
-                label="Навыки"
-                class="bg-default/20 transition-colors"
-                :class="[
-                  isEditMode
-                    ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-                    : 'border-muted',
-                ]"
-                @click.left.exact.prevent="openSkillsModal"
-              >
-                <div class="flex flex-wrap gap-1.5 p-2 pt-1">
-                  <UBadge
-                    v-for="skill in formattedSkills"
-                    :key="skill"
-                    :label="skill"
-                    color="neutral"
-                    variant="subtle"
-                  />
-
-                  <span
-                    v-if="formattedSkills.length === 0"
-                    class="text-xs text-dimmed italic"
-                  >
-                    Нет
-                  </span>
-                </div>
-              </FieldsetLabel>
-
-              <FieldsetLabel
-                label="Восприятие"
-                class="border-muted bg-default/20"
-              >
-                <div class="flex flex-col gap-1 p-2 pt-1 text-sm text-default">
-                  <div class="flex items-center justify-between">
-                    <span class="text-dimmed">Зрение:</span>
-
-                    <span
-                      >{{ localCreature.token?.vision?.range ?? 0 }} фт.</span
-                    >
-                  </div>
-
-                  <div
-                    v-if="localCreature.token?.vision?.darkvision"
-                    class="flex items-center justify-between"
-                  >
-                    <span class="text-dimmed">Тёмное зрение:</span>
-
-                    <span>{{ localCreature.token.vision.darkvision }} фт.</span>
-                  </div>
-
-                  <div class="flex items-center justify-between">
-                    <span class="text-dimmed">Пассивное Внимание:</span>
-
-                    <span class="font-bold text-highlighted">{{
-                      passivePerception
-                    }}</span>
-                  </div>
-                </div>
-              </FieldsetLabel>
-
-              <FieldsetLabel
-                label="Языки"
-                class="bg-default/20 transition-colors"
-                :class="[
-                  isEditMode
-                    ? 'cursor-pointer border-gold/30 hover:border-gold/50'
-                    : 'border-muted',
-                ]"
-                @click.left.exact.prevent="openLanguagesModal"
-              >
-                <div class="flex flex-wrap gap-1.5 p-2 pt-1">
-                  <UBadge
-                    v-for="language in localCreature.system.languages"
-                    :key="language"
-                    :label="language"
-                    color="neutral"
-                    variant="subtle"
-                    :ui="{
-                      base: 'h-auto max-w-full',
-                      label:
-                        'whitespace-normal wrap-break-word text-left leading-tight',
-                    }"
-                  />
-
-                  <span
-                    v-if="
-                      !localCreature.system.languages
-                      || localCreature.system.languages.length === 0
-                    "
-                    class="text-xs text-dimmed italic"
-                  >
-                    Нет
-                  </span>
-                </div>
-              </FieldsetLabel>
-
-              <FieldsetLabel
-                label="Среда обитания"
-                class="bg-default/20 transition-colors"
-                :class="[
-                  isEditMode
-                    ? 'cursor-pointer border-success/30 hover:border-success/50'
-                    : 'border-muted',
-                ]"
-                @click.left.exact.prevent="openEnvironmentsModal"
-              >
-                <div class="flex flex-col gap-1 p-2 pt-1">
-                  <div class="flex flex-wrap gap-1.5">
-                    <UBadge
-                      v-for="env in localCreature.system.environments"
-                      :key="env"
-                      :label="
-                        CREATURE_ENVIRONMENTS.find((entry) => entry.key === env)
-                          ?.label || env
-                      "
-                      color="neutral"
-                      variant="subtle"
-                      :ui="{
-                        base: 'h-auto max-w-full',
-                        label:
-                          'whitespace-normal wrap-break-word text-left leading-tight',
-                      }"
-                    />
-
-                    <span
-                      v-if="
-                        (!localCreature.system.environments
-                          || localCreature.system.environments.length === 0)
-                        && !localCreature.system.customEnvironments
-                      "
-                      class="text-xs text-dimmed italic"
-                    >
-                      Нет
-                    </span>
-                  </div>
-
-                  <div
-                    v-if="localCreature.system.customEnvironments"
-                    class="mt-1 text-sm text-toned"
-                  >
-                    <span class="mb-0.5 block text-xs text-dimmed"
-                      >Особая:</span
-                    >
-                    {{ localCreature.system.customEnvironments }}
-                  </div>
-                </div>
-              </FieldsetLabel>
-            </div>
-
-            <!-- Правая колонка -->
-            <div class="flex min-w-0 flex-1 flex-col gap-4">
-              <!-- Характеристики: 6 ячеек -->
-              <CreatureAbilities
-                :creature="localCreature"
-                :is-edit-mode="isEditMode"
-                @update:system="handleSystemUpdate"
-              />
-
-              <!-- Вкладки -->
-              <div class="relative mt-2 flex flex-1 flex-col space-y-2">
-                <div class="flex gap-4 border-b border-muted/30">
-                  <button
-                    v-for="tab in tabs"
-                    :key="tab.id"
-                    :class="[
-                      'relative pb-2 text-xs font-bold tracking-wider uppercase transition-colors',
-                      activeTab === tab.id
-                        ? 'border-b-2 border-gold text-gold'
-                        : 'border-b-2 border-transparent text-muted hover:text-highlighted',
-                    ]"
-                    @click.left.exact.prevent="activeTab = tab.id"
-                  >
-                    {{ tab.label }}
-                  </button>
-                </div>
-
-                <!-- Содержимое вкладок -->
-                <div class="flex flex-1 flex-col space-y-3">
                   <!-- Действия -->
-                  <template v-if="activeTab === 'actions'">
-                    <CreatureActionsBlock
-                      mode="action"
-                      :actions="localCreature.system.actions"
-                      :is-edit-mode="isEditMode"
-                      :is-read-only="isReadOnly"
-                      :creature-id="localCreature.id"
-                      :creature-name="localCreature.name"
-                      @update="handleActionsUpdate"
-                    />
+                  <CreatureActionsTab
+                    v-if="activeTab === 'actions'"
+                    :creature="localCreature"
+                    :is-edit-mode="isEditMode"
+                    :is-read-only="isReadOnly"
+                    @update:actions="handleActionsUpdate"
+                    @update:bonus-actions="handleBonusActionsUpdate"
+                    @update:reactions="handleReactionsUpdate"
+                    @update:legendary-actions="handleLegendaryActionsUpdate"
+                    @update:legendary-count="handleLegendaryCountUpdate"
+                  />
 
-                    <CreatureActionsBlock
-                      title="Бонусные действия"
-                      mode="action"
-                      :actions="localCreature.system.bonusActions"
+                  <!-- Инвентарь -->
+                  <template v-if="activeTab === 'equipment'">
+                    <CreatureEquipmentBlock
+                      :creature="localCreature"
                       :is-edit-mode="isEditMode"
-                      :is-read-only="isReadOnly"
-                      :creature-id="localCreature.id"
-                      :creature-name="localCreature.name"
-                      @update="handleBonusActionsUpdate"
-                    />
-
-                    <CreatureActionsBlock
-                      title="Реакции"
-                      mode="action"
-                      :actions="localCreature.system.reactions"
-                      :is-edit-mode="isEditMode"
-                      :is-read-only="isReadOnly"
-                      :creature-id="localCreature.id"
-                      :creature-name="localCreature.name"
-                      @update="handleReactionsUpdate"
-                    />
-
-                    <CreatureActionsBlock
-                      v-if="
-                        isEditMode
-                        || localCreature.system.legendary.actions.length > 0
-                      "
-                      title="Легендарные действия"
-                      mode="action"
-                      :actions="localCreature.system.legendary.actions"
-                      :is-edit-mode="isEditMode"
-                      :is-read-only="isReadOnly"
-                      :creature-id="localCreature.id"
-                      :creature-name="localCreature.name"
-                      :legendary-count="localCreature.system.legendary.count"
-                      @update="handleLegendaryActionsUpdate"
-                      @update:legendary-count="handleLegendaryCountUpdate"
+                      :is-drag-over="isItemDragOver"
+                      :is-read-only="isReadOnly || !canControl"
+                      @update:creature="handleCreatureUpdate"
                     />
                   </template>
 
                   <!-- Особенности -->
-                  <template v-if="activeTab === 'traits'">
-                    <CreatureActionsBlock
-                      mode="trait"
-                      :actions="localCreature.system.traits"
-                      :is-edit-mode="isEditMode"
-                      :is-read-only="isReadOnly"
-                      :creature-id="localCreature.id"
-                      :creature-name="localCreature.name"
-                      @update="handleTraitsUpdate"
-                    />
-                  </template>
+                  <CreatureTraitsTab
+                    v-if="activeTab === 'traits'"
+                    :creature="localCreature"
+                    :is-edit-mode="isEditMode"
+                    :is-read-only="isReadOnly"
+                    @update:traits="handleTraitsUpdate"
+                  />
 
                   <!-- Заклинания -->
                   <template v-if="activeTab === 'spells'">
                     <CreatureSpellsBlock
                       :creature="localCreature"
                       :spells="localCreature.spells"
-                      :spellcasting="localCreature.system.spellcasting"
+                      :spellcasting-blocks="
+                        localCreature.system.spellcastingBlocks
+                      "
                       :is-edit-mode="isEditMode"
                       :is-read-only="isReadOnly"
+                      :can-edit="canControl && !isReadOnly"
                       :creature-id="localCreature.id"
                       :creature-name="localCreature.name"
-                      @update:spells="handleSpellsUpdate"
-                      @update:spellcasting="handleSpellcastingUpdate"
+                      :socket="socket"
+                      @update:spellbook="handleSpellbookUpdate"
                     />
                   </template>
 
@@ -1396,13 +2383,15 @@
                     <RichTextEditor
                       v-if="isEditMode"
                       :model-value="localCreature.description ?? ''"
-                      placeholder="Описание существа..."
+                      :placeholder="
+                        CREATURE_SHEET_LABELS.descriptionPlaceholder
+                      "
                       @update:model-value="handleCreatureDescriptionUpdate"
                     />
 
                     <div
                       v-else
-                      class="min-h-[200px] rounded-lg bg-accented/30"
+                      class="min-h-50 rounded-lg bg-accented/30"
                     >
                       <ItemDescriptionRenderer
                         v-if="localCreature.description"
@@ -1414,11 +2403,11 @@
                         v-else
                         class="p-4 text-sm text-dimmed"
                       >
-                        Нет описания
+                        {{ CREATURE_SHEET_LABELS.descriptionEmpty }}
                       </p>
                     </div>
                   </template>
-                </div>
+                </SheetTabs>
               </div>
             </div>
           </div>
@@ -1436,12 +2425,12 @@
     :min-width="400"
     :min-height="160"
     :z-index="Z_INDEX.MODAL_ELEVATED"
-    title="Несохранённые изменения"
+    :title="UNSAVED_CHANGES_LABELS.title"
   >
     <template #body>
       <div class="space-y-4">
         <p class="text-sm text-toned">
-          У вас есть несохранённые изменения. Что сделать?
+          {{ CREATURE_SHEET_LABELS.discardQuestion }}
         </p>
 
         <div class="flex justify-end gap-2">
@@ -1451,7 +2440,7 @@
             size="sm"
             @click.left.exact.prevent="onConfirmCancel"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -1460,7 +2449,7 @@
             size="sm"
             @click.left.exact.prevent="onConfirmDiscard"
           >
-            Отменить изменения
+            {{ UNSAVED_CHANGES_LABELS.discard }}
           </UButton>
 
           <UButton
@@ -1468,12 +2457,24 @@
             size="sm"
             @click.left.exact.prevent="onConfirmSave"
           >
-            Сохранить
+            {{ MODAL_BUTTON_LABELS.save }}
           </UButton>
         </div>
       </div>
     </template>
   </UDraggableModal>
+
+  <!-- Броски навыков и спасбросков левой колонки -->
+  <DiceRollModal
+    v-model:open="isDiceRollOpen"
+    :modifier="diceRollConfig.modifier"
+    :title="diceRollConfig.title"
+    :roll-label="diceRollConfig.rollLabel"
+    :actor-name="localCreature?.name"
+    :roll-button-text="diceRollConfig.rollButtonText"
+    :initial-roll-mode="diceRollConfig.initialRollMode"
+    :evaluate-bonus-roll-formulas="diceRollConfig.evaluateBonusRollFormulas"
+  />
 
   <!-- Языки -->
   <LanguageProficiencyModal
@@ -1483,11 +2484,31 @@
     @apply="onLanguagesApply"
   />
 
+  <!-- Спасброски: владение и настройка расчёта — то же окно, что и у листа
+    персонажа. Правила у спасбросков общие, различаются только места записи -->
+  <SavingThrowSettingsModal
+    v-if="localCreature"
+    v-model:open="isSavingThrowSettingsOpen"
+    :saving-throws="creatureSavingThrows"
+    :settings="localCreature.system.savingThrowSettings"
+    :ability-mods="skillAbilityMods"
+    :proficiency-bonus="creatureProficiencyBonus"
+    :saves="resolvedStats?.saves ?? {}"
+    @apply="onSavingThrowSettingsApply"
+  />
+
   <!-- Навыки -->
-  <CreatureSkillsModal
+  <!-- Навыки: владение и настройка расчёта — то же окно, что и у листа
+    персонажа. Правила у навыков общие, различаются только места записи -->
+  <SkillSettingsModal
     v-if="localCreature"
     v-model:open="isSkillsOpen"
-    :creature="localCreature"
+    :proficiencies="localCreature.system.skills"
+    :settings="localCreature.system.skillSettings"
+    :ability-mods="skillAbilityMods"
+    :proficiency-bonus="creatureProficiencyBonus"
+    :skills="resolvedStats?.skills ?? {}"
+    :overridden-keys="overriddenSkillKeys"
     @apply="onSkillsApply"
   />
 
@@ -1496,18 +2517,14 @@
     v-if="localCreature"
     v-model:open="isDefensesOpen"
     :category="activeDefenseCategory"
-    :selected="
-      (localCreature.system.defenses[activeDefenseCategory] as string[]) || []
-    "
+    :selected="localCreature.system.defenses[activeDefenseCategory] || []"
     @apply="onDefensesApply"
   />
 
   <CreatureConditionImmunitiesModal
     v-if="localCreature"
     v-model:open="isConditionImmunitiesOpen"
-    :selected="
-      (localCreature.system.defenses.conditionImmunities as string[]) || []
-    "
+    :selected="localCreature.system.defenses.conditionImmunities || []"
     @apply="onConditionImmunitiesApply"
   />
 

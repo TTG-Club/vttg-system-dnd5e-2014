@@ -3,28 +3,58 @@ import type {
   DamagePartTarget,
   MeasurementTemplate,
   SceneEntity,
-  SpellSaveType,
   Token,
   TypedWebSocketClient,
 } from '@vtt/shared';
 import type {
   ActiveEffect,
+  CreatureCategory,
   DamageDefenseOutcome,
-  DnDSceneEntity,
+  DamageTypeChoice,
+  HpChangeDetail,
+  ProjectileOutcome,
+  SaveDamageDefense,
   Spell,
   TargetHpGate,
 } from '@vtt/shared/system/dnd.js';
 
-import { generateId, isCreatureEntity } from '@vtt/shared';
+import type { AttackRollSnapshot } from './attackRollSnapshot';
+import type { RollBonusEvaluator } from './rollBonusEvaluator';
+
+import { useChatStore } from '@/stores/chatStore';
+import { useSpellTemplateStore } from '@/stores/spellTemplateStore';
+import { generateId } from '@vtt/shared';
 import {
-  DAMAGE_TYPE_LABELS,
-  resolveEffectApplication,
-  stampTurnDuration,
-  targetHpGateMatches,
+  CREATURE_TYPE_LABELS,
+  DAMAGE_STATUS_PHRASE_PREFIXES,
+  damageReachesTarget,
+  isDndSceneEntity,
+  isMagicRoll,
+  isSaveAbility,
+  listIgnoredResistances,
+  readDamageStatusName,
+  removesItselfOnApply,
+  resolveActorStats,
+  resolveDamageTypeLabel,
+  SAVE_TYPE_LABELS,
+  stampAppliedEffect,
   withInitializedDuration,
 } from '@vtt/shared/system/dnd.js';
 
-import { useInitiativeStore } from '@/stores/initiativeStore';
+import { SAVING_THROW_ROLL_LABELS } from '../ui/actor/constants';
+import { withAttackHeldEffects } from './attackRollSnapshot';
+import { resolveActiveTurnActorId } from './encounterTurn';
+import { resolveEntityStats } from './useResolvedStats';
+import { useWorldEntities } from './useWorldEntities';
+
+// Выбор эффектов заклинания по доставке живёт в движке (его проверяют тесты
+// правил), клиентские пути берут его отсюда же, как раньше
+export {
+  getCasterSpellEffects,
+  getTargetSpellEffects,
+  getZoneSpellEffects,
+  isSaveAbility,
+} from '@vtt/shared/system/dnd.js';
 
 /** Результат спасброска одной цели */
 export interface SpellTargetResult {
@@ -46,12 +76,19 @@ export interface SpellTargetResult {
   hpBefore: number;
   /** HP после применения */
   hpAfter: number;
+  /**
+   * Хиты цели до и после вместе с временными — для подробностей строки
+   * сводки в чате; нет — хиты цели не менялись
+   */
+  hpChange?: HpChangeDetail;
   /** Полученные временные ХП (прирост; 0 — если текущие временные были выше) */
   tempHpGained?: number;
   /** Сработавшая защита от урона (иммунитет/сопротивление/уязвимость) */
   defenseOutcome?: DamageDefenseOutcome;
   /** Названия наложенных эффектов */
   appliedEffects?: string[];
+  /** Снаряды по этой цели (Волшебная стрела, Мистический заряд) — строкой каждый */
+  projectiles?: ProjectileOutcome[];
 }
 
 /** Контекст для обработки заклинания */
@@ -68,8 +105,20 @@ export interface SpellResolutionContext {
   socket: TypedWebSocketClient;
   /** Переопределённый тип урона (выбран игроком для заклинаний с damageType: 'choice') */
   overrideDamageType?: string;
-  /** ID заклинателя (для маршрутизации частей с target: 'self') */
-  casterId?: string;
+  /**
+   * Кто накладывает. Обязателен: по нему части «на себя» находят заклинателя,
+   * а эффект на цели получает наложившего, каст с концентрацией и его круг.
+   * Без него эффект заклинания не снимался концом концентрации и не
+   * рассеивался, а срок «до хода наложившего» терял якорь
+   */
+  casterId: string;
+  /**
+   * Снимок броска атаки, если разбору предшествовал бросок попадания:
+   * стороны удара считаются с эффектами, которые этот бросок израсходовал
+   * (`attackRollSnapshot.ts`). Сущности в `actors` вызывающий собирает тем
+   * же снимком (`listAttackResolutionEntities`)
+   */
+  attack?: AttackRollSnapshot;
 }
 
 /**
@@ -82,6 +131,11 @@ export interface SpellDamagePartInput {
   type?: string;
   /** Все типы урона части, если их несколько (напр. рубящий+огонь) */
   types?: string[];
+  /**
+   * Тип урона на выбор (`@dmg.choice(…)`): окно броска спрашивает его и
+   * ставит выбранный тип в `type`
+   */
+  typeChoice?: DamageTypeChoice;
   /** Является ли часть лечением */
   isHealing: boolean;
   /** Лечение временными ХП (`@heal.temp`): с текущими временными — большее */
@@ -92,6 +146,10 @@ export interface SpellDamagePartInput {
   requiresDamage: boolean;
   /** Гейт по состоянию HP цели (per-target ветка @target.full/@target.notFull) */
   targetGate?: TargetHpGate;
+  /** Гейт по типу существа цели (per-target ветка @target.type.<тип>) */
+  targetTypeGate?: CreatureCategory;
+  /** Гейт по состоянию цели (per-target ветка @target.status.<ключ>) */
+  targetStatusGate?: string;
   /** Часть получает усиление высших кругов (слот-скейлинг) при броске */
   applySlotScaling?: boolean;
 }
@@ -120,6 +178,12 @@ export interface RolledSpellDamagePart {
   requiresDamage: boolean;
   /** Гейт по состоянию HP цели (per-target ветка @target.full/@target.notFull) */
   targetGate?: TargetHpGate;
+  /** Гейт по типу существа цели (per-target ветка @target.type.<тип>) */
+  targetTypeGate?: CreatureCategory;
+  /** Гейт по состоянию цели (per-target ветка @target.status.<ключ>) */
+  targetStatusGate?: string;
+  /** Часть брошена критом: событиям урона цели нужен крит */
+  critical?: boolean;
 }
 
 /** Контекст AoE шаблона */
@@ -135,17 +199,53 @@ export interface AoeContext {
 /** Результат информации о спасброске актора */
 export interface ActorSaveInfo {
   modifier: number;
+  evaluateBonusRollFormulas: RollBonusEvaluator;
   hasAdvantage: boolean;
   hasDisadvantage: boolean;
   autoFail: boolean;
 }
 
-/** Результат броска спасброска */
-export interface SavingThrowResult {
-  roll: number;
-  modifier: number;
-  total: number;
-  passed: boolean;
+/**
+ * Собирает строку в чат о свёрнутом действии: окно спасброска закрыли, не
+ * бросив.
+ *
+ * Общая для обоих путей разрешения (многочастного и одночастного): отмена
+ * должна выглядеть в чате одинаково, кто бы её ни поймал.
+ *
+ * @param actionName - название заклинания или действия существа
+ * @returns готовая строка сообщения
+ */
+export function formatSaveCancelledMessage(actionName: string): string {
+  return `${actionName}${SAVING_THROW_ROLL_LABELS.cancelledSuffix}`;
+}
+
+/**
+ * Подпись броска спасброска для чата: «Спасбросок Ловкости — Арт».
+ *
+ * @param ability - характеристика спасброска
+ * @param entityName - имя цели
+ * @returns подпись броска
+ */
+export function formatSavingThrowRollLabel(
+  ability: AbilityType,
+  entityName: string,
+): string {
+  const abilityLabel = SAVE_TYPE_LABELS[ability];
+
+  return `${SAVING_THROW_ROLL_LABELS.rollPrefix}${abilityLabel}${SAVING_THROW_ROLL_LABELS.nameSeparator}${entityName}`;
+}
+
+/**
+ * Заголовок окна спасброска: «Спасбросок Ловкость».
+ *
+ * Общий у своего окна и у окна адресата по запросу. Имени цели и сложности
+ * в нём нет: окно показывает их отдельно, над формулой.
+ *
+ * @param ability - характеристика спасброска
+ * @returns заголовок окна
+ */
+export function formatSavingThrowTitle(ability: AbilityType): string {
+  return `${SAVING_THROW_ROLL_LABELS.rollPrefix}${SAVE_TYPE_LABELS[ability]}`;
 }
 
 /**
@@ -171,90 +271,6 @@ export function determineRollMode(
 }
 
 /**
- * Определяет, использует ли сущность автоматические спасброски.
- *
- * Существа (NPC) по умолчанию всегда используют автоспасброски.
- * Акторы (PC) — только если явно включено `autoSaves === true`.
- *
- * @param entity - сущность-цель
- * @returns true если нужен автоматический спасбросок
- */
-export function resolveAutoSaves(entity: SceneEntity): boolean {
-  return isCreatureEntity(entity)
-    ? (entity.autoSaves ?? true)
-    : entity.autoSaves === true;
-}
-
-/**
- * Упорядочивает цели для разрешения спасбросков: сначала цели с
- * автоматическим спасброском, затем — с ручным (PC с `autoSaves: false`).
- *
- * Ручные броски открывают DiceRollModal по одному и ждут игрока, поэтому
- * авто-цели обрабатываются первыми — их результаты уходят в чат сразу,
- * не дожидаясь закрытия модалок.
- *
- * @param targets - целевые сущности
- * @param saveType - тип спасброска заклинания
- * @returns цели в порядке «авто → ручные» (без спасброска — исходный порядок)
- */
-export function orderTargetsBySaveMode(
-  targets: SceneEntity[],
-  saveType: SpellSaveType,
-): SceneEntity[] {
-  if (saveType === 'none') {
-    return targets;
-  }
-
-  const autoSaveTargets: SceneEntity[] = [];
-  const manualSaveTargets: SceneEntity[] = [];
-
-  for (const entity of targets) {
-    if (resolveAutoSaves(entity)) {
-      autoSaveTargets.push(entity);
-    } else {
-      manualSaveTargets.push(entity);
-    }
-  }
-
-  return [...autoSaveTargets, ...manualSaveTargets];
-}
-
-/**
- * Возвращает текущее и максимальное HP сущности (для per-target гейтов).
- *
- * @param entity - сущность-цель
- * @returns текущее и максимальное HP
- */
-function getEntityHp(entity: SceneEntity): { current: number; max: number } {
-  // Ядро видит entity как Base*; в D&D-композабле восстанавливаем D&D-форму
-  // (при isCreatureEntity сужается к DnDCreature, иначе — DnDActor).
-  const dnd = entity as DnDSceneEntity;
-
-  const current = isCreatureEntity(dnd)
-    ? (dnd.system.hitPoints.current ?? 0)
-    : dnd.system.hitPoints.current;
-
-  const max = isCreatureEntity(dnd)
-    ? (dnd.system.hitPoints.max ?? 0)
-    : dnd.system.hitPoints.max;
-
-  return { current, max };
-}
-
-/**
- * Определяет, находится ли сущность на полном запасе HP
- * (для per-target гейтов `@target.full`/`@target.notFull`).
- *
- * @param entity - сущность-цель
- * @returns true если текущее HP не меньше максимума
- */
-export function isEntityHpFull(entity: SceneEntity): boolean {
-  const { current, max } = getEntityHp(entity);
-
-  return current >= max;
-}
-
-/**
  * Проверяет, проходит ли часть гейт состояния HP цели.
  *
  * Части без гейта применяются всегда. Гейт `full` пропускает часть только
@@ -270,13 +286,13 @@ export function partPassesTargetGate(
   part: RolledSpellDamagePart,
   entity: SceneEntity,
 ): boolean {
-  if (!part.targetGate) {
+  if (!part.targetGate && !part.targetTypeGate && !part.targetStatusGate) {
     return true;
   }
 
-  const { current, max } = getEntityHp(entity);
-
-  return targetHpGateMatches(part.targetGate, current, max);
+  // Чужая запись ни хитов, ни типа в D&D-форме не несёт — условная ветка ей не
+  // достаётся вовсе, а не «проходит по умолчанию»
+  return isDndSceneEntity(entity) && damageReachesTarget(part, entity);
 }
 
 /** Подписи гейт-веток состояния HP цели (для чата и описаний выбора цели). */
@@ -289,134 +305,182 @@ export const TARGET_GATE_LABELS: Record<TargetHpGate, string> = {
 /**
  * Формирует суффикс гейт-ветки для строки части в чате.
  *
- * @param targetGate - гейт части (если есть)
- * @returns суффикс вида « (при полном HP)» или пустая строка
+ * Гейты складываются: часть может быть и «по нежити», и «при полном HP».
+ *
+ * @param targetGate - гейт по состоянию HP (если есть)
+ * @param targetTypeGate - гейт по типу существа (если есть)
+ * @param targetStatusGate - гейт по состоянию цели (если есть)
+ * @returns суффикс вида « (по нежити, при полном HP)» или пустая строка
  */
 export function formatTargetGateSuffix(
   targetGate: TargetHpGate | undefined,
+  targetTypeGate?: CreatureCategory,
+  targetStatusGate?: string,
 ): string {
-  return targetGate ? ` (${TARGET_GATE_LABELS[targetGate]})` : '';
-}
+  const parts: string[] = [];
 
-/**
- * Type guard: является ли тип спасброска характеристикой (не `none`).
- *
- * `SpellSaveType` — это `'none' | AbilityType`, поэтому отсечение `'none'`
- * безопасно сужает значение до `AbilityType` без приведения типов.
- *
- * @param saveType - тип спасброска заклинания
- * @returns true, если это характеристика для спасброска
- */
-export function isSaveAbility(
-  saveType: SpellSaveType,
-): saveType is AbilityType {
-  return saveType !== 'none';
-}
-
-/**
- * Инициализирует точную turn-длительность эффекта при наложении, подставляя
- * текущий ход энкаунтера. Для не-`turn` эффектов — no-op. Носитель — сущность,
- * на которую ложится эффект; источник — кастер (для якоря `source`).
- *
- * @param effect - накладываемый эффект
- * @param carrierId - id сущности-носителя (цели)
- * @param sourceId - id кастера (если известен)
- * @returns эффект с проставленными sourceActorId/turnSkipFirst (при type 'turn')
- */
-export function stampEffectTurnDuration(
-  effect: ActiveEffect,
-  carrierId: string,
-  sourceId?: string,
-): ActiveEffect {
-  if (effect.duration.type !== 'turn') {
-    return effect;
+  if (targetTypeGate) {
+    parts.push(`по цели: ${CREATURE_TYPE_LABELS[targetTypeGate]}`);
   }
 
-  // Берём текущий ход ТАК ЖЕ, как сервер: сырой entries[currentTurnIndex], а НЕ
-  // локально пересортированный список (порядок на сервере и клиенте может
-  // разойтись после add/remove участников без переброса инициативы).
-  const encounter = useInitiativeStore().encounter;
+  if (targetStatusGate) {
+    parts.push(
+      `${DAMAGE_STATUS_PHRASE_PREFIXES.target}${readDamageStatusName(targetStatusGate)}`,
+    );
+  }
 
-  const activeTurnActorId =
-    encounter && encounter.currentTurnIndex >= 0
-      ? (encounter.entries[encounter.currentTurnIndex]?.actorId ?? null)
-      : null;
+  if (targetGate) {
+    parts.push(TARGET_GATE_LABELS[targetGate]);
+  }
 
-  return stampTurnDuration(effect, { carrierId, sourceId, activeTurnActorId });
+  return parts.length > 0 ? ` (${parts.join(', ')})` : '';
 }
 
 /**
- * Определяет, нужно ли накладывать эффекты на ЦЕЛЬ заклинания.
+ * Сопротивления, которые игнорирует урон атакующего («Сила могилы»).
  *
- * Накладываются только эффекты, помеченные `effectTarget: 'target'` (эффекты
- * со значением 'self'/без значения предназначены заклинателю — см.
- * `getCasterSpellEffects`). Условие наложения:
- * - У заклинания нет спасброска (saveType === 'none') — атака уже попала
- * - Цель провалила спасбросок
+ * Атакующий берётся с эффектами, которые израсходовал бросок этой атаки:
+ * «следующая атака игнорирует сопротивление» действует на этот удар, даже
+ * когда ответ сервера эффект из мира уже убрал.
  *
- * @param spell - заклинание
- * @param saveResult - результат спасброска (если был)
- * @returns массив эффектов для наложения на цель или undefined
+ * @param attackerId - атакующий; без него — ничего
+ * @param attack - снимок броска атаки; нет — удар без броска попадания
+ * @returns типы урона
  */
-export function resolveEffectsToApply(
-  spell: Spell,
-  saveResult: SavingThrowResult | undefined,
-): ActiveEffect[] | undefined {
-  // На цель кладём только эффекты с effectTarget 'target'; отключённые
-  // (тумблер «Отключен» на заклинании) пропускаются.
-  const targetEffects = spell.activeEffects?.filter(
-    (effect) => !effect.disabled && effect.effectTarget === 'target',
-  );
+export function resolveAttackerIgnoredResistances(
+  attackerId: string | undefined,
+  attack?: AttackRollSnapshot,
+): string[] {
+  if (!attackerId) {
+    return [];
+  }
 
-  if (!targetEffects || targetEffects.length === 0) {
+  const attacker = useWorldEntities().findCurrentDndEntity(attackerId);
+
+  return attacker
+    ? listIgnoredResistances(
+        resolveEntityStats(withAttackHeldEffects(attacker, attack)).activeFlags,
+      )
+    : [];
+}
+
+/**
+ * Защиты цели от урона «половина при успехе» спасброска заклинания, оружия
+ * или действия: «Увёртливость» и «успех против магии — без урона».
+ *
+ * @param entity - цель
+ * @param spell - заклинание или псевдо-заклинание броска
+ * @returns защиты либо `undefined`, если спасброска или данных системы нет
+ */
+export function buildSaveDamageDefense(
+  entity: SceneEntity,
+  spell: Spell,
+): SaveDamageDefense | undefined {
+  if (!isSaveAbility(spell.saveType) || !isDndSceneEntity(entity)) {
     return undefined;
   }
 
-  // Спасбросок уровня заклинания: `landed` = провал спаса (нет спаса → эффект
-  // «приземлился», т.к. этот путь зовётся уже по факту попадания/каста). Гейтим
-  // ПОЭФФЕКТНО через resolveEffectApplication — иначе ветки «при успехе»
-  // (applyOnSuccessOnly) и «при успехе тоже» (applyOnSuccess) не работали бы
-  // (старый код слепо отбрасывал ВСЕ эффекты при успешном спасброске).
-  const landed = spell.saveType === 'none' || !saveResult?.passed;
-
-  const applied = targetEffects.filter(
-    (effect) => resolveEffectApplication(effect, { landed }).applyEffect,
-  );
-
-  return applied.length > 0 ? applied : undefined;
+  return {
+    flags: resolveActorStats(entity).activeFlags,
+    ability: spell.saveType,
+    againstMagic: isMagicRoll(spell),
+  };
 }
 
 /**
- * Отбирает «самобафф»-эффекты заклинания, предназначенные самому заклинателю:
- * включённые эффекты с `effectTarget` 'self' (или без значения — это значение
- * по умолчанию). Эффекты, помеченные 'target', исключаются — они ложатся на
- * цель в `resolveEffectsToApply`.
+ * Эффект в момент наложения по текущему ходу боя: наложивший запоминается
+ * всегда, точная turn-длительность привязывается к ходу. Одна точка для всех
+ * путей наложения заклинания — иначе путь без неё терял «ход наложившего» и
+ * «до конца хода заклинателя».
  *
- * Используется для заклинаний без цели-врага (напр. Щит, Доспех мага), у
- * которых эффект должен лечь на кастера.
- *
- * @param spell - заклинание
- * @returns массив эффектов для наложения на заклинателя (может быть пустым)
+ * @param effect - накладываемый эффект
+ * @param parties - носитель, наложивший и каст
+ * @param parties.carrierId - сущность, на которую ложится эффект
+ * @param parties.sourceId - наложивший, если известен
+ * @param parties.castId - каст с концентрацией: его конец снимет эффект
+ * @param parties.castLevel - круг каста: по нему «Рассеивание магии» решает,
+ *   снимать ли эффект
+ * @returns эффект, готовый лечь на носителя
  */
-export function getCasterSpellEffects(spell: Spell): ActiveEffect[] {
-  return (spell.activeEffects ?? []).filter(
-    (effect) =>
-      !effect.disabled && (effect.effectTarget ?? 'self') !== 'target',
+export function stampEffectOnApply(
+  effect: ActiveEffect,
+  parties: {
+    carrierId: string;
+    sourceId?: string;
+    castId?: string;
+    castLevel?: number;
+  },
+): ActiveEffect {
+  const { castId, castLevel, ...stampParties } = parties;
+
+  // Тип наложившего едет вместе с ним: по нему спасбросок против эффекта
+  // включает «Защиту от зла и добра», даже когда бросает сервер
+  const sourceCreatureType = useWorldEntities().findEntityCreatureType(
+    parties.sourceId,
   );
+
+  const stamped = stampAppliedEffect(
+    sourceCreatureType ? { ...effect, sourceCreatureType } : effect,
+    {
+      ...stampParties,
+      activeTurnActorId: resolveActiveTurnActorId(),
+    },
+  );
+
+  if (!castId) {
+    return stamped;
+  }
+
+  return {
+    ...stamped,
+    castId,
+    ...(castLevel === undefined ? {} : { castLevel }),
+  };
 }
 
 /**
- * Отбирает эффекты заклинания, предназначенные ЦЕЛИ (`effectTarget: 'target'`):
- * включённые эффекты, которые должны лечь на выбранную цель. В отличие от
- * `resolveEffectsToApply`, не учитывает спасбросок — вызывающий сам решает,
- * когда применять (напр. по попаданию атаки или при касте без броска).
+ * Собирает строку чата о наложенных эффектах заклинания. Одна форма на
+ * заклинателя, выбранную цель и несколько целей эффекта — чтобы касты из
+ * листа и с хотбара выглядели в чате одинаково.
  *
- * @param spell - заклинание
- * @returns массив эффектов для наложения на цель (может быть пустым)
+ * @param spellName - название заклинания
+ * @param targetNames - имена получивших эффекты
+ * @param effects - наложенные эффекты
+ * @returns готовая строка сообщения
  */
-export function getTargetSpellEffects(spell: Spell): ActiveEffect[] {
-  return (spell.activeEffects ?? []).filter(
-    (effect) => !effect.disabled && effect.effectTarget === 'target',
+export function formatSpellEffectsMessage(
+  spellName: string,
+  targetNames: readonly string[],
+  effects: readonly ActiveEffect[],
+): string {
+  const effectNames = effects.map((effect) => effect.name).join(', ');
+
+  return `${spellName}\n→ ${targetNames.join(', ')}: [${effectNames}]`;
+}
+
+/**
+ * Пишет в чат, что наложено. Мгновенные эффекты (зелье лечит и снимает себя)
+ * в список не входят — их итог пишет исход срабатывания; не осталось ничего —
+ * строки нет.
+ *
+ * @param spellName - название заклинания или источника
+ * @param targetNames - имена получивших эффекты
+ * @param effects - наложенные эффекты
+ */
+export function postSpellEffectsMessage(
+  spellName: string,
+  targetNames: readonly string[],
+  effects: readonly ActiveEffect[],
+): void {
+  const lasting = effects.filter((effect) => !removesItselfOnApply(effect));
+
+  if (lasting.length === 0) {
+    return;
+  }
+
+  useChatStore().sendMessage(
+    formatSpellEffectsMessage(spellName, targetNames, lasting),
+    'text',
   );
 }
 
@@ -445,18 +509,13 @@ export function instantiateSpellEffects(
  * Возвращает локализованное название типа урона или исходную строку.
  *
  * @param type - тип урона
- * @returns русское название или исходная строка
+ * @returns русское название или исходная строка; `undefined` — типа нет либо
+ * у него нет названия (служебный `choice`)
  */
 export function getDamageTypeLabel(
   type: string | undefined,
 ): string | undefined {
-  if (!type) {
-    return undefined;
-  }
-
-  const labels: Record<string, string> = DAMAGE_TYPE_LABELS;
-
-  return labels[type] ?? type;
+  return type ? resolveDamageTypeLabel(type) : undefined;
 }
 
 /**
@@ -481,9 +540,7 @@ export function getPartKindLabel(part: {
 
   // Несколько типов (напр. рубящий+огонь) — показываем через « и »
   if (part.types && part.types.length > 1) {
-    const labels = part.types
-      .map((type) => getDamageTypeLabel(type) ?? type)
-      .filter(Boolean);
+    const labels = part.types.flatMap((type) => getDamageTypeLabel(type) ?? []);
 
     if (labels.length > 0) {
       return labels.join(' и ');
@@ -507,10 +564,32 @@ export function formatRolledPartLine(
 ): string {
   const label = getPartKindLabel(rolledPart);
 
-  const gateSuffix = formatTargetGateSuffix(rolledPart.targetGate);
+  const gateSuffix = formatTargetGateSuffix(
+    rolledPart.targetGate,
+    rolledPart.targetTypeGate,
+    rolledPart.targetStatusGate,
+  );
 
   const diceBreakdown =
     rolledPart.values.length > 0 ? `[${rolledPart.values.join(', ')}] = ` : '';
 
   return `${rolledPart.formula} ${label}${gateSuffix}: ${diceBreakdown}${rolledPart.amount}${defenseSuffix}`;
+}
+
+/**
+ * Снимает размещённый AoE-шаблон отменённого каста: чистит кэш его данных и
+ * убирает шаблон со сцены.
+ *
+ * Шаблон встаёт на карту ДО окна броска, поэтому закрытое без броска окно
+ * обязано его убрать — иначе отменённая область висит на сцене до её
+ * перезагрузки. Доведённый до применения каст снимает шаблон сам: там его
+ * данные сперва забирают в кэш, по нему считаются задетые цели.
+ *
+ * @param templateId - id размещённого шаблона
+ */
+export function discardSpellTemplate(templateId: string): void {
+  const templateStore = useSpellTemplateStore();
+
+  templateStore.removePlacedTemplate(templateId);
+  templateStore.deleteTemplate(templateId);
 }

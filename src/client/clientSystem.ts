@@ -2,25 +2,34 @@ import type { Component } from 'vue';
 
 import type { ClientSystemAPI } from '@/core/systemBootstrap';
 
-import { dnd5eSystemInstance } from '@vtt/shared/system/dnd.js';
 import { defineAsyncComponent } from 'vue';
 
+import { dnd5eSystemInstance } from '@vtt/shared/system/dnd.js';
+
+import { promptGmRollRequest } from './composables/gmRollRequest';
+import { promptInitiativeRoll } from './composables/initiativeRollPrompt';
+import { promptRequestedRoll } from './composables/requestedRollPrompt';
 import { registerDnd5eMacros } from './macros/dnd5eMacros';
 import { registerSystemDataSync } from './systemDataSync';
 import ActorDeleteConfirmModal from './ui/actor/ActorDeleteConfirmModal.vue';
 import QuickEquipmentModal from './ui/actor/QuickEquipmentModal.vue';
 import QuickSpellsModal from './ui/actor/QuickSpellsModal.vue';
-import ActiveEffectFormModal from './ui/actor/tabs/ActiveEffectFormModal.vue';
 import CreatureDeleteConfirmModal from './ui/creature/CreatureDeleteConfirmModal.vue';
+import QuickCreatureActionsModal from './ui/creature/QuickCreatureActionsModal.vue';
+import ActiveEffectFormModal from './ui/effect/ActiveEffectFormModal.vue';
+import SelectedEntityEscapeBar from './ui/effect/SelectedEntityEscapeBar.vue';
 
 /**
  * Ленивая карта ВСЕХ модалок и листов системы D&D 5e (по имени файла). Glob
  * выполняется ВНУТРИ чанка системы (`systems/dnd5e/`) — ребра `core → systems`
  * не образует и всё остаётся в ленивом `system-dnd5e` чанке.
  */
-const DND5E_MODAL_MODULES: Record<string, () => Promise<unknown>> = {
-  ...import.meta.glob('./**/*Modal.vue'),
-  ...import.meta.glob('./**/*Sheet.vue'),
+const DND5E_MODAL_MODULES: Record<
+  string,
+  () => Promise<{ default: Component }>
+> = {
+  ...import.meta.glob<{ default: Component }>('./**/*Modal.vue'),
+  ...import.meta.glob<{ default: Component }>('./**/*Sheet.vue'),
 };
 
 /**
@@ -51,7 +60,7 @@ function registerDnd5eModals(api: ClientSystemAPI): void {
       fileName.replace(/\.vue$/, ''),
       // Ленивый async-компонент — как и прежний glob в ModalContainer (код
       // модалки грузится при первом открытии, не при загрузке системы).
-      defineAsyncComponent(importer as () => Promise<Component>),
+      defineAsyncComponent(importer),
     );
   }
 }
@@ -93,7 +102,10 @@ export function registerClientSystem(api: ClientSystemAPI) {
   api.defineSystem(dnd5eSystemInstance);
 
   // UI-слоты системы: макросы + модалки удаления/эффектов/быстрые (их рендерит
-  // ядро — custom-areas, удаление актёра/существа, быстрые окна).
+  // ядро — custom-areas, удаление актёра/существа, быстрые окна) + два окна
+  // броска, которые открывает ядро: инициатива (трекер боя) и спасбросок по
+  // чужому запросу (адресный канал «попроси владельца сущности бросить»), и
+  // окно мастера «Запросить бросок» (меню фишки и меню карты).
   api.uiSystem({
     registerMacros: registerDnd5eMacros,
     actorDeleteConfirmModal: ActorDeleteConfirmModal,
@@ -101,6 +113,11 @@ export function registerClientSystem(api: ClientSystemAPI) {
     activeEffectFormModal: ActiveEffectFormModal,
     quickSpellsModal: QuickSpellsModal,
     quickEquipmentModal: QuickEquipmentModal,
+    quickActionsModal: QuickCreatureActionsModal,
+    selectedEntityActions: SelectedEntityEscapeBar,
+    promptInitiativeRoll,
+    promptRequestedRoll,
+    promptGmRollRequest,
   });
 
   // Система «владеет» своими модалками (лист, просмотрщики, кубики) — регистрируем

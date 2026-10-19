@@ -1,0 +1,263 @@
+<script setup lang="ts">
+  import type {
+    DnDCustomBonus,
+    DnDCustomBonusContext,
+    DnDPreparedLimit,
+    PreparedKind,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { computed, ref, watch } from 'vue';
+
+  import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
+  import { Z_INDEX } from '@/shared_ui/consts';
+  import {
+    getPreparedLimitBreakdown,
+    normalizePreparedLimit,
+    PREPARED_LIMIT_EMPTY_VALUE,
+    PREPARED_LIMIT_MAX,
+    PREPARED_LIMIT_MIN,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { MODAL_BUTTON_LABELS, PREPARED_SPELLS_LABELS } from './constants';
+  import CustomBonusRows from './CustomBonusRows.vue';
+  import { formatSignedNumber } from './utils/formatSignedNumber';
+
+  interface Props {
+    open: boolean;
+    /** Что настраивается: заклинания книги либо заговоры */
+    kind: PreparedKind;
+    /** Текущая настройка предела */
+    limit: DnDPreparedLimit;
+    /** Число из таблиц классов; null — колонки нет */
+    classValue: number | null;
+    /** Числа листа, от которых считается вклад своих бонусов */
+    context: DnDCustomBonusContext;
+  }
+
+  const props = defineProps<Props>();
+
+  const emit = defineEmits<{
+    'update:open': [value: boolean];
+    'apply': [limit: DnDPreparedLimit];
+  }>();
+
+  /**
+   * Подписи по виду подготовки: заговоры считаются отдельным счётчиком со своей
+   * колонкой таблицы класса, поэтому и подписи у них свои.
+   */
+  const KIND_LABELS: Record<
+    PreparedKind,
+    { title: string; customValue: string; total: string; unknown: string }
+  > = {
+    spells: {
+      title: PREPARED_SPELLS_LABELS.spellsTitle,
+      customValue: PREPARED_SPELLS_LABELS.spellsField,
+      total: PREPARED_SPELLS_LABELS.spellsTotal,
+      unknown: PREPARED_SPELLS_LABELS.spellsNoTable,
+    },
+    cantrips: {
+      title: PREPARED_SPELLS_LABELS.cantripsTitle,
+      customValue: PREPARED_SPELLS_LABELS.cantripsField,
+      total: PREPARED_SPELLS_LABELS.cantripsTotal,
+      unknown: PREPARED_SPELLS_LABELS.cantripsNoTable,
+    },
+  };
+
+  const isOpen = computed({
+    get: () => props.open,
+    set: (value) => emit('update:open', value),
+  });
+
+  const labels = computed(() => KIND_LABELS[props.kind]);
+
+  const draftCustom = ref(false);
+  const draftValue = ref(PREPARED_LIMIT_MIN);
+  const draftBonuses = ref<DnDCustomBonus[]>([]);
+
+  /**
+   * Черновик заводится при открытии: окно живёт во вкладке постоянно, и без
+   * этого оно показывало бы значения того счётчика, с которым его открыли
+   * впервые. Своё число отталкивается от числа класса — игроку чаще нужно его
+   * поправить, а не набирать с нуля.
+   */
+  watch(
+    () => [props.open, props.kind],
+    ([opened]) => {
+      if (!opened) {
+        return;
+      }
+
+      draftCustom.value = props.limit.custom !== null;
+
+      // Копии, а не сами бонусы листа: окно живёт до «Применить», и его
+      // правки не должны менять лист раньше времени
+      draftBonuses.value = props.limit.bonuses.map((bonus) => ({ ...bonus }));
+
+      draftValue.value =
+        props.limit.custom ?? props.classValue ?? PREPARED_LIMIT_MIN;
+    },
+    { immediate: true },
+  );
+
+  /**
+   * Число из поля для предпросмотра: очищенное поле отдаёт не-число. В актёра
+   * значения уходят через `normalizePreparedLimit` — он их и клампит.
+   */
+  function toFieldValue(value: number): number {
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  /** Настройка из черновика — и для предпросмотра, и для сохранения */
+  const draftLimit = computed<DnDPreparedLimit>(() => ({
+    custom: draftCustom.value ? toFieldValue(draftValue.value) : null,
+    bonuses: draftBonuses.value,
+  }));
+
+  /** Разбор предпросмотра — той же утилитой, что и плитка вкладки */
+  const breakdown = computed(() =>
+    getPreparedLimitBreakdown(
+      props.classValue,
+      draftLimit.value,
+      props.context,
+    ),
+  );
+
+  /** Число класса: от черновика не зависит, его меняют уровень и класс */
+  const classValueLabel = computed(() =>
+    props.classValue === null
+      ? PREPARED_LIMIT_EMPTY_VALUE
+      : String(props.classValue),
+  );
+
+  const totalLabel = computed(() =>
+    breakdown.value.value === null
+      ? PREPARED_LIMIT_EMPTY_VALUE
+      : String(breakdown.value.value),
+  );
+
+  /** Сумма бонусов со знаком для строки предпросмотра */
+  const bonusLabel = computed(() => formatSignedNumber(breakdown.value.bonus));
+
+  /** Отдаёт выправленную настройку наверх и закрывает окно */
+  function applyLimit(): void {
+    emit('apply', normalizePreparedLimit(draftLimit.value));
+
+    isOpen.value = false;
+  }
+</script>
+
+<template>
+  <UDraggableModal
+    v-model:open="isOpen"
+    :draggable="false"
+    :resizable="false"
+    :blocking="true"
+    :min-width="440"
+    :min-height="300"
+    :title="labels.title"
+    :z-index="Z_INDEX.MODAL_ELEVATED"
+  >
+    <template #body>
+      <div class="space-y-3">
+        <UCheckbox
+          v-model="draftCustom"
+          :label="PREPARED_SPELLS_LABELS.useCustom"
+          :description="PREPARED_SPELLS_LABELS.useCustomHint"
+        />
+
+        <div class="border-t border-muted" />
+
+        <!-- Своё число вместо подсчёта -->
+        <div
+          v-if="draftCustom"
+          class="flex items-center justify-between gap-4"
+        >
+          <span class="text-sm text-toned">{{ labels.customValue }}</span>
+
+          <UInputNumber
+            v-model="draftValue"
+            :min="PREPARED_LIMIT_MIN"
+            :max="PREPARED_LIMIT_MAX"
+            size="sm"
+            class="w-40 shrink-0"
+          />
+        </div>
+
+        <!-- Подсчёт по таблице класса -->
+        <template v-else>
+          <div class="flex items-center justify-between gap-4 text-sm">
+            <span class="text-toned">{{
+              PREPARED_SPELLS_LABELS.fromTable
+            }}</span>
+
+            <span class="text-toned tabular-nums">{{ classValueLabel }}</span>
+          </div>
+
+          <!-- Свои бонусы: те же строки, что у инициативы и спасбросков, —
+            числом, модификатором характеристики или бонусом мастерства -->
+          <div class="space-y-3">
+            <span
+              class="text-[10px] font-bold tracking-wider text-muted uppercase"
+            >
+              {{ PREPARED_SPELLS_LABELS.bonusesTitle }}
+            </span>
+
+            <CustomBonusRows
+              v-model="draftBonuses"
+              :context="context"
+            />
+          </div>
+
+          <p class="text-xs leading-relaxed text-dimmed">
+            <template v-if="classValue === null">
+              {{ labels.unknown }}
+            </template>
+
+            <template v-else>
+              {{ PREPARED_SPELLS_LABELS.hint }}
+            </template>
+          </p>
+        </template>
+
+        <div class="border-t border-muted" />
+
+        <div class="flex items-center justify-between gap-4">
+          <span class="text-sm text-muted">{{ labels.total }}</span>
+
+          <span class="flex items-baseline gap-2">
+            <span
+              v-if="!draftCustom && breakdown.bonus !== 0"
+              class="text-xs text-dimmed tabular-nums"
+            >
+              {{ classValueLabel }} {{ bonusLabel }}
+            </span>
+
+            <span class="text-xl font-bold text-highlighted tabular-nums">
+              {{ totalLabel }}
+            </span>
+          </span>
+        </div>
+
+        <!-- Кнопки -->
+        <div class="flex justify-end gap-2 pt-2">
+          <UButton
+            variant="ghost"
+            color="neutral"
+            size="sm"
+            @click.left.exact.prevent="isOpen = false"
+          >
+            {{ MODAL_BUTTON_LABELS.cancel }}
+          </UButton>
+
+          <UButton
+            color="primary"
+            size="sm"
+            @click.left.exact.prevent="applyLimit"
+          >
+            {{ MODAL_BUTTON_LABELS.apply }}
+          </UButton>
+        </div>
+      </div>
+    </template>
+  </UDraggableModal>
+</template>

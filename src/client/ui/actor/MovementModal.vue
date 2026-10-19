@@ -1,27 +1,62 @@
 <script setup lang="ts">
   import type { ActorMovement, MovementType } from '@vtt/shared';
-  import type { ActiveEffect } from '@vtt/shared/system/dnd.js';
+  import type {
+    ActiveEffect,
+    DnDCustomBonus,
+    DnDCustomBonusContext,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { DISTANCE_UNIT_OPTIONS } from '@vtt/shared';
-  import { computed, reactive, watch } from 'vue';
+  import { computed, reactive, ref, watch } from 'vue';
 
+  import { generateEntityId } from '@/core/entityUtils';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
+  import { DISTANCE_UNIT_OPTIONS } from '@vtt/shared';
+  import {
+    describeChangeValue,
+    getCustomBonusesValue,
+    isMovementType,
+    MOVEMENT_LABELS,
+    MOVEMENT_PRIORITY,
+    NEW_CUSTOM_BONUS,
+    toStoredCustomBonus,
+  } from '@vtt/shared/system/dnd.js';
+
+  import { MODAL_BUTTON_LABELS, MOVEMENT_SETTINGS_LABELS } from './constants';
+  import CustomBonusRows from './CustomBonusRows.vue';
+  import { formatSignedNumber } from './utils/formatSignedNumber';
+
+  /** Свои бонусы по видам передвижения */
+  type MovementBonuses = Partial<Record<MovementType, DnDCustomBonus[]>>;
 
   interface Props {
     open: boolean;
     movement: ActorMovement;
+    /** Свои бонусы к видам передвижения */
+    bonuses?: MovementBonuses;
+    /** Числа листа, от которых считается вклад своих бонусов */
+    context: DnDCustomBonusContext;
     /** Активные эффекты для вычисления бонусов к скоростям */
     activeEffects?: readonly ActiveEffect[];
+    /**
+     * Итоговые скорости листа — то, что видит плитка и чем ядро меряет ход
+     * токена. Считает их движок; окно только сверяет их с записанными, чтобы
+     * показать расхождение, а не пересчитывает правила заново.
+     */
+    resolvedMovement?: ActorMovement;
   }
 
   const props = withDefaults(defineProps<Props>(), {
+    bonuses: () => ({}),
     activeEffects: () => [],
+    // Итогов может не быть вовсе: лист существа считает их не всегда, и тогда
+    // окно просто не показывает разбор
+    resolvedMovement: undefined,
   });
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
-    'apply': [movement: ActorMovement];
+    'apply': [payload: { movement: ActorMovement; bonuses: MovementBonuses }];
   }>();
 
   const isOpen = computed({
@@ -29,14 +64,9 @@
     set: (value) => emit('update:open', value),
   });
 
-  /** Порядок типов движения = приоритет отображения */
-  const movementTypes: Array<{ key: MovementType; label: string }> = [
-    { key: 'burrow', label: 'Копание' },
-    { key: 'climb', label: 'Лазание' },
-    { key: 'fly', label: 'Полёт' },
-    { key: 'swim', label: 'Плавание' },
-    { key: 'walk', label: 'Ходьба' },
-  ];
+  /** Виды передвижения в порядке показа — тот же список, что и в листе */
+  const movementTypes: Array<{ key: MovementType; label: string }> =
+    MOVEMENT_PRIORITY.map((key) => ({ key, label: MOVEMENT_LABELS[key] }));
 
   const editMovement = reactive<ActorMovement>({
     walk: 0,
@@ -48,109 +78,243 @@
     units: 'ft',
   });
 
+  /** Свои бонусы черновика: правятся до «Применить», лист их пока не видит */
+  const draftBonuses = ref<MovementBonuses>({});
+
   // При открытии — подставляем текущие значения
   watch(
     () => props.open,
     (opened) => {
-      if (opened) {
-        Object.assign(editMovement, props.movement);
+      if (!opened) {
+        return;
       }
-    },
-  );
 
-  /** Источник бонуса к скорости */
-  interface MovementBonusSource {
-    /** Название эффекта-источника */
-    name: string;
-    /** Числовое значение бонуса */
-    value: number;
-  }
+      Object.assign(editMovement, props.movement);
 
-  /** Набор валидных ключей движения для проверки без as-каста */
-  const validMovementKeys: Set<string> = new Set(
-    movementTypes.map((entry) => entry.key),
-  );
+      const copied: MovementBonuses = {};
 
-  /**
-   * Собирает бонусы к скорости от Active Effects для каждого типа движения
-   */
-  const movementBonuses = computed<Record<MovementType, MovementBonusSource[]>>(
-    () => {
-      const result: Record<string, MovementBonusSource[]> = Object.fromEntries(
-        movementTypes.map((entry) => [entry.key, []]),
-      );
+      for (const movementType of movementTypes) {
+        const bonuses = props.bonuses[movementType.key];
 
-      const targetPrefix = 'movement.';
-
-      for (const effect of props.activeEffects) {
-        for (const change of effect.changes) {
-          if (!change.key.startsWith(targetPrefix) || change.condition) {
-            continue;
-          }
-
-          const movementKey = change.key.slice(targetPrefix.length);
-
-          if (!validMovementKeys.has(movementKey)) {
-            continue;
-          }
-
-          const numericValue = Number(change.value);
-
-          if (!Number.isNaN(numericValue) && numericValue !== 0) {
-            result[movementKey].push({
-              name: effect.name,
-              value: numericValue,
-            });
-          }
+        if (bonuses && bonuses.length > 0) {
+          copied[movementType.key] = bonuses.map((bonus) => ({ ...bonus }));
         }
       }
 
-      return result as Record<MovementType, MovementBonusSource[]>;
+      draftBonuses.value = copied;
     },
   );
 
   /**
-   * Суммарный бонус к скорости для указанного типа движения
+   * Строки своих бонусов вида передвижения. Пустой список у вида не хранится —
+   * иначе запись листа копила бы пустоту по всем пяти видам.
+   *
+   * @param movementKey - вид передвижения
+   * @returns свои бонусы вида
    */
-  function getMovementBonus(movementKey: MovementType): number {
-    const sources = movementBonuses.value[movementKey];
-
-    return sources.reduce((sum, source) => sum + source.value, 0);
+  function getBonuses(movementKey: MovementType): DnDCustomBonus[] {
+    return draftBonuses.value[movementKey] ?? [];
   }
 
   /**
-   * Текст тултипа бонусов к скорости
+   * Записывает правленый список бонусов вида в черновик.
+   *
+   * @param movementKey - вид передвижения
+   * @param bonuses - строки бонусов вида
    */
-  function getMovementBonusTooltip(movementKey: MovementType): string {
-    return movementBonuses.value[movementKey]
-      .filter((source) => source.value !== 0)
-      .map((source) => {
-        const prefix = source.value > 0 ? '+' : '';
-
-        return `${source.name}: ${prefix}${source.value}`;
-      })
-      .join('\n');
+  function setBonuses(
+    movementKey: MovementType,
+    bonuses: DnDCustomBonus[],
+  ): void {
+    draftBonuses.value = { ...draftBonuses.value, [movementKey]: bonuses };
   }
 
   /**
-   * Форматированный бонус: +10, -5
+   * Заводит виду пустой бонус: заготовка «+1» правится тут же в строке.
+   *
+   * @param movementKey - вид передвижения
    */
-  function formatBonus(value: number): string {
-    return value > 0 ? `+${value}` : `${value}`;
+  function addBonus(movementKey: MovementType): void {
+    setBonuses(movementKey, [
+      ...getBonuses(movementKey),
+      { ...NEW_CUSTOM_BONUS, id: generateEntityId('bonus') },
+    ]);
   }
 
   /**
-   * CSS-класс цвета бонуса: зелёный для положительных, красный для отрицательных
+   * Вклад своих бонусов вида — он показывается рядом с полем скорости.
+   *
+   * @param movementKey - вид передвижения
+   * @returns суммарный вклад со знаком
    */
-  function bonusColorClass(value: number): string {
-    return value > 0 ? 'text-success' : 'text-danger';
+  function getBonusesLabel(movementKey: MovementType): string {
+    return formatSignedNumber(
+      getCustomBonusesValue(props.context, getBonuses(movementKey)),
+    );
+  }
+
+  /** Что делает с видом передвижения один эффект */
+  interface MovementEffectSource {
+    /** Название эффекта-источника */
+    name: string;
+    /** Подпись изменения в его собственном режиме: «+10 фт», «заменить 0 фт» */
+    text: string;
   }
 
   /**
-   * Применяет изменения передвижения
+   * Изменения видов передвижения от активных эффектов.
+   *
+   * Копятся любые, а не только ненулевые прибавки: замена скорости нулём и
+   * нечитаемое значение — ровно те случаи, когда лист замирает, и прятать их
+   * тут нельзя. Режим тоже не выдаётся за прибавку — «заменить 60» и «+60»
+   * дают разный итог, и подпись берётся общая с описанием эффекта.
+   *
+   * Условные строки попадают в список с пометкой, а не отбрасываются: часть из
+   * них (условие по носителю — доспех, тип существа) лист считает, часть
+   * откладывает до броска, и решает это движок. Повторять его разбор здесь
+   * значило бы завести вторую реализацию правила; список честнее показать
+   * целиком, а точное число всё равно приходит итогом.
+   */
+  const movementEffects = computed<
+    Record<MovementType, MovementEffectSource[]>
+  >(() => {
+    // Явный литерал, а не сборка по списку ключей: только он доказывает
+    // типу, что запись заполнена по всем типам движения
+    const result: Record<MovementType, MovementEffectSource[]> = {
+      walk: [],
+      swim: [],
+      fly: [],
+      climb: [],
+      burrow: [],
+    };
+
+    const targetPrefix = 'movement.';
+
+    for (const effect of props.activeEffects) {
+      for (const change of effect.changes) {
+        if (!change.key.startsWith(targetPrefix)) {
+          continue;
+        }
+
+        const movementKey = change.key.slice(targetPrefix.length);
+
+        // Хвост ключа приходит из записи мира — тип подтверждает гвард
+        if (!isMovementType(movementKey)) {
+          continue;
+        }
+
+        const value = describeChangeValue(change);
+
+        result[movementKey].push({
+          name: effect.name,
+          text: change.condition
+            ? `${value} (${MOVEMENT_SETTINGS_LABELS.conditionalMark})`
+            : value,
+        });
+      }
+    }
+
+    return result;
+  });
+
+  /**
+   * Эффекты, гасящие передвижение целиком флагом `speed.zero` — Схвачен,
+   * Опутан, Парализован, Окаменевший, Без сознания. Числами в скоростях они не
+   * видны никак, поэтому окно называет их отдельной строкой.
+   */
+  const zeroSpeedEffects = computed<string[]>(() =>
+    props.activeEffects
+      .filter((effect) => effect.flags.includes('speed.zero'))
+      .map((effect) => effect.name),
+  );
+
+  /**
+   * Трогают ли вид передвижения эффекты — только тогда рядом с полем встаёт
+   * итоговое число. Без итогов от листа показывать нечего: пересчитывать
+   * правила второй раз окно не станет.
+   *
+   * @param movementKey - вид передвижения
+   * @returns `true`, если у вида есть что объяснять
+   */
+  function hasEffectImpact(movementKey: MovementType): boolean {
+    if (!props.resolvedMovement) {
+      return false;
+    }
+
+    if (movementEffects.value[movementKey].length > 0) {
+      return true;
+    }
+
+    // Погашение скорости отмечается только там, где было что гасить: у вида с
+    // нулём и без того ничего не менялось
+    return zeroSpeedEffects.value.length > 0 && props.movement[movementKey] > 0;
+  }
+
+  /**
+   * Итоговая скорость вида — её же видит плитка листа и ядро при ходе токена.
+   *
+   * @param movementKey - вид передвижения
+   * @returns число из итогов листа
+   */
+  function getEffectTotal(movementKey: MovementType): number {
+    return props.resolvedMovement?.[movementKey] ?? 0;
+  }
+
+  /**
+   * Разбор итога вида: перечень эффектов и, если скорость погашена целиком, —
+   * чем именно.
+   *
+   * @param movementKey - вид передвижения
+   * @returns текст подсказки построчно
+   */
+  function getEffectTooltip(movementKey: MovementType): string {
+    const lines: string[] = [MOVEMENT_SETTINGS_LABELS.sheetTotalHint];
+
+    for (const source of movementEffects.value[movementKey]) {
+      lines.push(`${source.name}: ${source.text}`);
+    }
+
+    for (const name of zeroSpeedEffects.value) {
+      lines.push(`${name}: ${MOVEMENT_SETTINGS_LABELS.zeroBySource}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Цвет итога: красный, когда эффекты скорость срезали, зелёный — когда
+   * подняли.
+   *
+   * @param movementKey - вид передвижения
+   * @returns CSS-класс цвета
+   */
+  function effectTotalColorClass(movementKey: MovementType): string {
+    const total = getEffectTotal(movementKey);
+    const stored = props.movement[movementKey];
+
+    if (total < stored) {
+      return 'text-danger';
+    }
+
+    return total > stored ? 'text-success' : 'text-toned';
+  }
+
+  /**
+   * Применяет изменения передвижения. Виды без бонусов из записи выпадают —
+   * лист не копит пустые списки.
    */
   function applyMovement() {
-    emit('apply', { ...editMovement });
+    const bonuses: MovementBonuses = {};
+
+    for (const movementType of movementTypes) {
+      const rows = draftBonuses.value[movementType.key] ?? [];
+
+      if (rows.length > 0) {
+        bonuses[movementType.key] = rows.map(toStoredCustomBonus);
+      }
+    }
+
+    emit('apply', { movement: { ...editMovement }, bonuses });
     isOpen.value = false;
   }
 </script>
@@ -161,69 +325,107 @@
     :draggable="false"
     :resizable="false"
     :blocking="true"
-    :min-width="400"
+    :min-width="440"
     :min-height="300"
-    title="Передвижение"
+    :title="MOVEMENT_SETTINGS_LABELS.title"
     :z-index="Z_INDEX.MODAL_ELEVATED"
   >
     <template #body>
       <div class="space-y-4">
-        <!-- Типы движения -->
+        <!-- Типы движения: у каждого своя скорость и свои бонусы -->
         <div class="space-y-3">
           <div
             v-for="movementType in movementTypes"
             :key="movementType.key"
-            class="flex items-center gap-3"
+            class="flex flex-col gap-2 rounded-lg border p-2 transition-colors"
+            :class="
+              getBonuses(movementType.key).length > 0
+                ? 'border-primary/40'
+                : 'border-default/50'
+            "
           >
-            <span class="w-24 text-sm text-toned">{{
-              movementType.label
-            }}</span>
+            <div class="flex items-center gap-3">
+              <span class="w-24 text-sm text-toned">{{
+                movementType.label
+              }}</span>
 
-            <UInput
-              :model-value="editMovement[movementType.key]"
-              type="number"
-              :min="0"
-              size="sm"
-              class="flex-1"
-              @update:model-value="
-                editMovement[movementType.key] = Number($event)
-              "
-            />
+              <UInput
+                :model-value="editMovement[movementType.key]"
+                type="number"
+                :min="0"
+                size="sm"
+                class="flex-1"
+                @update:model-value="
+                  editMovement[movementType.key] = Number($event)
+                "
+              />
 
-            <!-- Бонус от эффектов -->
-            <UTooltip
-              v-if="getMovementBonus(movementType.key) !== 0"
-              :text="getMovementBonusTooltip(movementType.key)"
-              :ui="{ content: 'whitespace-pre-line' }"
-            >
+              <!-- Вклад своих бонусов вида -->
               <span
-                class="w-12 rounded-md bg-elevated px-2 py-1.5 text-center text-sm font-bold tabular-nums"
-                :class="bonusColorClass(getMovementBonus(movementType.key))"
-                >{{ formatBonus(getMovementBonus(movementType.key)) }}</span
+                v-if="getBonuses(movementType.key).length > 0"
+                class="w-12 rounded-md border border-primary/40 px-2 py-1 text-center text-sm font-bold text-toned tabular-nums"
               >
-            </UTooltip>
+                {{ getBonusesLabel(movementType.key) }}
+              </span>
 
-            <template v-if="movementType.key === 'fly'">
-              <label
-                class="flex cursor-pointer items-center gap-1.5 text-sm text-muted"
+              <!-- Итог с учётом эффектов: с ним видно, почему лист не идёт -->
+              <UTooltip
+                v-if="hasEffectImpact(movementType.key)"
+                :text="getEffectTooltip(movementType.key)"
+                :ui="{ content: 'whitespace-pre-line' }"
               >
-                <input
-                  v-model="editMovement.hover"
-                  type="checkbox"
-                  class="rounded border-accented bg-elevated text-gold focus:ring-gold/30"
+                <span
+                  class="w-12 rounded-md bg-elevated px-2 py-1.5 text-center text-sm font-bold tabular-nums"
+                  :class="effectTotalColorClass(movementType.key)"
+                  >{{ getEffectTotal(movementType.key) }}</span
+                >
+              </UTooltip>
+
+              <UCheckbox
+                v-if="movementType.key === 'fly'"
+                v-model="editMovement.hover"
+                :label="MOVEMENT_SETTINGS_LABELS.hover"
+                class="shrink-0"
+              />
+
+              <UTooltip :text="MOVEMENT_SETTINGS_LABELS.addBonus">
+                <UButton
+                  icon="tabler:plus"
+                  color="neutral"
+                  variant="subtle"
+                  size="xs"
+                  square
+                  :aria-label="`${MOVEMENT_SETTINGS_LABELS.addBonus}: ${movementType.label}`"
+                  @click.left.exact.prevent="addBonus(movementType.key)"
                 />
-                Парение
-              </label>
-            </template>
+              </UTooltip>
+            </div>
+
+            <!-- У вида без своих бонусов строк нет вовсе, а первый бонус
+              заводит плюс в шапке строки -->
+            <CustomBonusRows
+              v-if="getBonuses(movementType.key).length > 0"
+              :model-value="getBonuses(movementType.key)"
+              :context="context"
+              :with-add="false"
+              class="border-l-2 border-primary/40 pl-2"
+              @update:model-value="setBonuses(movementType.key, $event)"
+            />
           </div>
         </div>
+
+        <p class="text-xs leading-relaxed text-dimmed">
+          {{ MOVEMENT_SETTINGS_LABELS.bonusesHint }}
+        </p>
 
         <!-- Разделитель -->
         <div class="border-t border-muted" />
 
         <!-- Единицы -->
         <div class="flex items-center gap-3">
-          <span class="w-24 text-sm text-toned">Единицы</span>
+          <span class="w-24 text-sm text-toned">
+            {{ MOVEMENT_SETTINGS_LABELS.units }}
+          </span>
 
           <USelect
             v-model="editMovement.units"
@@ -242,7 +444,7 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -250,7 +452,7 @@
             size="sm"
             @click.left.exact.prevent="applyMovement"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

@@ -8,19 +8,27 @@
  * заклинаний для отображения в мастерах и записи в лист персонажа.
  */
 
+import type { Ref } from 'vue';
+
 import type { TypedWebSocketClient } from '@vtt/shared';
 import type {
+  ClassSpellListRequest,
+  GrantedSpellPack,
+  GrantedSpellResolution,
   GrantedSpellSource,
   ResolvedGrantedSpell,
   Spell,
 } from '@vtt/shared/system/dnd.js';
-import type { Ref } from 'vue';
 
 import { computed, ref, watch } from 'vue';
 
-import { loadCompendiumKind } from '@/core/compendiumDataClient';
+import {
+  expandClassSpellRequests,
+  resolveGrantedSpellSourcesInPacks,
+} from '@vtt/shared/system/dnd.js';
 
-import { extractSpellEntries } from './spellCompendium';
+import { loadGrantedSpellPacks } from './grantedSpellPacks';
+import { finalizeGrantedSpells } from './usePackChoicePrompt';
 
 /**
  * Composable сопоставления granted-заклинаний с данными компендиума.
@@ -30,13 +38,19 @@ import { extractSpellEntries } from './spellCompendium';
  *
  * @param socket - WebSocket-клиент для запроса данных компендиума
  * @param grantedSpellSources - связи «ID заклинания → умение-источник»
+ * @param classSpellRequests - запросы «выдать весь список класса»; они не называют
+ *   заклинаний поимённо, и записи для них подбираются уже по загруженному каталогу
  * @returns `resolvedGrantedSpells` — заклинания с умениями-источниками
  */
 export function useGrantedSpellsResolver(
   socket: Ref<TypedWebSocketClient | null>,
   grantedSpellSources: Ref<GrantedSpellSource[]>,
+  classSpellRequests?: Ref<ClassSpellListRequest[]>,
 ) {
-  /** Загруженные заклинания компендиума */
+  /** Загруженные заклинания компендиума по пакам */
+  const compendiumPacks = ref<GrantedSpellPack[]>([]);
+
+  /** Загруженные заклинания компендиума одним списком */
   const compendiumSpells = ref<Spell[]>([]);
 
   /** Был ли уже отправлен запрос данных (защита от повторных запросов) */
@@ -52,15 +66,21 @@ export function useGrantedSpellsResolver(
   ): Promise<void> {
     hasRequestedData.value = true;
 
-    const entries = await loadCompendiumKind(socketClient, 'spell');
+    compendiumPacks.value = await loadGrantedSpellPacks(socketClient);
 
-    compendiumSpells.value = extractSpellEntries(entries);
+    compendiumSpells.value = compendiumPacks.value.flatMap(
+      (pack) => pack.spells,
+    );
   }
 
   watch(
-    [grantedSpellSources, socket],
-    ([sources, socketClient]) => {
-      if (sources.length === 0 || !socketClient || hasRequestedData.value) {
+    [grantedSpellSources, classSpellRequests ?? ref([]), socket],
+    ([sources, requests, socketClient]) => {
+      if (
+        (sources.length === 0 && requests.length === 0)
+        || !socketClient
+        || hasRequestedData.value
+      ) {
         return;
       }
 
@@ -69,31 +89,52 @@ export function useGrantedSpellsResolver(
     { immediate: true },
   );
 
-  /** Granted-заклинания, сопоставленные с данными компендиума */
-  const resolvedGrantedSpells = computed((): ResolvedGrantedSpell[] => {
+  /**
+   * Выдаваемые заклинания, разобранные правилом «свой пак → единственный
+   * другой → выбор игрока → нет»: свой пак — пак источника (`source.packId`).
+   */
+  const grantedSpellResolution = computed((): GrantedSpellResolution => {
+    const requests = classSpellRequests?.value ?? [];
+
     if (
-      grantedSpellSources.value.length === 0
+      (grantedSpellSources.value.length === 0 && requests.length === 0)
       || compendiumSpells.value.length === 0
     ) {
-      return [];
+      return { resolved: [], ambiguous: [], missing: [] };
     }
 
-    const resolved: ResolvedGrantedSpell[] = [];
-
-    for (const source of grantedSpellSources.value) {
-      const spell = compendiumSpells.value.find(
-        (entry) => entry.id === source.spellId,
-      );
-
-      if (spell) {
-        resolved.push({ spell, featureName: source.featureName });
-      }
-    }
-
-    return resolved;
+    // Список класса разворачивается здесь, а не у источника запроса: заклинаний он
+    // не называет, и подобрать их можно только по загруженному каталогу
+    return resolveGrantedSpellSourcesInPacks(compendiumPacks.value, [
+      ...grantedSpellSources.value,
+      ...expandClassSpellRequests(requests, compendiumPacks.value),
+    ]);
   });
+
+  /**
+   * Нашедшиеся однозначно — их мастер показывает до применения. Заклинания,
+   * лежащие в нескольких компендиумах, добавятся после выбора игрока.
+   */
+  const resolvedGrantedSpells = computed(
+    (): ResolvedGrantedSpell[] => grantedSpellResolution.value.resolved,
+  );
+
+  /**
+   * Всё, что ляжет на лист: спрашивает игрока о заклинаниях из нескольких
+   * компендиумов и предупреждает о ненайденных. Зовётся при применении.
+   *
+   * @param actorId - персонаж, которому выдаются заклинания
+   */
+  function finalizeForActor(actorId: string): Promise<ResolvedGrantedSpell[]> {
+    return finalizeGrantedSpells(actorId, grantedSpellResolution.value);
+  }
+
+  /** Каталог заклинаний уже загружен: пустой результат — это правда, а не ожидание */
+  const isLoaded = computed(() => compendiumSpells.value.length > 0);
 
   return {
     resolvedGrantedSpells,
+    finalizeForActor,
+    isLoaded,
   };
 }

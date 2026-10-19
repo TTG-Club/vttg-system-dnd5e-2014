@@ -1,28 +1,58 @@
 <script setup lang="ts">
-  import type { GameItem } from '@vtt/shared/system/dnd.js';
+  import type { DnDGameItem } from '@vtt/shared/system/dnd.js';
+
+  import { computed } from 'vue';
 
   import { formatItemCost } from '@vtt/shared';
-  import { formatWeaponDamageFormula } from '@vtt/shared/system/dnd.js';
+  import { describeWeaponDamageDisplay } from '@vtt/shared/system/dnd.js';
 
+  import {
+    formatDamageBonusLines,
+    formatDamageTileFormula,
+    resolveDamageStatIcon,
+  } from '../../composables/damageTypeChoice';
   import { useContextMenu } from '../../composables/useContextMenu';
-  import { GAME_ITEM_MIME } from './constants';
+  import { useListRowClass } from '../../composables/useListRowClass';
+  import {
+    GAME_ITEM_MIME,
+    SHEET_ROW_TOOLTIP_LINE_BREAK,
+    WEIGHT_UNIT_LABEL,
+  } from './constants';
   import ContextMenuOverlay from './ContextMenuOverlay.vue';
+  import EntityRowBody from './EntityRowBody.vue';
   import WeaponIcon from './WeaponIcon.vue';
 
   const props = defineProps<{
     /** Данные предмета */
-    item: GameItem;
+    item: DnDGameItem;
     /** Показывать «Скопировать в предметы» в контекстном меню */
     showCopy?: boolean;
     /** Показывать «Редактировать» в контекстном меню */
     showEdit?: boolean;
     /** Показывать «Удалить» в контекстном меню */
     showDelete?: boolean;
+    /** Показывать «В компендиум» в контекстном меню (ставит ядро в «Мастерской») */
+    showAddToCompendium?: boolean;
+    /**
+     * «Поделиться в чат» в контекстном меню. Это обработчик `@share`, а не
+     * событие: пункт показывается, только когда отправить есть кому.
+     */
+    onShare?: () => void;
     /** Показывать стоимость (по умолчанию true) */
     showCost?: boolean;
     /** Показывать вес (по умолчанию true) */
     showWeight?: boolean;
+    /**
+     * Плоская строка списка: без своей плашки и скругления, а показатели записи
+     * (урон, стоимость, вес) уступают место английскому названию и источнику.
+     * Так строка встаёт в список компендиума и окон выбора; на листе персонажа
+     * строки стоят порознь, и там нужны и плашка, и показатели.
+     */
+    flat?: boolean;
   }>();
+
+  /** Оформление строки: плоская в списке, плашкой на листе персонажа */
+  const rowClass = useListRowClass(() => Boolean(props.flat));
 
   const emit = defineEmits<{
     /** Клик по строке (открыть детальник) */
@@ -33,17 +63,49 @@
     edit: [];
     /** Удалить */
     delete: [];
+    /** Положить запись в компендиум мира */
+    addToCompendium: [];
   }>();
 
-  const { isMenuOpen, menuX, menuY, openContextMenu, handleAction, closeMenu } =
-    useContextMenu(props, emit);
+  const {
+    isMenuOpen,
+    menuX,
+    menuY,
+    canShare,
+    openContextMenu,
+    handleAction,
+    closeMenu,
+  } = useContextMenu(props, emit, () => emit('addToCompendium'));
+
+  /**
+   * Урон для бейджа — как в плитке строки листа: только то, что бросается
+   * всегда. Добавки по условию («+ 2к6 (цель: Исчадие)») в узкую строку списка
+   * не помещаются: о них говорит значок, а сами они — в подсказке бейджа.
+   * Оружие без постоянного урона («Святой мститель»: одни добавки по типу
+   * цели) получает короткую заглушку — иначе бейдж выдавил бы название.
+   */
+  const damageBadge = computed(() => {
+    const display = describeWeaponDamageDisplay(props.item);
+    const bonusLines = formatDamageBonusLines(display.conditionalFormulas);
+
+    return {
+      formula: formatDamageTileFormula(display.baseFormula),
+      icon: resolveDamageStatIcon(false, bonusLines.length > 0),
+      hint:
+        bonusLines.length > 0
+          ? [display.baseFormula, ...bonusLines]
+              .filter((line) => line.length > 0)
+              .join(SHEET_ROW_TOOLTIP_LINE_BREAK)
+          : undefined,
+    };
+  });
 
   /**
    * Начинает перетаскивание предмета (D&D на актёра)
    * @param event - событие dragstart
    * @param weapon - данные предмета
    */
-  function handleDragStart(event: DragEvent, item: GameItem): void {
+  function handleDragStart(event: DragEvent, item: DnDGameItem): void {
     if (!event.dataTransfer) {
       return;
     }
@@ -56,56 +118,69 @@
 <template>
   <div
     draggable="true"
-    class="flex cursor-grab items-center gap-3 rounded-lg bg-elevated/30 px-3 py-2 transition-colors hover:bg-accented/40 active:cursor-grabbing"
+    class="flex cursor-grab items-center gap-3 py-2 transition-colors active:cursor-grabbing"
+    :class="rowClass"
     @click.left.exact.prevent="$emit('click')"
     @contextmenu="openContextMenu"
     @dragstart="handleDragStart($event, item)"
   >
-    <!-- Иконка оружия по baseType -->
-    <WeaponIcon
-      :base-type="item.baseType"
-      class="h-4 w-4 shrink-0 text-muted"
-    />
+    <!-- Строка списка: значок, название с английским и источник справа -->
+    <template v-if="flat">
+      <WeaponIcon
+        :base-type="item.baseType"
+        class="h-4 w-4 shrink-0 text-muted"
+      />
 
-    <!-- Название -->
-    <span class="flex-1 truncate text-sm font-medium text-highlighted">
-      {{ item.name }}
-    </span>
+      <EntityRowBody
+        :name="item.name"
+        :name-en="item.nameEn"
+        :source-key="item.sourceKey"
+        :source="item.source"
+      />
+    </template>
 
-    <!-- Тип (дальнобойное/ближний) -->
-    <span
-      v-if="item.rangeType"
-      class="shrink-0 text-xs text-dimmed"
-    >
-      {{ item.rangeType === 'ranged' ? 'Дальн.' : 'Ближн.' }}
-    </span>
+    <!-- Строка листа персонажа: показатели важнее книги, из которой запись -->
+    <template v-else>
+      <!-- Иконка оружия по baseType -->
+      <WeaponIcon
+        :base-type="item.baseType"
+        class="h-4 w-4 shrink-0 text-muted"
+      />
 
-    <!-- Урон -->
-    <UBadge
-      v-if="item.damageParts?.length"
-      color="neutral"
-      variant="subtle"
-      size="sm"
-      class="shrink-0 font-mono"
-    >
-      {{ formatWeaponDamageFormula(item) }}
-    </UBadge>
+      <!-- Название -->
+      <span class="flex-1 truncate text-sm font-medium text-highlighted">
+        {{ item.name }}
+      </span>
 
-    <!-- Стоимость -->
-    <span
-      v-if="item.cost && (showCost ?? true)"
-      class="shrink-0 text-xs text-gold/80"
-    >
-      {{ formatItemCost(item.cost) }}
-    </span>
+      <!-- Урон -->
+      <UBadge
+        v-if="item.damageParts?.length"
+        color="neutral"
+        variant="subtle"
+        size="sm"
+        class="shrink-0 font-mono"
+        :trailing-icon="damageBadge.icon"
+        :title="damageBadge.hint"
+      >
+        {{ damageBadge.formula }}
+      </UBadge>
 
-    <!-- Вес -->
-    <span
-      v-if="item.weight && (showWeight ?? true)"
-      class="shrink-0 text-xs text-dimmed"
-    >
-      {{ item.weight }} фнт.
-    </span>
+      <!-- Стоимость -->
+      <span
+        v-if="item.cost && (showCost ?? true)"
+        class="shrink-0 text-xs text-primary/80"
+      >
+        {{ formatItemCost(item.cost) }}
+      </span>
+
+      <!-- Вес -->
+      <span
+        v-if="item.weight && (showWeight ?? true)"
+        class="shrink-0 text-xs text-dimmed"
+      >
+        {{ item.weight }} {{ WEIGHT_UNIT_LABEL }}
+      </span>
+    </template>
   </div>
 
   <ContextMenuOverlay
@@ -115,6 +190,8 @@
     :show-copy="showCopy"
     :show-edit="showEdit"
     :show-delete="showDelete"
+    :show-add-to-compendium="showAddToCompendium"
+    :show-share="canShare"
     @action="handleAction"
     @close="closeMenu"
   />

@@ -5,27 +5,49 @@
     SpellAreaShape,
     SpellSaveType,
   } from '@vtt/shared';
-  import type { ActiveEffect, CreatureAction } from '@vtt/shared/system/dnd.js';
+  import type {
+    ActiveEffect,
+    CreatureAction,
+    CreatureActionRangeType,
+    CreatureDamageAlternative,
+    CreatureRecharge,
+    EffectFormContext,
+  } from '@vtt/shared/system/dnd.js';
 
+  import { computed, reactive, watch } from 'vue';
+
+  import RichTextEditor from '@/shared_ui/components/RichTextEditor.vue';
+  import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
+  import { useModalManager } from '@/shared_ui/composables/useModalManager';
   import { DISTANCE_UNIT_OPTIONS } from '@vtt/shared';
   import {
     AREA_SHAPE_OPTIONS,
     areaShapeUsesHeight,
     areaShapeUsesWidth,
     buildActionDescription,
+    createCreatureActionId,
     getActionDescriptionMarkdown,
     getAreaSizeLabel,
+    listCreatureDamageAlternatives,
+    MAX_SAVE_OVERRIDE_USES,
     SAVE_EFFECT_OPTIONS,
     SAVE_TYPE_OPTIONS,
   } from '@vtt/shared/system/dnd.js';
-  import { computed, reactive, watch } from 'vue';
 
-  import RichTextEditor from '@/shared_ui/components/RichTextEditor.vue';
-  import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
-  import { useModalManager } from '@/shared_ui/composables/useModalManager';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
-
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import {
+    AREA_FIELD_LABELS,
+    FORM_FIELD_LABELS,
+    FORM_TAB_LABELS,
+    MODAL_BUTTON_LABELS,
+    RANGE_FIELD_LABELS,
+  } from '../actor/constants';
   import DamagePartsEditor from '../actor/DamagePartsEditor.vue';
+  import {
+    CREATURE_ACTION_FORM_LABELS,
+    CREATURE_RECHARGE_OPTIONS,
+  } from './constants';
+  import CreatureDamageAlternativesEditor from './CreatureDamageAlternativesEditor.vue';
 
   type ActionMode = 'trait' | 'action';
 
@@ -68,12 +90,13 @@
 
   /** Заголовок модалки */
   const modalTitle = computed(() => {
-    const isEditing = !!props.action?.name;
-    const typeLabel = props.mode === 'trait' ? 'Черта' : 'Действие';
+    if (props.action?.name) {
+      return `${CREATURE_ACTION_FORM_LABELS.editTitlePrefix}${props.action.name}`;
+    }
 
-    return isEditing
-      ? `Редактирование: ${props.action!.name}`
-      : `Новая ${typeLabel === 'Черта' ? 'черта' : 'действие'}`;
+    return props.mode === 'trait'
+      ? CREATURE_ACTION_FORM_LABELS.createTraitTitle
+      : CREATURE_ACTION_FORM_LABELS.createActionTitle;
   });
 
   // ── Локальная форма ────────────────────────────────────────────────────────
@@ -83,7 +106,11 @@
     nameEn: string;
     description: string;
     attackBonus: number | null;
+    /** Урон без броска попадания; без отметки пустой бонус — атака с +0 */
+    autoHit: boolean;
     damageParts: DamagePart[];
+    /** Урон «или»: наборы, заменяющие основной урон по условию */
+    damageAlternatives: CreatureDamageAlternative[];
     saveType: SpellSaveType;
     saveDC: number | null;
     saveEffect: 'half' | 'none' | 'special';
@@ -98,14 +125,24 @@
     rangeNormal: number;
     rangeLong: number;
     distanceUnit: DistanceUnit;
-    rangeType: 'melee' | 'ranged';
+    rangeType: CreatureActionRangeType;
     activeEffects: ActiveEffect[];
+    /**
+     * `none` — перезарядки нет. Ключом, а не пустой строкой: `USelect` на
+     * пустом значении позиции не показывает список вовсе — так же, как
+     * соседние поля спасброска, где «нет» тоже отдельный ключ.
+     */
+    recharge: CreatureRecharge | 'none';
+    /** «Провал в успех» раз в день — только у черты; пусто — нет */
+    saveSuccessPerDay: number | null;
   }>({
     name: '',
     nameEn: '',
     description: '',
     attackBonus: null,
+    autoHit: false,
     damageParts: [],
+    damageAlternatives: [],
     saveType: 'none',
     saveDC: null,
     saveEffect: 'half',
@@ -122,28 +159,49 @@
     distanceUnit: 'ft',
     rangeType: 'melee',
     activeEffects: [],
+    recharge: 'none',
+    saveSuccessPerDay: null,
   });
+
+  /** Список перезарядки для формы: выбор «перезарядки нет» идёт первым */
+  const rechargeItems = computed<
+    { label: string; value: CreatureRecharge | 'none' }[]
+  >(() => [
+    { label: CREATURE_ACTION_FORM_LABELS.rechargeNone, value: 'none' },
+    ...CREATURE_RECHARGE_OPTIONS,
+  ]);
 
   /** Есть ли боевые параметры (только у действий) */
   const hasCombatFields = computed(() => props.mode === 'action');
 
+  /** Место окна эффекта: черта действует на существо, действие — на цель */
+  const effectFormContext = computed<EffectFormContext>(() =>
+    props.mode === 'trait' ? 'creatureTrait' : 'creatureAction',
+  );
+
   /** Вкладки формы (боевые параметры — только у действий) */
   const tabItems = computed(() => {
     const items: Array<{ label: string; slot: string }> = [
-      { label: 'Основное', slot: 'general' },
+      { label: FORM_TAB_LABELS.main, slot: 'general' },
     ];
 
     if (hasCombatFields.value) {
-      items.push({ label: 'Боевые параметры', slot: 'combat' });
+      items.push({
+        label: CREATURE_ACTION_FORM_LABELS.tabCombat,
+        slot: 'combat',
+      });
     }
 
-    items.push({ label: 'Эффекты', slot: 'effects' });
+    items.push({ label: FORM_TAB_LABELS.effects, slot: 'effects' });
 
     return items;
   });
 
   /** Есть ли спасбросок (заменяет бросок попадания) */
   const hasSave = computed(() => form.saveType !== 'none');
+
+  /** Поле бонуса атаки: у спасброска и автопопадания броска попадания нет */
+  const isAttackBonusShown = computed(() => !hasSave.value && !form.autoHit);
 
   /** Опции типа урона из системных данных (для DamagePartsEditor) */
   const damageTypeOptions = computed(() =>
@@ -153,8 +211,24 @@
     })),
   );
 
-  /** Дальнобойная дистанция активна только для ranged-типа */
-  const isRangeEnabled = computed(() => form.rangeType === 'ranged');
+  /**
+   * Варианты типа атаки. «Рукопашная или дальнобойная» — атака с обеими
+   * дальностями сразу, вид выбирается при броске.
+   */
+  const rangeTypeItems: { label: string; value: CreatureActionRangeType }[] = [
+    { label: CREATURE_ACTION_FORM_LABELS.rangeTypeMelee, value: 'melee' },
+    { label: CREATURE_ACTION_FORM_LABELS.rangeTypeRanged, value: 'ranged' },
+    {
+      label: CREATURE_ACTION_FORM_LABELS.rangeTypeMeleeOrRanged,
+      value: 'meleeOrRanged',
+    },
+  ];
+
+  /** Досягаемость нужна рукопашной атаке и «рукопашной или дальнобойной» */
+  const isReachEnabled = computed(() => form.rangeType !== 'ranged');
+
+  /** Дистанция нужна дальнобойной атаке и «рукопашной или дальнобойной» */
+  const isRangeEnabled = computed(() => form.rangeType !== 'melee');
 
   /** Подпись поля основного размера области (радиус либо размер стороны) */
   const areaSizeLabel = computed(() => getAreaSizeLabel(form.areaShape));
@@ -166,14 +240,20 @@
   const showAreaHeight = computed(() => areaShapeUsesHeight(form.areaShape));
 
   /**
-   * Формула урона невалидна: содержит `@mod.*`/`@prof`/`@level` — у существ
-   * модификатор уже вшит в формулу (плоское число), @-переменные не нужны и
-   * сломали бы бросок. Блокирует сохранение.
+   * Формула урона невалидна: содержит `@mod.*`/`@prof`/`@level`/`@classLevel` —
+   * у существ модификатор уже вшит в формулу (плоское число), @-переменные не
+   * нужны и сломали бы бросок. Блокирует сохранение.
+   *
+   * `@classLevel` попадает в тот же запрет отдельной веткой: классов у существа
+   * нет вовсе, и токен прочитался бы единицей — молча и не тем числом.
    */
   const damageFormulaInvalid = computed(() =>
-    form.damageParts.some((part) =>
-      /@(?:mod\.|prof|level)/i.test(part.formula),
-    ),
+    [
+      ...form.damageParts,
+      ...form.damageAlternatives.flatMap(
+        (alternative) => alternative.damageParts,
+      ),
+    ].some((part) => /@(?:mod\.|prof|(?:class)?level)/i.test(part.formula)),
   );
 
   // ── Инициализация формы ────────────────────────────────────────────────────
@@ -192,10 +272,18 @@
         form.nameEn = action.nameEn ?? '';
         form.description = getActionDescriptionMarkdown(action);
         form.attackBonus = action.attackBonus ?? null;
+        form.autoHit = action.autoHit ?? false;
 
         form.damageParts = (action.damageParts ?? []).map((part) => ({
           ...part,
         }));
+
+        form.damageAlternatives = listCreatureDamageAlternatives(action).map(
+          (alternative) => ({
+            ...alternative,
+            damageParts: alternative.damageParts.map((part) => ({ ...part })),
+          }),
+        );
 
         form.saveType = action.saveType ?? 'none';
         form.saveDC = action.saveDC ?? null;
@@ -218,12 +306,17 @@
         form.activeEffects = action.activeEffects
           ? action.activeEffects.map((effect) => ({ ...effect }))
           : [];
+
+        form.recharge = action.recharge ?? 'none';
+        form.saveSuccessPerDay = action.saveSuccessPerDay ?? null;
       } else {
         form.name = '';
         form.nameEn = '';
         form.description = '';
         form.attackBonus = null;
+        form.autoHit = false;
         form.damageParts = [];
+        form.damageAlternatives = [];
         form.saveType = 'none';
         form.saveDC = null;
         form.saveEffect = 'half';
@@ -240,6 +333,8 @@
         form.distanceUnit = 'ft';
         form.rangeType = 'melee';
         form.activeEffects = [];
+        form.recharge = 'none';
+        form.saveSuccessPerDay = null;
       }
     },
     { immediate: true },
@@ -257,7 +352,13 @@
 
     openModal('ActiveEffectFormModal', {
       effect: existingEffect,
-      hideAura: true,
+      // Место окна задаёт, куда летит НОВЫЙ эффект: у действия — в цель (укус
+      // накладывает Отравление на укушенного), у черты — на само существо
+      // («Магическое сопротивление»). Эффект черты «в цель» сбор черт отсекает,
+      // и он молча не работал бы
+      context: effectFormContext.value,
+      // «Авто» у Сл эффекта подставит Сл самого действия
+      sourceSaveDc: form.saveDC ?? undefined,
       onSave: (savedEffect: ActiveEffect) => {
         if (effectIndex >= 0) {
           form.activeEffects[effectIndex] = savedEffect;
@@ -288,11 +389,54 @@
     }
   }
 
+  /**
+   * Счётчик состава эффекта: «1 флаг», «2 модификатора». Окончание встаёт сразу
+   * за словом, поэтому строку собирает функция, а не шаблон: подстановки подряд
+   * форматтер вправе разорвать переносом, и Vue развёл бы слово с окончанием
+   * пробелом.
+   * @param count - сколько записей этого вида у эффекта
+   * @param word - слово в единственном числе
+   */
+  function formatCountWord(count: number, word: string): string {
+    const ending = count === 1 ? '' : CREATURE_ACTION_FORM_LABELS.countSuffix;
+
+    return `${count} ${word}${ending}`;
+  }
+
   // ── Сохранение ─────────────────────────────────────────────────────────────
+
+  /**
+   * Урон «или» для сохранения: части без формулы отбрасываются, вариант без
+   * частей — целиком, пустая подпись не пишется.
+   */
+  function buildDamageAlternatives(): CreatureDamageAlternative[] {
+    return form.damageAlternatives.flatMap((alternative) => {
+      const damageParts = alternative.damageParts
+        .filter((part) => part.formula.trim().length > 0)
+        .map((part) => ({ ...part }));
+
+      if (damageParts.length === 0) {
+        return [];
+      }
+
+      const label = alternative.label?.trim();
+
+      return [
+        {
+          condition: alternative.condition,
+          ...(label ? { label } : {}),
+          damageParts,
+        },
+      ];
+    });
+  }
 
   /** Собирает CreatureAction из формы (чистый JSON: пустые значения не пишутся) */
   function buildAction(): CreatureAction {
     const result: CreatureAction = {
+      // Правка сохраняет `id` записи, новая запись получает свой: по нему
+      // сервер меняет одно это действие, а не весь список
+      id: props.action?.id ?? createCreatureActionId(),
       name: form.name.trim(),
       description: buildActionDescription(form.description),
     };
@@ -310,8 +454,15 @@
         result.damageParts = cleanedParts;
       }
 
+      const cleanedAlternatives = buildDamageAlternatives();
+
+      if (cleanedAlternatives.length > 0) {
+        result.damageAlternatives = cleanedAlternatives;
+      }
+
       // Спасбросок ЗАМЕНЯЕТ бросок попадания: при наличии спаса бонус атаки
-      // не пишется (как у оружия со спасброском).
+      // не пишется (как у оружия со спасброском). Автопопадание тоже
+      // отменяет бросок — пустой бонус без него значит атаку с +0.
       if (hasSave.value) {
         result.saveType = form.saveType;
 
@@ -320,8 +471,14 @@
         }
 
         result.saveEffect = form.saveEffect;
-      } else if (form.attackBonus !== null) {
+      } else if (!form.autoHit && form.attackBonus !== null) {
         result.attackBonus = form.attackBonus;
+      }
+
+      // Автопопадание — тот же флаг, что у заклинаний: пишется при любом
+      // спасброске и области, а разбор целей читает его одинаково
+      if (form.autoHit) {
+        result.autoHit = true;
       }
 
       if (form.useArea) {
@@ -347,9 +504,12 @@
       result.rangeType = form.rangeType;
       result.distanceUnit = form.distanceUnit;
 
-      if (form.rangeType === 'melee') {
+      // «Рукопашная или дальнобойная» хранит обе дальности сразу
+      if (isReachEnabled.value) {
         result.reach = form.reach;
-      } else if (form.rangeNormal > 0) {
+      }
+
+      if (isRangeEnabled.value && form.rangeNormal > 0) {
         result.range = { normal: form.rangeNormal };
 
         if (form.rangeLong > 0) {
@@ -362,6 +522,21 @@
       result.activeEffects = form.activeEffects.map((effect) => ({
         ...effect,
       }));
+    }
+
+    // Перезарядка есть и у особенности («Легендарное сопротивление»), поэтому
+    // стоит вне боевых полей: те пишутся только у действия.
+    if (form.recharge !== 'none') {
+      result.recharge = form.recharge;
+    }
+
+    // Счётчик «провал в успех» ведёт движок (`saveOverride.ts`) — только у черты
+    if (
+      props.mode === 'trait'
+      && form.saveSuccessPerDay !== null
+      && form.saveSuccessPerDay > 0
+    ) {
+      result.saveSuccessPerDay = form.saveSuccessPerDay;
     }
 
     return result;
@@ -410,15 +585,15 @@
           <template #general>
             <div class="space-y-3">
               <div class="grid grid-cols-2 gap-3">
-                <UFormField label="Название">
+                <UFormField :label="FORM_FIELD_LABELS.name">
                   <UInput
                     v-model="form.name"
-                    placeholder="Название действия или черты"
+                    :placeholder="CREATURE_ACTION_FORM_LABELS.namePlaceholder"
                     class="w-full"
                   />
                 </UFormField>
 
-                <UFormField label="Английское название">
+                <UFormField :label="FORM_FIELD_LABELS.nameEn">
                   <UInput
                     v-model="form.nameEn"
                     placeholder="Multiattack"
@@ -427,10 +602,39 @@
                 </UFormField>
               </div>
 
-              <UFormField label="Описание">
+              <UFormField :label="CREATURE_ACTION_FORM_LABELS.recharge">
+                <USelect
+                  v-model="form.recharge"
+                  :items="rechargeItems"
+                  value-key="value"
+                  label-key="label"
+                  class="w-full"
+                  :portal="false"
+                />
+              </UFormField>
+
+              <UFormField
+                v-if="mode === 'trait'"
+                :label="CREATURE_ACTION_FORM_LABELS.saveSuccessPerDay"
+                :help="CREATURE_ACTION_FORM_LABELS.saveSuccessPerDayHint"
+              >
+                <UInputNumber
+                  v-model="form.saveSuccessPerDay"
+                  :min="0"
+                  :max="MAX_SAVE_OVERRIDE_USES"
+                  :placeholder="
+                    CREATURE_ACTION_FORM_LABELS.saveSuccessPerDayPlaceholder
+                  "
+                  class="w-32"
+                />
+              </UFormField>
+
+              <UFormField :label="FORM_FIELD_LABELS.description">
                 <RichTextEditor
                   v-model="form.description"
-                  placeholder="Описание..."
+                  :placeholder="
+                    CREATURE_ACTION_FORM_LABELS.descriptionPlaceholder
+                  "
                 />
               </UFormField>
             </div>
@@ -440,13 +644,10 @@
           <template #combat>
             <div class="space-y-3">
               <div class="grid grid-cols-2 gap-3">
-                <UFormField label="Тип атаки">
+                <UFormField :label="FORM_FIELD_LABELS.attackType">
                   <USelect
                     v-model="form.rangeType"
-                    :items="[
-                      { label: 'Ближний бой', value: 'melee' },
-                      { label: 'Дальний бой', value: 'ranged' },
-                    ]"
+                    :items="rangeTypeItems"
                     value-key="value"
                     class="w-full"
                     :portal="false"
@@ -454,27 +655,33 @@
                 </UFormField>
 
                 <UFormField
-                  v-if="!hasSave"
-                  label="+ к попаданию"
+                  v-if="isAttackBonusShown"
+                  :label="CREATURE_ACTION_FORM_LABELS.attackBonus"
                 >
                   <UInput
                     v-model="form.attackBonus"
                     type="number"
-                    placeholder="+5"
+                    :placeholder="
+                      CREATURE_ACTION_FORM_LABELS.attackBonusPlaceholder
+                    "
                     class="w-full"
                   />
                 </UFormField>
               </div>
 
+              <UCheckbox
+                v-model="form.autoHit"
+                :label="CREATURE_ACTION_FORM_LABELS.autoHit"
+              />
+
               <!-- Урон (единая со заклинаниями и оружием система частей) -->
               <div class="space-y-2">
                 <span class="text-xs font-semibold tracking-wide text-warning">
-                  Урон / лечение
+                  {{ CREATURE_ACTION_FORM_LABELS.damageTitle }}
                 </span>
 
                 <p class="text-xs text-muted">
-                  Указывайте плоские формулы (модификатор уже вшит, напр. «1к8 +
-                  3»). Тип урона, лечение и условия — токенами в формуле.
+                  {{ CREATURE_ACTION_FORM_LABELS.damageHint }}
                 </p>
 
                 <DamagePartsEditor
@@ -486,16 +693,26 @@
                 />
               </div>
 
+              <!-- Урон «или»: сразу под основным — он его и заменяет -->
+              <CreatureDamageAlternativesEditor
+                v-model="form.damageAlternatives"
+                :base-parts="form.damageParts"
+                :damage-type-options="damageTypeOptions"
+                :has-area="form.useArea"
+              />
+
               <!-- Спасбросок (заменяет бросок попадания) -->
               <div
                 class="space-y-2 rounded-lg border border-muted/60 bg-elevated/20 p-3"
               >
                 <span class="text-xs font-semibold tracking-wide text-error">
-                  Спасбросок
+                  {{ FORM_FIELD_LABELS.savingThrow }}
                 </span>
 
                 <div class="grid grid-cols-3 gap-3">
-                  <UFormField label="Тип">
+                  <UFormField
+                    :label="CREATURE_ACTION_FORM_LABELS.saveTypeShort"
+                  >
                     <USelect
                       v-model="form.saveType"
                       :items="SAVE_TYPE_OPTIONS"
@@ -507,7 +724,7 @@
 
                   <UFormField
                     v-if="hasSave"
-                    label="Сложность (DC)"
+                    :label="FORM_FIELD_LABELS.saveDc"
                   >
                     <UInput
                       v-model.number="form.saveDC"
@@ -520,7 +737,7 @@
 
                   <UFormField
                     v-if="hasSave"
-                    label="При успехе"
+                    :label="FORM_FIELD_LABELS.saveEffect"
                   >
                     <USelect
                       v-model="form.saveEffect"
@@ -539,14 +756,14 @@
               >
                 <UCheckbox
                   v-model="form.useArea"
-                  label="Область действия (шаблон)"
+                  :label="CREATURE_ACTION_FORM_LABELS.areaTitle"
                 />
 
                 <div
                   v-if="form.useArea"
                   class="grid grid-cols-3 gap-3"
                 >
-                  <UFormField label="Форма">
+                  <UFormField :label="AREA_FIELD_LABELS.shape">
                     <USelect
                       v-model="form.areaShape"
                       :items="AREA_SHAPE_OPTIONS"
@@ -565,7 +782,7 @@
                     />
                   </UFormField>
 
-                  <UFormField label="Ед.">
+                  <UFormField :label="FORM_FIELD_LABELS.unitShort">
                     <USelect
                       v-model="form.areaUnit"
                       :items="DISTANCE_UNIT_OPTIONS"
@@ -577,7 +794,7 @@
 
                   <UFormField
                     v-if="showAreaWidth"
-                    label="Ширина"
+                    :label="AREA_FIELD_LABELS.width"
                   >
                     <UInput
                       v-model.number="form.areaWidth"
@@ -589,7 +806,7 @@
 
                   <UFormField
                     v-if="showAreaHeight"
-                    label="Высота"
+                    :label="AREA_FIELD_LABELS.height"
                   >
                     <UInput
                       v-model.number="form.areaHeight"
@@ -602,7 +819,7 @@
                   <div class="col-span-3">
                     <UCheckbox
                       v-model="form.areaResizable"
-                      label="Размер можно менять при размещении"
+                      :label="AREA_FIELD_LABELS.resizable"
                     />
                   </div>
                 </div>
@@ -613,8 +830,10 @@
                 class="rounded-lg border border-muted/60 bg-elevated/20 px-3 pt-1 pb-3"
               >
                 <div class="mb-2 flex items-center justify-between">
-                  <span class="text-xs font-semibold tracking-wide text-gold">
-                    Дистанция
+                  <span
+                    class="text-xs font-semibold tracking-wide text-primary"
+                  >
+                    {{ FORM_FIELD_LABELS.range }}
                   </span>
 
                   <USelect
@@ -629,18 +848,19 @@
 
                 <div class="grid grid-cols-3 gap-3">
                   <!-- Досягаемость -->
-                  <UFormField label="Досягаемость">
+                  <UFormField :label="RANGE_FIELD_LABELS.reach">
                     <UInput
                       v-model.number="form.reach"
                       type="number"
                       :min="5"
                       :step="5"
+                      :disabled="!isReachEnabled"
                       class="w-full"
                     />
                   </UFormField>
 
                   <!-- Нормальная -->
-                  <UFormField label="Нормальная">
+                  <UFormField :label="RANGE_FIELD_LABELS.normal">
                     <UInput
                       v-model.number="form.rangeNormal"
                       type="number"
@@ -651,7 +871,7 @@
                   </UFormField>
 
                   <!-- Максимальная -->
-                  <UFormField label="Максимальная">
+                  <UFormField :label="RANGE_FIELD_LABELS.long">
                     <UInput
                       v-model.number="form.rangeLong"
                       type="number"
@@ -661,6 +881,13 @@
                     />
                   </UFormField>
                 </div>
+
+                <p
+                  v-if="form.rangeType === 'meleeOrRanged'"
+                  class="mt-2 text-xs text-dimmed"
+                >
+                  {{ CREATURE_ACTION_FORM_LABELS.meleeOrRangedHint }}
+                </p>
               </div>
             </div>
           </template>
@@ -672,7 +899,7 @@
                 <span
                   class="text-xs font-semibold tracking-wider text-muted uppercase"
                 >
-                  Активные эффекты
+                  {{ CREATURE_ACTION_FORM_LABELS.effectsTitle }}
                 </span>
 
                 <UButton
@@ -682,7 +909,7 @@
                   icon="tabler:plus"
                   @click.left.exact.prevent="openEffectEditor(-1)"
                 >
-                  Добавить
+                  {{ MODAL_BUTTON_LABELS.add }}
                 </UButton>
               </div>
 
@@ -690,8 +917,7 @@
                 v-if="form.activeEffects.length === 0"
                 class="rounded-lg border border-dashed border-default p-4 text-center text-xs text-dimmed italic"
               >
-                Нет активных эффектов. Эффекты применяются при активации черты
-                или попадании атакой.
+                {{ CREATURE_ACTION_FORM_LABELS.effectsEmpty }}
               </div>
 
               <div
@@ -720,10 +946,17 @@
                       "
                       class="text-xs text-dimmed"
                     >
-                      {{ effect.changes.length }} модификатор{{
-                        effect.changes.length !== 1 ? 'а/ов' : ''
-                      }}, {{ effect.flags.length }} флаг{{
-                        effect.flags.length !== 1 ? 'а/ов' : ''
+                      {{
+                        formatCountWord(
+                          effect.changes.length,
+                          CREATURE_ACTION_FORM_LABELS.changesWord,
+                        )
+                      }},
+                      {{
+                        formatCountWord(
+                          effect.flags.length,
+                          CREATURE_ACTION_FORM_LABELS.flagsWord,
+                        )
                       }}
                     </div>
                   </div>
@@ -731,7 +964,11 @@
                   <USwitch
                     :model-value="!effect.disabled"
                     size="sm"
-                    :title="effect.disabled ? 'Включить' : 'Выключить'"
+                    :title="
+                      effect.disabled
+                        ? CREATURE_ACTION_FORM_LABELS.effectEnable
+                        : CREATURE_ACTION_FORM_LABELS.effectDisable
+                    "
                     @update:model-value="toggleEffect(effectIndex)"
                   />
 
@@ -740,7 +977,7 @@
                     variant="ghost"
                     icon="tabler:edit"
                     size="xs"
-                    title="Редактировать эффект"
+                    :title="CREATURE_ACTION_FORM_LABELS.effectEdit"
                     @click.left.exact.prevent="openEffectEditor(effectIndex)"
                   />
 
@@ -749,7 +986,7 @@
                     variant="ghost"
                     icon="tabler:trash"
                     size="xs"
-                    title="Удалить эффект"
+                    :title="CREATURE_ACTION_FORM_LABELS.effectRemove"
                     @click.left.exact.prevent="removeEffect(effectIndex)"
                   />
                 </div>
@@ -767,7 +1004,7 @@
           color="neutral"
           @click.left.exact.prevent="isOpen = false"
         >
-          Отмена
+          {{ MODAL_BUTTON_LABELS.cancel }}
         </UButton>
 
         <UButton
@@ -775,7 +1012,7 @@
           :disabled="!form.name.trim() || damageFormulaInvalid"
           @click.left.exact.prevent="handleSave"
         >
-          Сохранить
+          {{ MODAL_BUTTON_LABELS.save }}
         </UButton>
       </div>
     </template>

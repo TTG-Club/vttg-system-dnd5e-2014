@@ -1,0 +1,655 @@
+import assert from 'node:assert/strict';
+
+import { describe, it } from 'vitest';
+
+import {
+  authoredScenario,
+  change,
+  createActor,
+  createCreature,
+  createEffect,
+  engine,
+  MAX_ROLL,
+  MIN_ROLL,
+  withHp,
+  withRandom,
+} from './_fixtures.mjs';
+
+/**
+ * Каталог: значения формулой (`docs/EFFECT_SCENARIOS.md`, раздел «Значения»).
+ *
+ * Общее правило у всего раздела одно: формула, которую бросают, бросается ОДИН
+ * раз — в момент наложения, — и дальше эффект живёт числом. Иначе конвейер
+ * катал бы кость заново при каждом пересчёте листа.
+ */
+
+/** Часть урона эффекта */
+function damagePart(formula, type = 'thunder') {
+  return { formula, type };
+}
+
+/**
+ * Заряды первого эффекта сущности.
+ *
+ * @param {object} entity - носитель
+ * @returns {object} заряды
+ */
+function chargesOf(entity) {
+  return entity.activeEffects[0].charges;
+}
+
+describe('каталог: значения формулой', () => {
+  it('[V01] Вибрирующие жидкости: сохранённый бросок один на все тики', () => {
+    const shaken = createEffect('Вибрирующие жидкости', {
+      savedRoll: '2к6',
+      duration: { type: 'rounds', value: 3 },
+      changes: [change('armorClass', '-@roll')],
+      recurringDamage: {
+        damageParts: [damagePart('@roll')],
+        timing: 'startOfTurn',
+      },
+    });
+
+    // 2к6 на максимум — 12
+    const applied = withRandom([MAX_ROLL], () =>
+      engine.withInitializedDuration(shaken),
+    );
+
+    assert.equal(applied.savedRollValue, 12);
+    assert.equal(applied.recurringDamage.damageParts[0].formula, '12');
+
+    assert.equal(
+      applied.changes[0].value,
+      '-12',
+      'то же число во всех формулах эффекта',
+    );
+
+    const again = withRandom([MIN_ROLL], () =>
+      engine.withInitializedDuration(applied),
+    );
+
+    assert.equal(
+      again.savedRollValue,
+      12,
+      'повторная подготовка кость не перебрасывает',
+    );
+
+    assert.equal(again.recurringDamage.damageParts[0].formula, '12');
+  });
+
+  it('[V02] Отрицательный сохранённый бросок не ломает формулу', () => {
+    const drain = createEffect('Иссушение', {
+      savedRoll: '1к4 - 5',
+      changes: [change('hitPoints.max', '@roll')],
+    });
+
+    const applied = withRandom([MIN_ROLL], () =>
+      engine.withInitializedDuration(drain),
+    );
+
+    assert.equal(applied.savedRollValue, -4);
+
+    assert.equal(
+      applied.changes[0].value,
+      '(-4)',
+      'минус в скобках — как у чисел источника',
+    );
+  });
+
+  it('[V03] Числа заклинателя доходят до сохранённого броска', () => {
+    const caster = createActor();
+
+    caster.system.abilities.charisma = 18;
+
+    const context = {
+      ...engine.buildFormulaContext(caster),
+      spellMod: 4,
+    };
+
+    const curse = createEffect('Проклятие', {
+      savedRoll: '1к4 + @mod.spell',
+      changes: [change('save.wisdom', '-@roll')],
+    });
+
+    const bound = engine.bindSourceEffectFormulas(curse, context);
+
+    assert.equal(bound.savedRoll, '1к4 + 4', 'токен источника стал числом');
+
+    const applied = withRandom([MIN_ROLL], () =>
+      engine.withInitializedDuration(bound),
+    );
+
+    assert.equal(applied.savedRollValue, 5);
+    assert.equal(applied.changes[0].value, '-5');
+  });
+
+  it('[V04] Замешательство: срок формулой', () => {
+    const confusion = createEffect('Замешательство', {
+      durationFormula: '1к4',
+      duration: { type: 'rounds' },
+    });
+
+    const applied = withRandom([MAX_ROLL], () =>
+      engine.withInitializedDuration(confusion),
+    );
+
+    assert.equal(applied.duration.value, 4);
+
+    assert.equal(
+      applied.duration.remaining,
+      4,
+      'раунды посчитались из брошенного срока',
+    );
+
+    const again = withRandom([MIN_ROLL], () =>
+      engine.withInitializedDuration(applied),
+    );
+
+    assert.equal(again.duration.value, 4, 'срок не перебрасывается');
+  });
+
+  it('[V05] Срок формулой в минутах переводится в раунды', () => {
+    const blessing = createEffect('Благословение предков', {
+      durationFormula: '1 + 1',
+      duration: { type: 'minutes' },
+    });
+
+    const applied = engine.withInitializedDuration(blessing);
+
+    assert.equal(applied.duration.value, 2);
+    assert.equal(applied.duration.remaining, 20, 'минута — десять раундов');
+  });
+
+  it('[V06] Несчитаемая формула пропускается целиком', () => {
+    const broken = createEffect('Без заклинателя', {
+      savedRoll: '1к4 + @mod.spell',
+      durationFormula: '@mod.spell',
+      duration: { type: 'rounds' },
+      changes: [change('armorClass', '@roll')],
+    });
+
+    const applied = withRandom([MAX_ROLL], () =>
+      engine.withInitializedDuration(broken),
+    );
+
+    assert.equal(
+      applied.savedRollValue,
+      undefined,
+      'бросок с неподставленным токеном не считается наполовину',
+    );
+
+    assert.equal(
+      applied.changes[0].value,
+      '@roll',
+      'формула осталась как была',
+    );
+
+    assert.equal(applied.duration.value, undefined, 'срок тоже не посчитан');
+  });
+
+  it('[V07] Эффект без сохранённого броска не трогают', () => {
+    const plain = createEffect('Щит веры', {
+      duration: { type: 'minutes', value: 10 },
+      changes: [change('armorClass', '2')],
+    });
+
+    const applied = engine.withInitializedDuration(plain);
+
+    assert.equal(applied.savedRollValue, undefined);
+    assert.equal(applied.changes[0].value, '2');
+    assert.equal(applied.duration.remaining, 100);
+  });
+
+  it('[V08] Огненный щит: заряды эффекта', () => {
+    const shield = createEffect('Огненный щит', {
+      charges: { max: 2, current: 2 },
+      triggers: [
+        {
+          id: 'trigger_burn',
+          event: 'damaged',
+          actions: [{ type: 'applyTag', tag: 'burned' }],
+        },
+      ],
+    });
+
+    const hero = withHp(createActor, 30, { activeEffects: [shield] });
+
+    const source = {
+      effect: shield,
+      trigger: shield.triggers[0],
+      ambient: false,
+      instance: true,
+      scope: shield.id,
+    };
+
+    assert.equal(engine.admitTrigger(hero, source), true, 'первый заряд');
+    assert.equal(chargesOf(hero).current, 1);
+
+    assert.equal(engine.admitTrigger(hero, source), true, 'второй заряд');
+    assert.equal(chargesOf(hero).current, 0);
+
+    assert.equal(
+      engine.admitTrigger(hero, source),
+      false,
+      'зарядов не осталось — срабатывание молчит',
+    );
+  });
+
+  it('[V09] Последний заряд снимает эффект', () => {
+    const spark = createEffect('Искра', {
+      charges: { max: 1, current: 1, endsWhenEmpty: true },
+      triggers: [
+        {
+          id: 'trigger_spark',
+          event: 'damaged',
+          actions: [{ type: 'applyTag', tag: 'sparked' }],
+        },
+      ],
+    });
+
+    const hero = withHp(createActor, 30, { activeEffects: [spark] });
+
+    const source = {
+      effect: spark,
+      trigger: spark.triggers[0],
+      ambient: false,
+      instance: true,
+      scope: spark.id,
+    };
+
+    assert.equal(engine.admitTrigger(hero, source), true);
+
+    assert.deepEqual(
+      hero.activeEffects,
+      [],
+      'эффект снят тем же заходом, а срабатывание доигрывает',
+    );
+  });
+
+  it('[V10] У ауры и зоны зарядов нет: списывать некуда', () => {
+    const aura = createEffect('Аура пламени', {
+      charges: { max: 1, current: 0 },
+      triggers: [
+        {
+          id: 'trigger_aura',
+          event: 'damaged',
+          actions: [{ type: 'applyTag', tag: 'scorched' }],
+        },
+      ],
+    });
+
+    const hero = withHp(createActor, 30, {});
+
+    assert.equal(
+      engine.admitTrigger(hero, {
+        effect: aura,
+        trigger: aura.triggers[0],
+        ambient: true,
+        instance: false,
+        scope: aura.id,
+      }),
+      true,
+      'пустые заряды чужой ауры срабатывание не держат',
+    );
+  });
+
+  it('[V11] Нарастающая порча: изменение растёт каждый ход, до предела', () => {
+    const rot = createEffect('Нарастающая порча', {
+      changes: [
+        change('abilityCheck', '-1', {
+          step: { by: -1, per: 'turn', until: -5 },
+        }),
+      ],
+    });
+
+    const hero = withHp(createActor, 30, { activeEffects: [rot] });
+
+    const modifierAfterTurns = (turns) => {
+      for (let turn = 0; turn < turns; turn += 1) {
+        engine.processTurnEffects(hero, 'startOfTurn');
+      }
+
+      return hero.activeEffects[0].changes[0].value;
+    };
+
+    assert.equal(modifierAfterTurns(1), '-2', 'первый ход');
+    assert.equal(modifierAfterTurns(2), '-4', 'ещё два хода');
+
+    assert.equal(
+      modifierAfterTurns(5),
+      '-5',
+      'дальше предела не уходит, сколько бы ходов ни прошло',
+    );
+  });
+
+  it('[V12] Шаг раунда двигается тиком длительностей, а не ходом', () => {
+    const swell = createEffect('Нарастающий гул', {
+      changes: [change('armorClass', '1', { step: { by: 1, per: 'round' } })],
+    });
+
+    const hero = withHp(createActor, 30, { activeEffects: [swell] });
+
+    engine.processTurnEffects(hero, 'startOfTurn');
+
+    assert.equal(
+      hero.activeEffects[0].changes[0].value,
+      '1',
+      'ход шаг раунда не двигает',
+    );
+
+    engine.decrementActorEffectDurations(hero);
+
+    assert.equal(hero.activeEffects[0].changes[0].value, '2');
+  });
+
+  it('[V13] Шаг не трогает формулу и выключенный эффект', () => {
+    const dice = createEffect('Растущая кость', {
+      changes: [change('damage.all', '1к6', { step: { by: 1, per: 'turn' } })],
+    });
+
+    const off = createEffect('Выключенный', {
+      disabled: true,
+      changes: [change('armorClass', '1', { step: { by: 1, per: 'turn' } })],
+    });
+
+    const hero = withHp(createActor, 30, { activeEffects: [dice, off] });
+
+    engine.processTurnEffects(hero, 'startOfTurn');
+
+    assert.equal(
+      hero.activeEffects[0].changes[0].value,
+      '1к6',
+      'у формулы двигать нечего',
+    );
+
+    assert.equal(
+      hero.activeEffects[1].changes[0].value,
+      '1',
+      'выключенный эффект в тишине не досчитывается',
+    );
+  });
+
+  it('[V19] Числа источника в эффекте на цель: урон и лечение — его, модификаторы — цели', () => {
+    const caster = createActor();
+
+    caster.system.abilities.wisdom = 16;
+    caster.system.abilities.dexterity = 8;
+
+    const context = engine.buildFormulaContext(caster);
+
+    const armor = createEffect('Доспехи мага', {
+      effectTarget: 'target',
+      changes: [change('armorClass', '13 + @mod.dex', { mode: 'override' })],
+    });
+
+    const potion = createEffect('Лечение', {
+      effectTarget: 'target',
+      triggers: [
+        {
+          id: 'heal',
+          event: 'applied',
+          actions: [
+            {
+              type: 'damage',
+              parts: [damagePart('1к8@heal + @mod.wis', undefined)],
+            },
+          ],
+        },
+      ],
+    });
+
+    const [boundArmor, boundPotion] = engine.bindTargetEffectsToSource(
+      [armor, potion],
+      caster,
+      context,
+    );
+
+    assert.equal(
+      boundArmor.changes[0].value,
+      '13 + @mod.dex',
+      'Ловкость доспеха — того, на ком он лежит',
+    );
+
+    assert.equal(
+      boundPotion.triggers[0].actions[0].parts[0].formula,
+      '1к8@heal + 3',
+      'сервер пропустил бы лечение с неподставленным токеном',
+    );
+  });
+
+  it('[V20] Число и грань костей выражением: ступени уровня в формуле', () => {
+    const ladder = [2, 6, 7, 12, 13, 17, 18, 20].map((level) =>
+      engine.evaluateFormula(`1 + steps(${level}, 7, 13, 18)`, {
+        ...engine.buildFormulaContext(createActor()),
+      }),
+    );
+
+    assert.deepEqual(ladder, [1, 1, 2, 2, 3, 3, 4, 4]);
+
+    assert.equal(
+      engine.resolveDiceCountExpressions('(1 + steps(13, 7, 13, 18))к8 + 2'),
+      '3к8 + 2',
+    );
+
+    assert.equal(
+      engine.resolveDiceCountExpressions('(2 + 1) d6'),
+      '3d6',
+      'пробел перед костью не мешает',
+    );
+
+    assert.equal(
+      engine.resolveDiceCountExpressions('(@classLevel)к8'),
+      '(@classLevel)к8',
+      'неподставленный токен не трогается — бросок пропустит часть, как раньше',
+    );
+
+    // Грань кости — тем же выражением: «Дубинка» растит размер кости
+    const shillelaghDice = (level) =>
+      engine.resolveDiceCountExpressions(
+        `(1 + steps(${level}, 17))к(8 + 2 * steps(${level}, 5, 11) - 6 * steps(${level}, 17))`,
+      );
+
+    assert.deepEqual([1, 5, 11, 17].map(shillelaghDice), [
+      '1к8',
+      '1к10',
+      '1к12',
+      '2к6',
+    ]);
+
+    assert.equal(
+      engine.resolveDiceCountExpressions('1 d (4 + 2) + 1к(@level)'),
+      '1 d6 + 1к(@level)',
+      'пробелы вокруг скобки грани не мешают, неподставленный токен не трогается',
+    );
+
+    const hero = withHp(createActor, 30);
+
+    const rolled = withRandom([MAX_ROLL], () =>
+      engine.rollEffectDamageParts(
+        [damagePart('(1 + 1)к6')],
+        engine.resolveActorStats(hero),
+        hero,
+      ),
+    );
+
+    assert.equal(rolled.total, 12, 'сервер бросает две к6');
+  });
+
+  // Пробелы: этим значениям нужны либо сцена вокруг носителя в момент расчёта,
+  // либо событие «удар прошёл» — их этап впереди
+  it('[V21] Кровавый пир: числа владельца в срабатывании своего постоянного умения', () => {
+    // «Когда вы попадаете броском атаки… восстановите хиты, равные броску кости
+    // + ваш модификатор Телосложения». Умение постоянное: его никто не
+    // накладывал, и числа владельца подставляются, когда событие собирает
+    // срабатывания носителя
+    const feast = createEffect('Кровавый пир', {
+      triggers: [
+        {
+          id: 'trigger_feast',
+          event: 'attackRoll',
+          role: 'attacker',
+          condition: 'attack.landed === true',
+          actions: [
+            { type: 'damage', parts: [{ formula: '1к10@heal + @mod.con' }] },
+          ],
+        },
+        {
+          id: 'trigger_mark',
+          event: 'attackRoll',
+          role: 'attacker',
+          recipient: 'other',
+          condition: 'attack.landed === true',
+          actions: [
+            {
+              type: 'damage',
+              parts: [{ formula: '@prof', type: 'necrotic' }],
+            },
+          ],
+        },
+      ],
+    });
+
+    authoredScenario(feast, 'ownEffects');
+
+    const system = structuredClone(engine.DEFAULT_ACTOR.system);
+
+    const hero = withHp(
+      createActor,
+      10,
+      {
+        system: {
+          ...system,
+          abilities: { ...system.abilities, constitution: 16 },
+          classes: [{ classKey: 'barbarian', level: 5, hitDie: 12 }],
+        },
+        activeEffects: [feast],
+      },
+      50,
+    );
+
+    const foe = withHp(createCreature, 40);
+
+    const result = withRandom([MAX_ROLL], () =>
+      engine.settleAttackRollTriggers(hero, 'attacker', {
+        other: foe,
+        roll: {},
+        landed: true,
+        inCombat: true,
+      }),
+    );
+
+    assert.equal(
+      engine.resolveEntityCurrentHp(hero),
+      10 + 13,
+      '1к10 на максимум и +3 Телосложения',
+    );
+
+    assert.equal(
+      engine.resolveEntityCurrentHp(foe),
+      40 - 3,
+      'мастерство 5-го уровня',
+    );
+
+    assert.deepEqual(result.notes, [], 'всё посчитано — сообщать не о чем');
+
+    // Запись листа остаётся формулой: числа подставлены в копию
+    assert.equal(
+      hero.activeEffects[0].triggers[0].actions[0].parts[0].formula,
+      '1к10@heal + @mod.con',
+    );
+  });
+
+  it('[V22] Слагаемое, которое не посчиталось, видно в сводке', () => {
+    // Круг ячейки ставит только каст: у постоянного эффекта его нет, и бросок
+    // такую часть пропускает — но не молча
+    const broken = createEffect('Кровавый пир', {
+      triggers: [
+        {
+          id: 'trigger_feast',
+          event: 'attackRoll',
+          role: 'attacker',
+          condition: 'attack.landed === true',
+          actions: [
+            { type: 'damage', parts: [{ formula: '6@heal + @castLevel' }] },
+          ],
+        },
+      ],
+    });
+
+    const hero = withHp(createActor, 10, { activeEffects: [broken] }, 50);
+
+    const result = engine.settleAttackRollTriggers(hero, 'attacker', {
+      other: withHp(createCreature, 40),
+      roll: {},
+      landed: true,
+      inCombat: true,
+    });
+
+    assert.equal(engine.resolveEntityCurrentHp(hero), 10);
+    assert.equal(result.notes.length, 1);
+
+    assert.match(
+      result.notes[0],
+      /^Кровавый пир: не посчитано автоматически — .*@castLevel/,
+    );
+  });
+
+  it.todo('[V14] Лимит, общий на весь каст');
+  it.todo('[V15] Токен «сколько существ в радиусе»');
+  it.todo('[V16] Токен «нанесённый урон»');
+
+  it('[V17] Кости хитов как стоимость каста', () => {
+    // Цена каста живёт в эффекте заклинания (`pay`), бросок потраченных костей
+    // — токеном `@paid.hitDiceRoll` в уроне самого заклинания
+    const consumption = {
+      name: 'Истощение',
+      damageParts: [{ formula: '@paid.hitDiceRoll', type: 'necrotic' }],
+      activeEffects: [
+        createEffect('Истощение', {
+          effectTarget: 'target',
+          pay: [{ kind: 'hitDice' }],
+          duration: { type: 'hours', value: 1 },
+          recurringSave: {
+            ability: 'constitution',
+            dc: engine.SOURCE_SAVE_DC,
+            timing: 'endOfTurn',
+          },
+          triggers: [
+            {
+              id: 'trigger_drain',
+              event: 'turnEnd',
+              actions: [
+                {
+                  type: 'damage',
+                  parts: [{ formula: '@paid.hitDiceRoll', type: 'necrotic' }],
+                },
+              ],
+            },
+          ],
+        }),
+      ],
+    };
+
+    const paid = engine.bindSourcePaid(consumption, {
+      hitDice: 1,
+      hitDie: 8,
+      hitDiceRoll: 5,
+    });
+
+    assert.equal(paid.damageParts[0].formula, '5');
+
+    assert.equal(
+      paid.activeEffects[0].triggers[0].actions[0].parts[0].formula,
+      '5',
+      'тот же бросок бьёт на каждом ходу — кость заново не катается',
+    );
+
+    assert.deepEqual(paid.activeEffects[0].paid, {
+      hitDice: 1,
+      hitDie: 8,
+      hitDiceRoll: 5,
+    });
+  });
+
+  it.todo('[V18] Апкаст меняет срок и концентрацию');
+});

@@ -16,7 +16,11 @@
  * @module system/dnd/itemSchemas
  */
 
+import type { DnDGameItem } from './dndEntities.js';
+
 import { z } from 'zod';
+
+import { isRecord } from '@vtt/shared';
 
 /** Известные типы предметов D&D 5e (дискриминатор объединения). */
 const ITEM_TYPES = [
@@ -28,6 +32,9 @@ const ITEM_TYPES = [
   'species',
   'class',
   'spell',
+  // Состояние («Отравленный», своё состояние стола): не предмет склада, но
+  // хранится записью мира — у неё уже есть права, рассылка и копирование
+  'condition',
 ] as const;
 
 /**
@@ -81,6 +88,7 @@ export const GameItemSchema = z.discriminatedUnion('type', [
   GameItemEnvelopeSchema.extend({ type: z.literal('species') }).passthrough(),
   GameItemEnvelopeSchema.extend({ type: z.literal('class') }).passthrough(),
   GameItemEnvelopeSchema.extend({ type: z.literal('spell') }).passthrough(),
+  GameItemEnvelopeSchema.extend({ type: z.literal('condition') }).passthrough(),
 ]);
 
 /** Список известных типов предметов (для потребителей вне схемы). */
@@ -123,4 +131,32 @@ export function validateGameItem(item: unknown): void {
 
     throw new Error(`Некорректные данные предмета: ${issues}`);
   }
+}
+
+/**
+ * Проверяет, что значение — запись предмета D&D 5e, пригодная для показа.
+ *
+ * Проверка НАМЕРЕННО легче конверта персистентности ({@link validateGameItem}):
+ * тот сторожит запись, которую сохраняют в мир, и требует полей склада
+ * (`quantity`, `equipped`, `isReadOnly`). У записи компендиума их нет, а
+ * показывать её надо — поэтому здесь проверяется только то, по чему окно
+ * находит запись и выбирает себя: идентификатор, название и тип.
+ *
+ * Не бросает, в отличие от `validateGameItem`: испорченную запись достаточно
+ * не показать, а не уронить на ней лист.
+ *
+ * @param value - произвольные данные записи
+ * @returns `true`, если значение — запись предмета известного D&D-типа
+ */
+export function isDnDGameItem(value: unknown): value is DnDGameItem {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    typeof value.id === 'string'
+    && typeof value.name === 'string'
+    && typeof value.type === 'string'
+    && KNOWN_ITEM_TYPES.includes(value.type)
+  );
 }

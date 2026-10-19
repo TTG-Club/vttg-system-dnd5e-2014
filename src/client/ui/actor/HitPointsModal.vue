@@ -1,18 +1,28 @@
 <script setup lang="ts">
   import type {
     ActorClassEntry,
-    HitDie,
     ManualHitDieGroup,
+    MaxHitPointsSource,
   } from '@vtt/shared/system/dnd.js';
 
-  import { getHitDiceGroups } from '@vtt/shared/system/dnd.js';
   import { computed, reactive, ref, watch } from 'vue';
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
+  import {
+    getHitDiceGroups,
+    isHitDie,
+    MAX_HIT_POINTS_SOURCE_KIND,
+  } from '@vtt/shared/system/dnd.js';
 
-  /** Доступные размеры костей хитов */
-  const HIT_DIE_OPTIONS: HitDie[] = [6, 8, 10, 12];
+  import {
+    ACTOR_LEFT_PANEL_LABELS,
+    HIT_DIE_LETTER,
+    HIT_DIE_SELECT_OPTIONS,
+    HIT_POINTS_LABELS,
+    MODAL_BUTTON_LABELS,
+  } from './constants';
+  import { formatSignedNumber } from './utils/formatSignedNumber';
 
   interface HitPointsData {
     current: number;
@@ -25,13 +35,38 @@
   interface Props {
     open: boolean;
     currentHitPoints: number;
+    /**
+     * ЗАПИСЬ ЛИСТА, а не итог плитки: этим числом окно максимум не только
+     * показывает, но и ПРАВИТ. Передать сюда итог с эффектами — и «Применить»
+     * запишет его в запас листа, а эффект прибавит своё поверх ещё раз: у
+     * чародея с «Драконьей устойчивостью» максимум так рос на уровень с каждого
+     * лечения. Прибавка эффектов приходит отдельным числом —
+     * {@link resolvedMaxHitPoints}.
+     */
     maxHitPoints: number;
     tempHitPoints: number;
     classes?: ActorClassEntry[];
     manualHitDice?: ManualHitDieGroup[];
+    /**
+     * Итоговый максимум листа — то же число, что стоит в плитке хитов (запас
+     * листа с прибавкой эффектов). Окно его только показывает. Нет — окно
+     * считает, что эффекты максимум не трогают.
+     */
+    resolvedMaxHitPoints?: number;
+    /**
+     * Из чего сложилась прибавка к максимуму: по этому списку окно называет
+     * каждый источник и его число
+     */
+    maxHitPointsSources?: readonly MaxHitPointsSource[];
   }
 
-  const props = defineProps<Props>();
+  const props = withDefaults(defineProps<Props>(), {
+    classes: () => [],
+    manualHitDice: () => [],
+    maxHitPointsSources: () => [],
+    // Итога может не быть: лист его считает не всегда, и тогда сверять не с чем
+    resolvedMaxHitPoints: undefined,
+  });
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
@@ -74,8 +109,79 @@
     },
   );
 
+  /**
+   * Прибавка эффектов к максимуму — разница итога плитки и записи листа.
+   *
+   * Именно разницей, а не своим проходом по эффектам: окно не повторяет расчёт
+   * пайплайна (условия, режимы «заменить» и «повысить до») и потому не может
+   * разойтись с плиткой.
+   */
+  const effectsMaxBonus = computed(() =>
+    props.resolvedMaxHitPoints === undefined
+      ? 0
+      : props.resolvedMaxHitPoints - props.maxHitPoints,
+  );
+
+  /** Итог листа показывается, только когда эффекты и правда двигают максимум */
+  const hasSheetTotal = computed(() => effectsMaxBonus.value !== 0);
+
+  /**
+   * Итог листа для ПРАВЯЩЕГОСЯ числа: прибавка эффектов ложится на то, что
+   * набрано в поле, — иначе подпись отставала бы от ввода на одну правку.
+   */
+  const sheetMaxTotal = computed(() => editHp.max + effectsMaxBonus.value);
+
+  /** Подпись поля максимума: с эффектами в нём не итог, а запас листа */
+  const maxFieldLabel = computed(() =>
+    hasSheetTotal.value
+      ? HIT_POINTS_LABELS.totalWithoutEffects
+      : HIT_POINTS_LABELS.total,
+  );
+
+  /**
+   * Текущие хиты в границах итогового максимума (с эффектами) — рукой их выше
+   * не поднять, как и лечением: сверх максимума бывают только временные хиты,
+   * у них своё поле.
+   */
+  const boundedCurrentHitPoints = computed(() =>
+    Math.min(Math.max(0, editHp.current), Math.max(0, sheetMaxTotal.value)),
+  );
+
+  /**
+   * Правка текущих хитов. Срез до максимума — при уходе из поля и при
+   * «Применить», а не на каждой цифре: набирая «87», человек проходит через
+   * «8», и срез на лету не давал бы набрать число больше одной цифры.
+   */
+  function handleCurrentInput(value: unknown): void {
+    editHp.current = Number(value);
+  }
+
+  /** Уход из поля текущих хитов: набранное сверх максимума срезается */
+  function handleCurrentBlur(): void {
+    editHp.current = boundedCurrentHitPoints.value;
+  }
+
+  /**
+   * Разбор итога строками: кто и на сколько двигает максимум хитов. Виден сразу,
+   * а не в подсказке по наведению — её не находили и спрашивали, откуда число.
+   */
+  const sheetTotalSources = computed(() =>
+    props.maxHitPointsSources.map((source) => ({
+      label:
+        source.kind === MAX_HIT_POINTS_SOURCE_KIND.effect
+          ? source.name
+          : HIT_POINTS_LABELS.constitutionSource,
+      value: formatSignedNumber(source.delta),
+    })),
+  );
+
   // Группируем только классовые кости — ручные показываются отдельным блоком
   const hitDiceGroups = computed(() => getHitDiceGroups(editClasses.value));
+
+  /** Запись кости хитов группы: «к8» */
+  function formatHitDie(die: number): string {
+    return `${HIT_DIE_LETTER}${die}`;
+  }
 
   function adjustHitDieUsed(die: number, delta: number) {
     let remainingDelta = Math.abs(delta);
@@ -117,6 +223,24 @@
     }
   }
 
+  /**
+   * Меняет кость хитов группы: селектор отдаёт значение свободной формы,
+   * поэтому число сверяется со списком костей системы.
+   *
+   * @param group - группа ручных костей хитов
+   * @param value - значение из селектора
+   */
+  function handleGroupDieChange(
+    group: ManualHitDieGroup,
+    value: unknown,
+  ): void {
+    const die = Number(value);
+
+    if (isHitDie(die)) {
+      group.die = die;
+    }
+  }
+
   /** Добавляет новую группу ручных костей хитов */
   function addManualHitDieGroup() {
     editManualHitDice.value.push({ die: 8, total: 1, used: 0 });
@@ -129,8 +253,9 @@
 
   /** Применяет изменения очков здоровья и костей хитов */
   function applyHitPoints() {
+    // Максимум могли опустить уже после текущих хитов — срез и здесь
     emit('apply', {
-      current: editHp.current,
+      current: boundedCurrentHitPoints.value,
       max: editHp.max,
       temp: editHp.temp,
       classes: editClasses.value,
@@ -149,7 +274,7 @@
     :blocking="true"
     :min-width="380"
     :min-height="250"
-    title="Очки здоровья и кости хитов"
+    :title="HIT_POINTS_LABELS.title"
     :z-index="Z_INDEX.MODAL_ELEVATED"
   >
     <template #body>
@@ -159,15 +284,18 @@
           <div class="flex flex-1 flex-col gap-1">
             <span
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
-              >Сейчас</span
             >
+              {{ HIT_POINTS_LABELS.current }}
+            </span>
 
             <UInput
               :model-value="editHp.current"
               type="number"
               :min="0"
+              :max="sheetMaxTotal"
               size="lg"
-              @update:model-value="editHp.current = Number($event)"
+              @update:model-value="handleCurrentInput"
+              @blur="handleCurrentBlur"
             />
           </div>
 
@@ -176,8 +304,9 @@
           <div class="flex flex-1 flex-col gap-1">
             <span
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
-              >Всего</span
             >
+              {{ maxFieldLabel }}
+            </span>
 
             <UInput
               :model-value="editHp.max"
@@ -191,8 +320,9 @@
           <div class="flex flex-1 flex-col gap-1">
             <span
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
-              >Врем.</span
             >
+              {{ HIT_POINTS_LABELS.temporary }}
+            </span>
 
             <UInput
               :model-value="editHp.temp"
@@ -202,6 +332,32 @@
               @update:model-value="editHp.temp = Math.max(0, Number($event))"
             />
           </div>
+        </div>
+
+        <!-- Итог листа: появляется, когда максимум двигают эффекты -->
+        <div
+          v-if="hasSheetTotal"
+          class="flex flex-col gap-1 rounded bg-elevated/40 p-2 text-xs"
+        >
+          <UTooltip :text="HIT_POINTS_LABELS.sheetTotalHint">
+            <p class="flex justify-between font-medium text-toned">
+              <span>{{ HIT_POINTS_LABELS.sheetTotal }}</span>
+
+              <span class="font-bold text-highlighted">{{
+                sheetMaxTotal
+              }}</span>
+            </p>
+          </UTooltip>
+
+          <p
+            v-for="(source, sourceIndex) in sheetTotalSources"
+            :key="sourceIndex"
+            class="flex justify-between gap-2 text-muted"
+          >
+            <span class="min-w-0 truncate">{{ source.label }}</span>
+
+            <span class="shrink-0">{{ source.value }}</span>
+          </p>
         </div>
 
         <div class="border-t border-muted" />
@@ -214,7 +370,7 @@
           <span
             class="text-[10px] font-bold tracking-wider text-muted uppercase"
           >
-            Кости хитов (из классов)
+            {{ HIT_POINTS_LABELS.classHitDice }}
           </span>
 
           <div
@@ -228,12 +384,14 @@
                 class="h-4 w-4 text-healing"
               />
 
-              <span class="font-bold text-highlighted">к{{ group.die }}</span>
+              <span class="font-bold text-highlighted">{{
+                formatHitDie(group.die)
+              }}</span>
             </div>
 
             <div class="flex items-center gap-3">
               <span class="text-sm">
-                Доступно:
+                {{ HIT_POINTS_LABELS.availablePrefix }}
                 <span class="font-bold text-highlighted">{{
                   group.available
                 }}</span>
@@ -247,8 +405,8 @@
                   color="neutral"
                   variant="soft"
                   icon="tabler:minus"
-                  :disabled="group.used === 0"
-                  @click.left.exact.prevent="adjustHitDieUsed(group.die, -1)"
+                  :disabled="group.available === 0"
+                  @click.left.exact.prevent="adjustHitDieUsed(group.die, 1)"
                 />
 
                 <UButton
@@ -256,8 +414,8 @@
                   color="neutral"
                   variant="soft"
                   icon="tabler:plus"
-                  :disabled="group.available === 0"
-                  @click.left.exact.prevent="adjustHitDieUsed(group.die, 1)"
+                  :disabled="group.used === 0"
+                  @click.left.exact.prevent="adjustHitDieUsed(group.die, -1)"
                 />
               </div>
             </div>
@@ -276,7 +434,9 @@
               class="text-[10px] font-bold tracking-wider text-muted uppercase"
             >
               {{
-                hasClassHitDice ? 'Дополнительные кости хитов' : 'Кости хитов'
+                hasClassHitDice
+                  ? HIT_POINTS_LABELS.extraHitDice
+                  : ACTOR_LEFT_PANEL_LABELS.hitDice
               }}
             </span>
 
@@ -287,7 +447,7 @@
               icon="tabler:plus"
               @click.left.exact.prevent="addManualHitDieGroup"
             >
-              Добавить
+              {{ MODAL_BUTTON_LABELS.add }}
             </UButton>
           </div>
 
@@ -295,7 +455,7 @@
             v-if="editManualHitDice.length === 0 && !hasClassHitDice"
             class="text-sm text-dimmed"
           >
-            Нет доступных костей хитов.
+            {{ HIT_POINTS_LABELS.hitDiceEmpty }}
           </div>
 
           <div
@@ -308,7 +468,7 @@
               <span
                 class="text-[9px] font-medium tracking-wider text-dimmed uppercase"
               >
-                Сейчас
+                {{ HIT_POINTS_LABELS.current }}
               </span>
 
               <UInput
@@ -333,7 +493,7 @@
               <span
                 class="text-[9px] font-medium tracking-wider text-dimmed uppercase"
               >
-                Всего
+                {{ HIT_POINTS_LABELS.total }}
               </span>
 
               <UInput
@@ -354,19 +514,14 @@
               <span
                 class="text-[9px] font-medium tracking-wider text-dimmed uppercase"
               >
-                Кость
+                {{ HIT_POINTS_LABELS.die }}
               </span>
 
               <USelect
                 :model-value="group.die"
-                :items="
-                  HIT_DIE_OPTIONS.map((hitDie) => ({
-                    label: `к${hitDie}`,
-                    value: hitDie,
-                  }))
-                "
+                :items="HIT_DIE_SELECT_OPTIONS"
                 size="sm"
-                @update:model-value="group.die = Number($event) as HitDie"
+                @update:model-value="handleGroupDieChange(group, $event)"
               />
             </div>
 
@@ -392,7 +547,7 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -400,7 +555,7 @@
             size="sm"
             @click.left.exact.prevent="applyHitPoints"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

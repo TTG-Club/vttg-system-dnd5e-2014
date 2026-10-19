@@ -1,20 +1,28 @@
 <script setup lang="ts">
-  import type { ActiveEffect, GameItem } from '@vtt/shared/system/dnd.js';
+  import type { ActiveEffect, DnDGameItem } from '@vtt/shared/system/dnd.js';
 
-  import {
-    ABILITY_OPTIONS,
-    CURRENCY_OPTIONS,
-    RARITY_OPTIONS,
-  } from '@vtt/shared/system/dnd.js';
   import { computed, ref } from 'vue';
 
   import RichTextEditor from '@/shared_ui/components/RichTextEditor.vue';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { useModalManager } from '@/shared_ui/composables/useModalManager';
+  import { ABILITY_OPTIONS } from '@vtt/shared/system/dnd.js';
 
   import { useToolForm } from '../../composables/useToolForm';
+  import ActiveEffectFormModal from '../effect/ActiveEffectFormModal.vue';
+  import {
+    FORM_FIELD_LABELS,
+    FORM_TAB_LABELS,
+    ITEM_FORM_LABELS,
+    ITEM_USES_LABELS,
+    MODAL_BUTTON_LABELS,
+    TOOL_FORM_LABELS,
+    WINDOW_TAB_CONTENT_CLASS,
+  } from './constants';
   import FormSection from './FormSection.vue';
-  import ActiveEffectFormModal from './tabs/ActiveEffectFormModal.vue';
+  import ItemCostWeightFields from './ItemCostWeightFields.vue';
+  import ItemUsesFields from './ItemUsesFields.vue';
+  import SourceField from './SourceField.vue';
 
   const props = defineProps<{
     /** Открыто ли модальное окно */
@@ -25,7 +33,7 @@
     savedPosition?: unknown;
     savedSize?: unknown;
     /** Редактируемый инструмент (null = создание) */
-    item: GameItem | null;
+    item: DnDGameItem | null;
     /** Z-index (управляется родителем для bring-to-front) */
     zIndex?: number;
     /** Смещение позиции для каскадного расположения */
@@ -34,7 +42,7 @@
 
   const emit = defineEmits<{
     'close': [];
-    'save': [item: GameItem];
+    'save': [item: DnDGameItem];
     'bring-to-front': [];
   }>();
 
@@ -62,6 +70,7 @@
     costValue,
     costCurrency,
     sourceKey,
+    source,
     isSRD,
     isMagical,
     magicAttunement,
@@ -70,11 +79,11 @@
     activeEffects,
     toolCategoryOptions,
     toolBaseTypeOptions,
-    sourceOptions,
     selectedToolProperties,
     toolPropertyOptions,
     toggleToolProperty,
     buildTool,
+    itemUses,
   } = useToolForm(
     () => props.item,
     () => props.open,
@@ -83,15 +92,15 @@
   /** Вкладки формы */
   const tabItems = [
     {
-      label: 'Общие',
+      label: FORM_TAB_LABELS.general,
       slot: 'general' as const,
     },
     {
-      label: 'Подробнее',
+      label: FORM_TAB_LABELS.details,
       slot: 'details' as const,
     },
     {
-      label: 'Эффекты',
+      label: FORM_TAB_LABELS.effects,
       slot: 'effects' as const,
     },
   ];
@@ -144,17 +153,23 @@
 
   /** Опции настройки магического предмета */
   const attunementOptions = [
-    { label: 'Не требуется', value: 'none' as const },
-    { label: 'Требуется', value: 'required' as const },
-    { label: 'Опциональная', value: 'optional' as const },
+    { label: ITEM_FORM_LABELS.attunementNone, value: 'none' as const },
+    { label: ITEM_FORM_LABELS.attunementRequired, value: 'required' as const },
+    { label: ITEM_FORM_LABELS.attunementOptional, value: 'optional' as const },
   ];
 
   const proficiencyModeOptions = [
-    { label: 'Автоматически', value: 'auto' as const },
-    { label: 'Без умения', value: 'none' as const },
-    { label: 'Наполовину', value: 'half' as const },
-    { label: 'Умелый', value: 'proficient' as const },
-    { label: 'Экспертность', value: 'expertise' as const },
+    { label: TOOL_FORM_LABELS.proficiencyAuto, value: 'auto' as const },
+    { label: TOOL_FORM_LABELS.proficiencyNone, value: 'none' as const },
+    { label: TOOL_FORM_LABELS.proficiencyHalf, value: 'half' as const },
+    {
+      label: TOOL_FORM_LABELS.proficiencyProficient,
+      value: 'proficient' as const,
+    },
+    {
+      label: TOOL_FORM_LABELS.proficiencyExpertise,
+      value: 'expertise' as const,
+    },
   ];
 
   /** Сохраняет форму */
@@ -167,9 +182,8 @@
 <template>
   <UDraggableModal
     :open="open"
-    :title="item ? 'Редактировать инструмент' : 'Создать инструмент'"
+    :title="item ? TOOL_FORM_LABELS.editTitle : TOOL_FORM_LABELS.createTitle"
     :initial-width="500"
-    :resizable="false"
     :z-index="zIndex"
     :saved-position="initialPosition"
     @update:open="
@@ -190,7 +204,7 @@
         :ui="{
           list: 'mb-3',
           trigger: 'flex-1 justify-center',
-          content: 'overflow-y-auto max-h-[600px]',
+          content: WINDOW_TAB_CONTENT_CLASS,
         }"
       >
         <!-- Вкладка «Общие» -->
@@ -198,97 +212,57 @@
           <div class="flex flex-col gap-4">
             <!-- Название -->
             <div class="grid grid-cols-2 gap-3">
-              <UFormField label="Название">
+              <UFormField :label="FORM_FIELD_LABELS.name">
                 <UInput
                   v-model="name"
-                  placeholder="Воровские инструменты"
+                  :placeholder="TOOL_FORM_LABELS.namePlaceholder"
                   class="w-full"
                 />
               </UFormField>
 
-              <UFormField label="Название (English)">
+              <UFormField :label="FORM_FIELD_LABELS.nameEn">
                 <UInput
                   v-model="nameEn"
-                  placeholder="Thieves' Tools"
+                  :placeholder="TOOL_FORM_LABELS.nameEnPlaceholder"
                   class="w-full"
                 />
               </UFormField>
             </div>
 
             <!-- Описание -->
-            <UFormField label="Описание">
+            <UFormField :label="FORM_FIELD_LABELS.description">
               <RichTextEditor
                 v-model="description"
-                placeholder="Описание инструмента..."
+                :placeholder="TOOL_FORM_LABELS.descriptionPlaceholder"
               />
             </UFormField>
 
             <!-- Стоимость + Вес -->
             <FormSection
-              title="Ценность и вес"
-              title-color="healing"
+              :title="ITEM_FORM_LABELS.costWeightTitle"
+              icon="tabler:coins"
             >
-              <div class="grid grid-cols-3 gap-3">
-                <UFormField label="Стоимость">
-                  <div class="flex gap-1.5">
-                    <UInput
-                      v-model.number="costValue"
-                      type="number"
-                      :min="0"
-                      placeholder="0"
-                      class="flex-1"
-                    />
-
-                    <USelect
-                      v-model="costCurrency"
-                      :items="CURRENCY_OPTIONS"
-                      value-key="value"
-                      label-key="labelShort"
-                      class="w-[80px]"
-                      :portal="false"
-                    />
-                  </div>
-                </UFormField>
-
-                <UFormField label="Вес (фнт.)">
-                  <UInput
-                    v-model.number="weight"
-                    type="number"
-                    :min="0"
-                    class="w-full"
-                  />
-                </UFormField>
-
-                <UFormField label="Редкость">
-                  <USelect
-                    v-model="rarity"
-                    :items="RARITY_OPTIONS"
-                    value-key="value"
-                    placeholder="Редкость"
-                    class="w-full"
-                    :portal="false"
-                  />
-                </UFormField>
-              </div>
+              <ItemCostWeightFields
+                v-model:cost-value="costValue"
+                v-model:cost-currency="costCurrency"
+                v-model:weight="weight"
+                v-model:rarity="rarity"
+              />
             </FormSection>
 
             <!-- Источник -->
             <FormSection
-              title="Источник"
-              title-color="source"
+              :title="FORM_FIELD_LABELS.source"
+              icon="tabler:book-2"
             >
-              <USelect
-                v-model="sourceKey"
-                :items="sourceOptions"
-                value-key="value"
-                placeholder="Выберите источник..."
-                class="w-full"
-                :portal="false"
+              <SourceField
+                v-model:source-key="sourceKey"
+                v-model:source="source"
               />
 
               <UCheckbox
                 v-model="isSRD"
-                label="SRD контент"
+                :label="FORM_FIELD_LABELS.srd"
                 class="mt-2"
               />
             </FormSection>
@@ -298,15 +272,16 @@
         <!-- Вкладка «Подробнее» -->
         <template #details>
           <div class="flex flex-col gap-4">
-            <!-- Основное -->
+            <!-- Тип инструмента -->
             <FormSection
-              title="Тип инструмента"
-              title-color="arcane"
+              :title="TOOL_FORM_LABELS.typeTitle"
+              icon="tabler:tools"
+              :hint="TOOL_FORM_LABELS.typeHint"
             >
               <div class="flex flex-col gap-3">
                 <div class="flex items-center gap-3">
-                  <span class="min-w-[140px] shrink-0 text-sm text-muted">
-                    Категория
+                  <span class="min-w-35 shrink-0 text-sm text-muted">
+                    {{ TOOL_FORM_LABELS.category }}
                   </span>
 
                   <USelect
@@ -320,15 +295,15 @@
                 </div>
 
                 <div class="flex items-center gap-3">
-                  <span class="min-w-[140px] shrink-0 text-sm text-muted">
-                    Базовый тип
+                  <span class="min-w-35 shrink-0 text-sm text-muted">
+                    {{ ITEM_FORM_LABELS.baseType }}
                   </span>
 
                   <USelect
                     v-model="baseToolType"
                     :items="toolBaseTypeOptions"
                     value-key="value"
-                    placeholder="Пользовательский..."
+                    :placeholder="TOOL_FORM_LABELS.baseTypePlaceholder"
                     class="flex-1"
                     :portal="false"
                   />
@@ -338,8 +313,8 @@
 
             <!-- Свойства инструмента -->
             <FormSection
-              title="Свойства инструмента"
-              title-color="info"
+              :title="TOOL_FORM_LABELS.propertiesTitle"
+              icon="tabler:tags"
             >
               <div class="flex flex-wrap gap-2">
                 <UPopover
@@ -375,15 +350,16 @@
               </div>
             </FormSection>
 
-            <!-- Проверка характеристики -->
+            <!-- Проверка инструмента -->
             <FormSection
-              title="Проверка характеристики"
-              title-color="success"
+              :title="TOOL_FORM_LABELS.checkTitle"
+              icon="tabler:dice"
+              :hint="TOOL_FORM_LABELS.checkHint"
             >
               <div class="flex flex-col gap-3">
                 <div class="flex items-center gap-3">
-                  <span class="min-w-[140px] shrink-0 text-sm text-muted">
-                    Умение
+                  <span class="min-w-35 shrink-0 text-sm text-muted">
+                    {{ TOOL_FORM_LABELS.proficiencyMode }}
                   </span>
 
                   <USelect
@@ -395,9 +371,13 @@
                   />
                 </div>
 
+                <p class="text-xs text-dimmed">
+                  {{ TOOL_FORM_LABELS.proficiencyModeHelp }}
+                </p>
+
                 <div class="flex items-center gap-3">
-                  <span class="min-w-[140px] shrink-0 text-sm text-muted">
-                    Характеристика
+                  <span class="min-w-35 shrink-0 text-sm text-muted">
+                    {{ FORM_FIELD_LABELS.ability }}
                   </span>
 
                   <USelect
@@ -410,8 +390,8 @@
                 </div>
 
                 <div class="flex items-center gap-3">
-                  <span class="min-w-[140px] shrink-0 text-sm text-muted">
-                    Бонус инструмента
+                  <span class="min-w-35 shrink-0 text-sm text-muted">
+                    {{ TOOL_FORM_LABELS.bonus }}
                   </span>
 
                   <UInput
@@ -427,12 +407,12 @@
             <!-- Блок «Магическое» -->
             <FormSection
               v-if="isMagical"
-              title="Магическое"
-              title-color="arcane"
+              :title="ITEM_FORM_LABELS.magicalTitle"
+              icon="tabler:sparkles"
             >
               <div class="flex flex-col gap-3">
                 <div class="grid grid-cols-2 items-start gap-3">
-                  <UFormField label="Настройка">
+                  <UFormField :label="ITEM_FORM_LABELS.attunement">
                     <USelect
                       v-model="magicAttunement"
                       :items="attunementOptions"
@@ -448,38 +428,42 @@
                       || magicAttunement === 'optional'
                     "
                     v-model="isAttuned"
-                    label="Настроен"
+                    :label="ITEM_FORM_LABELS.attuned"
                   />
                 </div>
               </div>
+            </FormSection>
+
+            <!-- Блок «Заряды» -->
+            <FormSection
+              v-if="isMagical"
+              :title="ITEM_USES_LABELS.title"
+              icon="tabler:battery-2"
+            >
+              <ItemUsesFields v-model="itemUses" />
             </FormSection>
           </div>
         </template>
 
         <!-- Вкладка «Эффекты» -->
         <template #effects>
-          <div class="flex flex-col gap-4">
-            <div
-              v-if="activeEffects.length === 0"
-              class="rounded-lg border border-dashed border-default p-3 text-center text-xs text-dimmed italic"
-            >
-              Нет эффектов у данного инструмента
-            </div>
-
-            <div
-              v-else
-              class="space-y-1"
-            >
+          <FormSection
+            :title="FORM_TAB_LABELS.effects"
+            icon="tabler:sparkles"
+            :add-label="MODAL_BUTTON_LABELS.addEffect"
+            @add="createCustomEffect"
+          >
+            <div class="space-y-1">
               <div
                 v-for="effect in activeEffects"
                 :key="effect.id"
-                class="group flex min-h-[44px] items-center gap-2 rounded-lg bg-elevated/50 p-2 transition-colors hover:bg-accented/50"
+                class="group flex min-h-11 items-center gap-2 rounded-lg bg-elevated/50 p-2 transition-colors hover:bg-accented/50"
                 :class="{ 'opacity-50 grayscale': effect.disabled }"
               >
                 <UIcon
                   :name="effect.icon || 'tabler:bolt'"
                   class="size-5 shrink-0"
-                  :class="effect.disabled ? 'text-dimmed' : 'text-gold'"
+                  :class="effect.disabled ? 'text-dimmed' : 'text-primary'"
                 />
 
                 <div class="min-w-0 flex-1">
@@ -511,7 +495,7 @@
                       icon="tabler:pencil"
                       size="xs"
                       variant="ghost"
-                      color="gray"
+                      color="neutral"
                       class="px-1.5"
                       @click.left.exact.prevent="editCustomEffect(effect)"
                     />
@@ -520,7 +504,7 @@
                       icon="tabler:trash"
                       size="xs"
                       variant="ghost"
-                      color="red"
+                      color="error"
                       class="px-1.5"
                       @click.left.exact.prevent="deleteCustomEffect(effect.id)"
                     />
@@ -528,19 +512,7 @@
                 </div>
               </div>
             </div>
-
-            <UButton
-              size="sm"
-              color="primary"
-              variant="soft"
-              icon="tabler:plus"
-              block
-              class="mt-1"
-              @click.left.exact.prevent="createCustomEffect"
-            >
-              Добавить Эффект
-            </UButton>
-          </div>
+          </FormSection>
         </template>
       </UTabs>
     </template>
@@ -548,14 +520,14 @@
     <template #footer>
       <div class="flex justify-end gap-3">
         <UButton
-          label="Отмена"
+          :label="MODAL_BUTTON_LABELS.cancel"
           color="neutral"
           variant="ghost"
           @click.left.exact.prevent="emit('close')"
         />
 
         <UButton
-          :label="item ? 'Сохранить' : 'Создать'"
+          :label="item ? MODAL_BUTTON_LABELS.save : MODAL_BUTTON_LABELS.create"
           color="primary"
           :disabled="!name.trim()"
           @click.left.exact.prevent="handleSave"
@@ -569,7 +541,7 @@
     :modal-id="effectModalId"
     :z-index="effectModalZIndex"
     :effect="editingEffect"
-    :show-effect-target="true"
+    context="item"
     @save="saveCustomEffect"
   />
 </template>

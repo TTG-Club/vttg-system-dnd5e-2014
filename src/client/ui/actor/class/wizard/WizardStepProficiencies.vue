@@ -5,22 +5,28 @@
    * Первый класс — показывает полные стартовые владения.
    * Мультикласс — показывает сокращённый набор по PHB 2024.
    */
+  import type { TypedWebSocketClient } from '@vtt/shared';
   import type { ClassDefinition } from '@vtt/shared/system/dnd.js';
 
-  import { getMulticlassProficiencies } from '@vtt/shared/system/dnd.js';
   import { computed } from 'vue';
 
-  import {
-    ARMOR_PROF_LABELS,
-    TOOL_PROF_LABELS,
-    WEAPON_PROF_LABELS,
-  } from './constants';
+  import { getMulticlassProficiencies } from '@vtt/shared/system/dnd.js';
+
+  import { CLASS_WIZARD_LABELS, GRANT_SECTION_LABELS } from '../../constants';
+  import ToolProficiencyGrant from '../../ToolProficiencyGrant.vue';
+  import { ARMOR_PROF_LABELS, WEAPON_PROF_LABELS } from './constants';
 
   const props = defineProps<{
     classDefinition: ClassDefinition;
     isFirstClass: boolean;
     isMulticlass: boolean;
+    socket: TypedWebSocketClient | null;
   }>();
+
+  /** Разобранные ключи владений инструментами — уходят на лист персонажа */
+  const toolProficiencies = defineModel<string[]>('toolProficiencies', {
+    default: () => [],
+  });
 
   /** Владения доспехами для отображения */
   const armorProficiencies = computed(() => {
@@ -52,8 +58,38 @@
     return [];
   });
 
-  /** Владения инструментами для отображения */
-  const toolProficiencies = computed(() => {
+  /** Приписка к владению доспехами: показывается, но владением не выдаётся */
+  const armorCustom = computed(() => {
+    if (props.isFirstClass) {
+      return props.classDefinition.armorProficienciesCustom ?? '';
+    }
+
+    if (props.isMulticlass) {
+      return (
+        getMulticlassProficiencies(props.classDefinition)?.armorCustom ?? ''
+      );
+    }
+
+    return '';
+  });
+
+  /** Приписка к владению оружием; см. {@link armorCustom} */
+  const weaponCustom = computed(() => {
+    if (props.isFirstClass) {
+      return props.classDefinition.weaponProficienciesCustom ?? '';
+    }
+
+    if (props.isMulticlass) {
+      return (
+        getMulticlassProficiencies(props.classDefinition)?.weaponsCustom ?? ''
+      );
+    }
+
+    return '';
+  });
+
+  /** Владения инструментами как их прислал компендиум — текстом */
+  const toolSources = computed(() => {
     if (props.isFirstClass) {
       return props.classDefinition.toolProficiencies ?? [];
     }
@@ -72,7 +108,9 @@
     return (
       armorProficiencies.value.length > 0
       || weaponProficiencies.value.length > 0
-      || toolProficiencies.value.length > 0
+      || toolSources.value.length > 0
+      || armorCustom.value.length > 0
+      || weaponCustom.value.length > 0
     );
   });
 </script>
@@ -80,11 +118,11 @@
 <template>
   <div class="space-y-3">
     <span class="mb-2 block text-sm font-medium text-toned">
-      Владения
+      {{ GRANT_SECTION_LABELS.proficiencies }}
       <span
         v-if="isMulticlass"
         class="text-sm text-dimmed"
-        >(мультикласс)</span
+        >{{ CLASS_WIZARD_LABELS.multiclassNote }}</span
       >
     </span>
 
@@ -92,13 +130,17 @@
       v-if="hasProficiencies"
       class="space-y-3"
     >
-      <!-- Доспехи -->
-      <div v-if="armorProficiencies.length > 0">
-        <span class="mb-1 block text-sm font-medium text-muted"
-          >Снаряжение</span
-        >
+      <!-- Доспехи. Приписка идёт строкой под значками: значком её не сделать —
+        в владение листа она не превращается, её только читают -->
+      <div v-if="armorProficiencies.length > 0 || armorCustom">
+        <span class="mb-1 block text-sm font-medium text-muted">{{
+          GRANT_SECTION_LABELS.equipment
+        }}</span>
 
-        <div class="flex flex-wrap gap-1.5">
+        <div
+          v-if="armorProficiencies.length > 0"
+          class="flex flex-wrap gap-1.5"
+        >
           <UBadge
             v-for="armor in armorProficiencies"
             :key="armor"
@@ -108,13 +150,25 @@
             size="md"
           />
         </div>
+
+        <p
+          v-if="armorCustom"
+          class="mt-1 text-xs text-dimmed"
+        >
+          {{ armorCustom }}
+        </p>
       </div>
 
       <!-- Оружие -->
-      <div v-if="weaponProficiencies.length > 0">
-        <span class="mb-1 block text-sm font-medium text-muted">Оружие</span>
+      <div v-if="weaponProficiencies.length > 0 || weaponCustom">
+        <span class="mb-1 block text-sm font-medium text-muted">{{
+          GRANT_SECTION_LABELS.weapons
+        }}</span>
 
-        <div class="flex flex-wrap gap-1.5">
+        <div
+          v-if="weaponProficiencies.length > 0"
+          class="flex flex-wrap gap-1.5"
+        >
           <UBadge
             v-for="weapon in weaponProficiencies"
             :key="weapon"
@@ -124,25 +178,22 @@
             size="md"
           />
         </div>
-      </div>
 
-      <!-- Инструменты -->
-      <div v-if="toolProficiencies.length > 0">
-        <span class="mb-1 block text-sm font-medium text-muted"
-          >Инструменты</span
+        <p
+          v-if="weaponCustom"
+          class="mt-1 text-xs text-dimmed"
         >
-
-        <div class="flex flex-wrap gap-1.5">
-          <UBadge
-            v-for="tool in toolProficiencies"
-            :key="tool"
-            :label="TOOL_PROF_LABELS[tool] ?? tool"
-            color="neutral"
-            variant="soft"
-            size="md"
-          />
-        </div>
+          {{ weaponCustom }}
+        </p>
       </div>
+
+      <!-- Инструменты: текст компендиума сопоставляется со словарём владений -->
+      <ToolProficiencyGrant
+        v-if="toolSources.length > 0"
+        v-model:selected="toolProficiencies"
+        :sources="toolSources"
+        :socket="socket"
+      />
     </div>
 
     <!-- Нет владений (Sorcerer, Wizard при мультиклассе) -->
@@ -151,7 +202,7 @@
       class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5"
     >
       <span class="text-sm text-muted">
-        Этот класс не даёт дополнительных владений при мультиклассе.
+        {{ CLASS_WIZARD_LABELS.proficienciesEmpty }}
       </span>
     </div>
   </div>

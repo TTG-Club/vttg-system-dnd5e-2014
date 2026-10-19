@@ -1,19 +1,40 @@
 <script setup lang="ts">
   import type { TypedWebSocketClient } from '@vtt/shared';
-  import type { Actor, GameItem } from '@vtt/shared/system/dnd.js';
+  import type {
+    DnDCarryingCapacity,
+    DnDCurrency,
+    DnDGameItem,
+    DnDSceneEntity,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { generateId } from '@vtt/shared';
-  import { computed, ref, watch } from 'vue';
+  import { computed, ref } from 'vue';
 
-  import { requireSocket } from '@/core/entityUtils';
+  import { findEntityInWorld, requireSocket } from '@/core/entityUtils';
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { useWorldStore } from '@/stores/worldStore';
+  import { isActorEntity } from '@vtt/shared';
+  import {
+    createInventoryItem,
+    isDnDGameItem,
+    isDndSceneEntity,
+    isDndSceneEntityRecord,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { GAME_ITEM_MIME } from './constants';
+  import { useWorldEntityCopy } from '../../composables/useWorldEntityCopy';
+  import {
+    GAME_ITEM_MIME,
+    QUICK_PANEL_LABELS,
+    QUICK_PANEL_MODAL_SIZE,
+  } from './constants';
   import ActorEquipmentTab from './tabs/ActorEquipmentTab.vue';
 
   interface Props {
     open: boolean;
+    /**
+     * Идентификатор выделенной сущности. Имя пропа историческое — панель над
+     * хотбаром одна на актёра и существо, и сюда приезжает идентификатор любой
+     * из них.
+     */
     actorId: string;
     worldId: string;
     socket: TypedWebSocketClient | null;
@@ -27,26 +48,40 @@
 
   const worldStore = useWorldStore();
 
-  /** Реактивный актёр из worldStore (source of truth) */
-  const storeActor = computed(() => {
-    const world = worldStore.getWorldById(props.worldId);
-
-    return (
-      world?.actors.find((actor: Actor) => actor.id === props.actorId) ?? null
+  /**
+   * Реактивная сущность из worldStore (источник истины) — актёр или существо.
+   *
+   * Мир хоста хранит их в нейтральной форме, поэтому D&D-форму подтверждает
+   * гвард границы, а не приведение типа: запись чужой системы или недогруженная
+   * до панели не доедет.
+   */
+  const storeEntity = computed<DnDSceneEntity | null>(() => {
+    const entity = findEntityInWorld(
+      worldStore.getWorldById(props.worldId),
+      props.actorId,
     );
+
+    return entity && isDndSceneEntity(entity) ? entity : null;
   });
 
-  /** Локальная копия актёра для компонента (синхронизируется из store) */
-  const localActor = ref<Actor | null>(null);
+  /** Локальная копия сущности для компонента (синхронизируется из store) */
+  const localActor = ref<DnDSceneEntity | null>(null);
 
-  watch(
-    storeActor,
-    (newActor) => {
-      if (newActor) {
-        localActor.value = JSON.parse(JSON.stringify(newActor));
-      }
-    },
-    { immediate: true, deep: true },
+  // Копия следует за миром; серверу уходит только то, чем её изменило окно
+  const { saveCopy } = useWorldEntityCopy({
+    copy: localActor,
+    readWorld: () => storeEntity.value,
+    isEntity: isDndSceneEntityRecord,
+  });
+
+  /**
+   * Лист персонажа, если выделен он. Кошелёк и предел переносимого веса живут в
+   * его блоке `system`; у существа предела нет, а кошелёк правится своим путём.
+   */
+  const localActorSheet = computed(() =>
+    localActor.value && isActorEntity(localActor.value)
+      ? localActor.value
+      : null,
   );
 
   const isOpen = computed({
@@ -55,17 +90,48 @@
   });
 
   /**
-   * Обработчик обновления актёра из дочернего компонента.
-   * Применяет обновления к локальной копии.
+   * Кладёт новый инвентарь в локальную копию сущности.
    *
-   * @param updates - частичные обновления актёра
+   * @param equipment - новый инвентарь
    */
-  function handleActorUpdate(updates: Partial<Actor>): void {
+  function handleEquipmentUpdate(equipment: DnDGameItem[]): void {
     if (!localActor.value) {
       return;
     }
 
-    Object.assign(localActor.value, updates);
+    localActor.value.equipment = equipment;
+  }
+
+  /**
+   * Кладёт новый кошелёк в блок `system` локальной копии. Кошелёк есть у обоих
+   * листов, и поле в блоке называется одинаково.
+   *
+   * @param currency - новый кошелёк
+   */
+  function handleCurrencyUpdate(currency: DnDCurrency): void {
+    if (!localActor.value) {
+      return;
+    }
+
+    localActor.value.system = { ...localActor.value.system, currency };
+  }
+
+  /**
+   * Кладёт настройку предела переносимого веса в блок `system` копии. Только у
+   * листа персонажа: у существа предел всегда считается по правилам.
+   *
+   * @param carryingCapacity - новая настройка предела
+   */
+  function handleCarryingCapacityUpdate(
+    carryingCapacity: DnDCarryingCapacity,
+  ): void {
+    const actor = localActorSheet.value;
+
+    if (!actor) {
+      return;
+    }
+
+    actor.system = { ...actor.system, carryingCapacity };
   }
 
   /**
@@ -79,8 +145,7 @@
 
     try {
       requireSocket(props.socket);
-
-      props.socket.emit('actor:updated', localActor.value);
+      saveCopy(props.socket);
     } catch (error) {
       console.error('[QuickEquipmentModal] Immediate save failed:', error);
     }
@@ -104,20 +169,6 @@
     }
   }
 
-  function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null;
-  }
-
-  function isGameItem(value: unknown): value is GameItem {
-    return (
-      isRecord(value)
-      && typeof value.id === 'string'
-      && typeof value.name === 'string'
-      && typeof value.description === 'string'
-      && typeof value.type === 'string'
-    );
-  }
-
   /**
    * Обрабатывает drop предмета из компендиума.
    * Добавляет предмет в инвентарь актора и сохраняет на сервер.
@@ -138,11 +189,11 @@
     try {
       const parsedItem: unknown = JSON.parse(equipData);
 
-      if (!isGameItem(parsedItem)) {
+      if (!isDnDGameItem(parsedItem)) {
         return;
       }
 
-      const alreadyExists = localActor.value.equipment.some(
+      const alreadyExists = (localActor.value.equipment ?? []).some(
         (item) => item.id === parsedItem.id,
       );
 
@@ -150,14 +201,13 @@
         return;
       }
 
-      const newItem: GameItem = {
-        ...parsedItem,
-        id: generateId('eq'),
-        isReadOnly: false,
-        equipped: false,
-      };
+      const newItem = createInventoryItem(parsedItem);
 
-      localActor.value.equipment = [...localActor.value.equipment, newItem];
+      localActor.value.equipment = [
+        ...(localActor.value.equipment ?? []),
+        newItem,
+      ];
+
       handleImmediateSave();
     } catch {
       /* ошибка парсинга — игнорируем */
@@ -173,9 +223,11 @@
     /** Поднимает окно выше всех остальных */
     bringToFront: () => draggableModalRef.value?.bringToFront(),
     /** Текущий z-index окна (Vue auto-unwrap из expose) */
-    localZIndex: computed(
-      () => draggableModalRef.value?.localZIndex as number | undefined,
-    ),
+    localZIndex: computed(() => {
+      const zIndex = draggableModalRef.value?.localZIndex;
+
+      return typeof zIndex === 'number' ? zIndex : undefined;
+    }),
   });
 </script>
 
@@ -185,11 +237,11 @@
     v-model:open="isOpen"
     :draggable="true"
     :resizable="true"
-    :min-width="400"
-    :min-height="300"
-    :initial-width="520"
-    initial-height="70vh"
-    :title="`Инвентарь — ${localActor?.name ?? ''}`"
+    :min-width="QUICK_PANEL_MODAL_SIZE.minWidth"
+    :min-height="QUICK_PANEL_MODAL_SIZE.minHeight"
+    :initial-width="QUICK_PANEL_MODAL_SIZE.initialWidth"
+    :initial-height="QUICK_PANEL_MODAL_SIZE.initialHeight"
+    :title="`${QUICK_PANEL_LABELS.equipmentTitlePrefix}${localActor?.name ?? ''}`"
   >
     <template #body>
       <div
@@ -199,9 +251,14 @@
       >
         <ActorEquipmentTab
           v-if="localActor"
-          :actor="localActor"
+          :entity="localActor"
           :is-edit-mode="false"
-          @update:actor="handleActorUpdate"
+          show-currency
+          :show-carrying-capacity="Boolean(localActorSheet)"
+          :allow-hotbar-drag="Boolean(localActorSheet)"
+          @update:equipment="handleEquipmentUpdate"
+          @update:currency="handleCurrencyUpdate"
+          @update:carrying-capacity="handleCarryingCapacityUpdate"
           @immediate-save="handleImmediateSave"
         />
       </div>

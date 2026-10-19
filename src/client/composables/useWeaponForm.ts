@@ -4,6 +4,7 @@ import type {
   DamagePart,
   DistanceUnit,
   ItemRarity,
+  SourceDefinition,
   SpellSaveType,
   WeaponCategory,
   WeaponProficiencyMode,
@@ -13,27 +14,50 @@ import type {
 import type {
   ActiveEffect,
   CurrencyType,
-  GameItem,
+  DnDCustomBonus,
+  DnDGameItem,
 } from '@vtt/shared/system/dnd.js';
 
-import {
-  damagePartIsHealing,
-  DEFAULT_CURRENCY,
-  isDnDEffect,
-  parseCost,
-  SAVE_EFFECT_OPTIONS,
-  SAVE_TYPE_OPTIONS,
-} from '@vtt/shared/system/dnd.js';
 import { computed, ref, watch } from 'vue';
 
-import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+import {
+  AMMUNITION_PROPERTY,
+  damagePartIsHealing,
+  DEFAULT_CURRENCY,
+  FALLBACK_SOURCE_KEY,
+  getDefaultWeaponAbility,
+  isDnDEffect,
+  parseCost,
+  parseCustomBonuses,
+  SAVE_EFFECT_OPTIONS,
+  SAVE_TYPE_OPTIONS,
+  toStoredCustomBonus,
+  WEAPON_MASTERIES,
+} from '@vtt/shared/system/dnd.js';
+
+import { useSystemDataStore } from '../stores/systemDataStore';
+import { useItemUsesForm } from './useItemUsesForm';
 
 /**
- * Значение опции «не выбрано» в селектах базового типа и категории.
+ * Значение опции «не выбрано» в селектах базового типа/категории/приёма.
  * Не пустая строка: Nuxt UI `USelect` резервирует `''` под очистку выбора и
  * запрещает её как значение пункта.
  */
 const NO_SELECTION = 'none';
+
+/**
+ * Значение селектора характеристики урона «как у атаки» — оно же значение по
+ * умолчанию. В записи оружия ему соответствует пустое поле `damageAbility`:
+ * так урон следует за характеристикой атаки, даже если её потом поменяют.
+ */
+export const DAMAGE_ABILITY_INHERIT = 'inherit';
+
+/** Значение селектора характеристики урона «без характеристики» */
+export const DAMAGE_ABILITY_NONE = 'none';
+
+/** Выбор характеристики урона в форме */
+export type DamageAbilityOption =
+  AbilityType | typeof DAMAGE_ABILITY_INHERIT | typeof DAMAGE_ABILITY_NONE;
 
 /**
  * Composable для логики формы оружия.
@@ -45,7 +69,7 @@ const NO_SELECTION = 'none';
  * @param getIsOpen - функция получения флага открытости модалки
  */
 export function useWeaponForm(
-  getWeapon: () => GameItem | null,
+  getWeapon: () => DnDGameItem | null,
   getIsOpen: () => boolean,
 ) {
   // --- Reactive-поля формы ---
@@ -72,16 +96,25 @@ export function useWeaponForm(
   const attackAbility = ref<AbilityType>('strength');
   const proficiencyMode = ref<WeaponProficiencyMode>('auto');
   const attackBonus = ref(0);
+  const damageAbility = ref<DamageAbilityOption>(DAMAGE_ABILITY_INHERIT);
+  const damageBonus = ref(0);
+  const attackCustomBonuses = ref<DnDCustomBonus[]>([]);
+  const damageCustomBonuses = ref<DnDCustomBonus[]>([]);
   const special = ref('');
   const ammunitionType = ref<AmmunitionType | ''>('');
+  const consumable = ref(false);
+  const mastery = ref<string>(NO_SELECTION);
   const distanceUnit = ref<DistanceUnit>('ft');
-  const sourceKey = ref('hb');
+  const sourceKey = ref<string | undefined>(FALLBACK_SOURCE_KEY);
+  const source = ref<SourceDefinition | undefined>(undefined);
   const isSRD = ref(false);
   const magicAttunement = ref<'none' | 'required' | 'optional'>('none');
   const isAttuned = ref(false);
+  const activeWhenCarried = ref(false);
   const magicBonus = ref(0);
   const rarity = ref<ItemRarity>('none');
   const activeEffects = ref<ActiveEffect[]>([]);
+  const itemUses = useItemUsesForm();
 
   /**
    * Адамантиновое — вычисляемое на основе selectedProperties
@@ -96,6 +129,13 @@ export function useWeaponForm(
   const isMagical = computed(() =>
     selectedProperties.value.includes('magical'),
   );
+
+  /**
+   * Фокусирующее: магический посох или жезл-оружие годится заклинательной
+   * фокусировкой. У снаряжения это свойство есть в справочнике, а среди свойств
+   * оружия его нет — поэтому здесь оно отдельной галочкой.
+   */
+  const isFocus = ref(false);
 
   const systemDataStore = useSystemDataStore();
 
@@ -144,6 +184,11 @@ export function useWeaponForm(
     })),
   );
 
+  /** Стреляет ли оружие боеприпасами */
+  const firesAmmunition = computed(() =>
+    selectedProperties.value.includes(AMMUNITION_PROPERTY),
+  );
+
   /** Опции режима владения */
   const proficiencyModeOptions = [
     { label: 'Автоматически', value: 'auto' as const },
@@ -151,13 +196,15 @@ export function useWeaponForm(
     { label: 'Не учитывать', value: 'never' as const },
   ];
 
-  /** Опции источников контента */
-  const sourceOptions = computed(() =>
-    systemDataStore.sources.map((src) => ({
-      label: `${src.name} (${src.abbreviation})`,
-      value: src.key,
+  /** Опции оружейных приёмов (с пунктом «Без приёма») */
+  const masteryOptions = computed(() => [
+    { label: 'Без приёма', value: NO_SELECTION, description: '' },
+    ...WEAPON_MASTERIES.map((masteryEntry) => ({
+      label: `${masteryEntry.name.ru} (${masteryEntry.name.en})`,
+      value: masteryEntry.key,
+      description: masteryEntry.description.ru,
     })),
-  );
+  ]);
 
   // --- Заполнение формы при открытии ---
   watch(
@@ -194,13 +241,32 @@ export function useWeaponForm(
         reach.value = weapon.reach ?? 5;
         rangeNormal.value = weapon.range?.normal ?? 0;
         rangeLong.value = weapon.range?.long ?? 0;
-        attackAbility.value = weapon.attackAbility ?? 'strength';
+
+        attackAbility.value =
+          weapon.attackAbility ?? getDefaultWeaponAbility(weapon.rangeType);
+
         proficiencyMode.value = weapon.proficiencyMode ?? 'auto';
         attackBonus.value = weapon.attackBonus ?? 0;
+        damageAbility.value = weapon.damageAbility ?? DAMAGE_ABILITY_INHERIT;
+        damageBonus.value = weapon.damageBonus ?? 0;
+
+        // Копии, а не сами бонусы предмета: форма живёт до сохранения, и её
+        // правки не должны менять запись раньше времени
+        attackCustomBonuses.value = parseCustomBonuses(
+          weapon.attackCustomBonuses,
+        ).map((bonus) => ({ ...bonus }));
+
+        damageCustomBonuses.value = parseCustomBonuses(
+          weapon.damageCustomBonuses,
+        ).map((bonus) => ({ ...bonus }));
+
         special.value = weapon.special ?? '';
         ammunitionType.value = weapon.ammunitionType ?? '';
+        consumable.value = weapon.consumable ?? false;
+        mastery.value = weapon.mastery ?? NO_SELECTION;
         distanceUnit.value = weapon.distanceUnit ?? 'ft';
-        sourceKey.value = weapon.sourceKey ?? 'hb';
+        sourceKey.value = weapon.sourceKey ?? FALLBACK_SOURCE_KEY;
+        source.value = weapon.source;
         isSRD.value = weapon.isSRD ?? false;
         rarity.value = weapon.rarity ?? 'none';
 
@@ -218,11 +284,15 @@ export function useWeaponForm(
 
         magicAttunement.value = weapon.magicAttunement ?? 'none';
         isAttuned.value = weapon.isAttuned ?? false;
+        activeWhenCarried.value = weapon.activeWhenCarried ?? false;
         magicBonus.value = weapon.magicBonus ?? 0;
+        isFocus.value = weapon.isFocus ?? false;
 
         activeEffects.value = [...(weapon.activeEffects ?? [])].filter(
           isDnDEffect,
         );
+
+        itemUses.loadItemUses(weapon.uses);
       } else {
         // Дефолты для создания
         name.value = '';
@@ -245,19 +315,29 @@ export function useWeaponForm(
         reach.value = 5;
         rangeNormal.value = 0;
         rangeLong.value = 0;
-        attackAbility.value = 'strength';
+        attackAbility.value = getDefaultWeaponAbility(rangeType.value);
         proficiencyMode.value = 'auto';
         attackBonus.value = 0;
+        damageAbility.value = DAMAGE_ABILITY_INHERIT;
+        damageBonus.value = 0;
+        attackCustomBonuses.value = [];
+        damageCustomBonuses.value = [];
         special.value = '';
         ammunitionType.value = '';
+        consumable.value = false;
+        mastery.value = NO_SELECTION;
         distanceUnit.value = 'ft';
-        sourceKey.value = 'hb';
+        sourceKey.value = FALLBACK_SOURCE_KEY;
+        source.value = undefined;
         isSRD.value = false;
         magicAttunement.value = 'none';
         isAttuned.value = false;
+        activeWhenCarried.value = false;
         magicBonus.value = 0;
+        isFocus.value = false;
         rarity.value = 'none';
         activeEffects.value = [];
+        itemUses.resetItemUses();
       }
     },
     { immediate: true },
@@ -269,16 +349,18 @@ export function useWeaponForm(
 
     if (newType === 'ranged' && !hasRange) {
       selectedProperties.value.push('range');
-      attackAbility.value = 'dexterity';
     } else if (newType === 'melee' && hasRange) {
       const index = selectedProperties.value.indexOf('range');
 
       if (index !== -1) {
         selectedProperties.value.splice(index, 1);
       }
-
-      attackAbility.value = 'strength';
     }
+
+    // Характеристика по умолчанию: дальнобойное — Ловкость, рукопашное — Сила.
+    // Вне ветки со свойством «Дальнобойное», иначе у оружия, у которого свойство
+    // уже стоит, характеристика осталась бы от прежнего типа.
+    attackAbility.value = getDefaultWeaponAbility(newType);
   });
 
   /**
@@ -287,6 +369,12 @@ export function useWeaponForm(
    */
   function toggleProperty(prop: WeaponProperty): void {
     const index = selectedProperties.value.indexOf(prop);
+
+    // Свойство «Боеприпасы» меняет смысл типа боеприпаса: «чем стреляет»
+    // против «что это за боеприпас» — старое значение не переносится
+    if (prop === AMMUNITION_PROPERTY) {
+      ammunitionType.value = '';
+    }
 
     if (index === -1) {
       selectedProperties.value.push(prop);
@@ -364,7 +452,7 @@ export function useWeaponForm(
    * Собирает объект GameItem из текущих полей формы
    * @returns объект GameItem для отправки на сервер
    */
-  function buildWeapon(): GameItem {
+  function buildWeapon(): DnDGameItem {
     const weapon = getWeapon();
 
     return {
@@ -373,7 +461,8 @@ export function useWeaponForm(
       nameEn: nameEn.value.trim() || undefined,
       description: description.value,
       type: 'weapon',
-      quantity: 1,
+      // Стопка стрел и метательного оружия не сбрасывается правкой записи
+      quantity: weapon?.quantity ?? 1,
       weight: weight.value,
       cost:
         costValue.value > 0
@@ -388,6 +477,7 @@ export function useWeaponForm(
       rangeType: rangeType.value,
       baseType: baseType.value !== NO_SELECTION ? baseType.value : undefined,
       reach: reach.value !== 5 ? reach.value : undefined,
+      mastery: mastery.value !== NO_SELECTION ? mastery.value : undefined,
       damageParts: buildDamageParts(),
       weaponProperties: selectedProperties.value,
       range:
@@ -402,24 +492,41 @@ export function useWeaponForm(
       attackAbility: attackAbility.value,
       proficiencyMode: proficiencyMode.value,
       attackBonus: attackBonus.value || undefined,
-      special: special.value.trim() || undefined,
-      ammunitionType: selectedProperties.value.includes('ammunition')
-        ? ammunitionType.value || undefined
+      // «Как у атаки» — это отсутствие поля, а не значение: урон обязан
+      // следовать за характеристикой атаки при её смене
+      damageAbility:
+        damageAbility.value === DAMAGE_ABILITY_INHERIT
+          ? undefined
+          : damageAbility.value,
+      damageBonus: damageBonus.value || undefined,
+      attackCustomBonuses: attackCustomBonuses.value.length
+        ? attackCustomBonuses.value.map(toStoredCustomBonus)
         : undefined,
+      damageCustomBonuses: damageCustomBonuses.value.length
+        ? damageCustomBonuses.value.map(toStoredCustomBonus)
+        : undefined,
+      special: special.value.trim() || undefined,
+      ammunitionType: ammunitionType.value || undefined,
+      consumable: consumable.value || undefined,
       sourceKey: sourceKey.value || undefined,
+      source: source.value,
       isSRD: isSRD.value || undefined,
       isReadOnly: false,
       distanceUnit:
         distanceUnit.value !== 'ft' ? distanceUnit.value : undefined,
       isAdamantine: isAdamantine.value || undefined,
       isMagical: isMagical.value || undefined,
+      isFocus: isFocus.value || undefined,
       magicAttunement:
         isMagical.value && magicAttunement.value !== 'none'
           ? magicAttunement.value
           : undefined,
       isAttuned: isMagical.value && isAttuned.value ? true : undefined,
+      activeWhenCarried:
+        isMagical.value && activeWhenCarried.value ? true : undefined,
       magicBonus:
         isMagical.value && magicBonus.value > 0 ? magicBonus.value : undefined,
+      uses: itemUses.buildItemUses(),
       activeEffects: activeEffects.value,
     };
   }
@@ -445,18 +552,29 @@ export function useWeaponForm(
     attackAbility,
     proficiencyMode,
     attackBonus,
+    damageAbility,
+    damageBonus,
+    attackCustomBonuses,
+    damageCustomBonuses,
     special,
     ammunitionType,
+    consumable,
+    firesAmmunition,
+    mastery,
     distanceUnit,
     sourceKey,
+    source,
     isSRD,
     isAdamantine,
     isMagical,
+    isFocus,
     magicAttunement,
     isAttuned,
+    activeWhenCarried,
     magicBonus,
     rarity,
     activeEffects,
+    ...itemUses,
 
     // Computed опции
     categoryOptions,
@@ -465,7 +583,7 @@ export function useWeaponForm(
     baseTypeOptions,
     ammunitionTypeOptions,
     proficiencyModeOptions,
-    sourceOptions,
+    masteryOptions,
     saveTypeOptions: SAVE_TYPE_OPTIONS,
     saveEffectOptions: SAVE_EFFECT_OPTIONS,
 

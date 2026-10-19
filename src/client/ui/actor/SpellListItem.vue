@@ -1,30 +1,45 @@
 <script setup lang="ts">
-  import type { Actor, GameItem, Spell } from '@vtt/shared/system/dnd.js';
+  import type { DnDGameItem, Spell } from '@vtt/shared/system/dnd.js';
 
-  import {
-    formatConditionalDamageDisplay,
-    getSpellDamageParts,
-    resolveActorStats,
-    resolveSpellDamageFormula,
-    SPELL_USES_RECOVERY_LABELS,
-    stripDamageTypeTokens,
-    stripFormulaVariables,
-  } from '@vtt/shared/system/dnd.js';
+  import type { ContextMenuAction } from '../../composables/useContextMenu';
+
   import { computed, ref } from 'vue';
 
   import { startHotbarDrag } from '@/core/utils/hotbarDrag';
-  import { ContextMenuDangerItem } from '@/shared_ui/components';
   import FieldGroupReset from '@/shared_ui/components/FieldGroupReset.vue';
+  import {
+    isSpell,
+    SPELL_USES_RECOVERY_LABELS,
+  } from '@vtt/shared/system/dnd.js';
 
-  import { SPELL_MIME } from './constants';
+  import {
+    SHEET_ROW_MENU_LABELS,
+    SPELL_BADGE_LABELS,
+    SPELL_MENU_LABELS,
+    SPELL_MIME,
+  } from './constants';
+  import ContextMenuOverlay from './ContextMenuOverlay.vue';
+  import EntityRowBody from './EntityRowBody.vue';
   import { extractSpellFromGameItem } from './utils/extractSpellFromGameItem';
+  import { formatSpellDamageDisplay } from './utils/formatSpellDamageDisplay';
 
+  /**
+   * Атрибуты вызывающего компонент переносит на строку САМ (`v-bind="$attrs"` на
+   * обоих корнях шаблона): корней у него два — сама строка и портал
+   * контекстного меню, — а таким Vue `class` и `style` автоматически не отдаёт.
+   * Без этого до строки не доезжали ни `flex-1` из компендиума (строка не
+   * растягивалась во всю ширину, и бейджи липли к названию), ни приглушение уже
+   * изученного заклинания.
+   *
+   * Обработчики в `$attrs` не попадают: все события объявлены в `defineEmits`, а
+   * объявленные Vue оттуда исключает.
+   */
   defineOptions({ inheritAttrs: false });
 
   const props = defineProps<{
     /** Данные заклинания или предмет-заклинание */
-    item: Spell | GameItem;
-    /** Показывать «Скопировать» в контекстном меню */
+    item: Spell | DnDGameItem;
+    /** Показывать «Скопировать в предметы» в контекстном меню */
     showCopy?: boolean;
     /** Показывать «Редактировать» в контекстном меню */
     showEdit?: boolean;
@@ -32,87 +47,69 @@
     showDelete?: boolean;
     /** Показывать «Применить» в контекстном меню */
     showCast?: boolean;
-    /** Показывать чекбокс подготовки */
-    showPrepare?: boolean;
-    /** ID актора-владельца (для перетаскивания на хотбар) */
-    actorId?: string;
+    /** Показывать «В компендиум» в контекстном меню (ставит ядро в «Мастерской») */
+    showAddToCompendium?: boolean;
     /**
      * ID существа-владельца. Если задан — перетаскивание на хотбар создаёт
      * макрос `creature-spell` (вместо `spell-cast` актора).
      */
     creatureId?: string;
-    /** Актор-владелец — для подстановки @-переменных в формуле урона при показе */
-    actor?: Actor;
     /** Проп для режима редактирования: показывает inline-иконки */
     isEditMode?: boolean;
+    /**
+     * Плоская строка списка: без своей плашки и скругления. Так строка встаёт в
+     * список с разделителями (компендиум и окна выбора); на листе персонажа
+     * строки стоят порознь, и плашка им нужна.
+     */
+    flat?: boolean;
   }>();
 
   const emit = defineEmits<{
     /** Клик по строке (открыть детальник) */
-    'click': [];
-    /** Скопировать */
-    'copy': [];
+    click: [];
+    /** Скопировать в предметы */
+    copy: [];
     /** Редактировать */
-    'edit': [];
+    edit: [];
     /** Удалить */
-    'delete': [];
+    delete: [];
     /** Применить */
-    'cast': [];
-    /** Изменить подготовку */
-    'update:prepared': [value: boolean];
+    cast: [];
     /** Отправить в чат */
-    'share': [];
+    share: [];
+    /** Положить запись в компендиум мира */
+    addToCompendium: [];
   }>();
 
-  const spellObject = computed<Spell>(() => {
-    if (
-      'type' in props.item
-      && props.item.type === 'spell'
-      && 'spellData' in props.item
-      && props.item.spellData
-    ) {
-      return extractSpellFromGameItem(props.item as GameItem);
+  /**
+   * Заклинание строки. Запись компендиума уже плоская — её узнаёт гвард
+   * заклинания; предмет-обёртка мира несёт заклинание во вложенном
+   * `spellData`, откуда оно и разворачивается.
+   */
+  const spellObject = computed<Spell | null>(() => {
+    if (isSpell(props.item)) {
+      return props.item;
     }
 
-    return props.item as Spell;
+    return extractSpellFromGameItem(props.item);
   });
 
   /**
-   * Формула урона для отображения: при известном акторе подставляет
-   * @-переменные конкретным числом; без актора (глобальный список предметов)
-   * убирает @-токены, оставляя только кубиковую часть. Затем переводит кости
-   * d→к для русского вида.
+   * Формула урона для отображения — общая со строкой листа. Владельца строка не
+   * знает (её показывают панель предметов и лист существа), поэтому от формулы
+   * остаются одни кости, без подстановки характеристик.
    */
-  const damageFormulaDisplay = computed(() => {
-    const stats = props.actor ? resolveActorStats(props.actor) : null;
+  const damageFormulaDisplay = computed(() =>
+    spellObject.value ? formatSpellDamageDisplay(spellObject.value) : '',
+  );
 
-    const parts = getSpellDamageParts(spellObject.value)
-      .map((part) => {
-        // Инлайн-токены @dmg.<type> — это метки типа, не переменные роллера;
-        // убираем их до подстановки @-переменных (иначе resolveVariable падает).
-        // Условные ветки @target.* показываем через «или» (formatConditional...).
-        const resolveTerm = (subFormula: string): string => {
-          const baseFormula = stripDamageTypeTokens(subFormula);
-
-          return props.actor && stats
-            ? resolveSpellDamageFormula(
-                spellObject.value,
-                props.actor,
-                baseFormula,
-                stats,
-              )
-            : stripFormulaVariables(baseFormula);
-        };
-
-        return formatConditionalDamageDisplay(
-          part.formula,
-          resolveTerm,
-        ).replace(/(\d+)d(\d+)/gi, '$1к$2');
-      })
-      .filter((formula) => formula.length > 0);
-
-    return parts.join(' + ');
-  });
+  /**
+   * Источник записи: у заклинания компендиума он на самом заклинании, у
+   * предмета-заклинания — на предмете. Показывается бейджем в строке списка.
+   */
+  const sourceKey = computed<string | undefined>(
+    () => spellObject.value?.sourceKey ?? props.item.sourceKey,
+  );
 
   /**
    * Начинает перетаскивание заклинания на хотбар.
@@ -122,7 +119,7 @@
   function handleDragStart(event: DragEvent): void {
     const spell = spellObject.value;
 
-    if (!event.dataTransfer) {
+    if (!spell || !event.dataTransfer) {
       return;
     }
 
@@ -148,13 +145,12 @@
       label: spell.name,
       icon: 'tabler:wand',
       ref: spell.id,
-      actorId: props.actorId,
     });
   }
 
   /** Заряды заклинания для отображения (current/max + способ отката) */
   const usesBadge = computed<{ text: string; title: string } | null>(() => {
-    const uses = spellObject.value.uses;
+    const uses = spellObject.value?.uses;
 
     if (!uses || uses.recovery === 'atWill') {
       return null;
@@ -174,7 +170,11 @@
   /** Есть ли пункты для контекстного меню */
   const hasContextMenu = computed(
     () =>
-      props.showCopy || props.showEdit || props.showDelete || props.showCast,
+      props.showCopy
+      || props.showEdit
+      || props.showDelete
+      || props.showCast
+      || props.showAddToCompendium,
   );
 
   /**
@@ -200,9 +200,7 @@
    *
    * @param action - действие
    */
-  function handleAction(
-    action: 'copy' | 'edit' | 'delete' | 'cast' | 'share',
-  ): void {
+  function handleAction(action: ContextMenuAction): void {
     isMenuOpen.value = false;
 
     if (action === 'copy') {
@@ -215,6 +213,8 @@
       emit('cast');
     } else if (action === 'share') {
       emit('share');
+    } else if (action === 'add-to-compendium') {
+      emit('addToCompendium');
     }
   }
 
@@ -222,37 +222,57 @@
   function closeMenu(): void {
     isMenuOpen.value = false;
   }
-
-  /** Обработка клика по чекбоксу подготовки */
-  function togglePrepared(): void {
-    emit('update:prepared', !spellObject.value.prepared);
-  }
 </script>
 
 <template>
-  <div class="flex items-center gap-2">
-    <!-- Чекбокс подготовки -->
-    <button
-      v-if="showPrepare && spellObject.level > 0"
-      class="flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors"
-      :class="[
-        spellObject.prepared || spellObject.alwaysPrepared
-          ? 'border-success bg-success/20 text-healing'
-          : 'border-accented text-transparent hover:border-accented',
-      ]"
-      :title="
-        spellObject.alwaysPrepared ? 'Всегда подготовлено' : 'Подготовить'
-      "
-      :disabled="spellObject.alwaysPrepared"
-      @click.left.exact.prevent.stop="togglePrepared"
+  <!-- Строка списка: простой ряд, а не группа кнопок, — подсветка тогда идёт во
+    всю строку, а не по кнопке внутри неё -->
+  <div
+    v-if="flat"
+    v-bind="$attrs"
+    draggable="true"
+    class="flex cursor-grab items-center gap-3 px-2 py-2 transition-colors hover:bg-primary/10 active:cursor-grabbing"
+    @click.left.exact.prevent="emit('click')"
+    @contextmenu="openContextMenu"
+    @dragstart="handleDragStart($event)"
+  >
+    <!-- Значка в списке нет: он одинаков у всех строк и только съедает место.
+      На листе персонажа палочка остаётся — там строка стоит среди других -->
+    <EntityRowBody
+      :name="spellObject?.name ?? ''"
+      :name-en="spellObject?.nameEn"
+      :source-key="sourceKey"
+      :source="item.source"
     >
-      <UIcon
-        v-if="spellObject.prepared || spellObject.alwaysPrepared"
-        name="tabler:check"
-        class="h-3 w-3"
-      />
-    </button>
+      <template #badges>
+        <UBadge
+          v-if="spellObject?.concentration"
+          color="warning"
+          variant="subtle"
+          size="xs"
+          class="shrink-0"
+        >
+          {{ SPELL_BADGE_LABELS.concentration }}
+        </UBadge>
 
+        <UBadge
+          v-if="spellObject?.ritual"
+          color="info"
+          variant="subtle"
+          size="xs"
+          class="shrink-0"
+        >
+          {{ SPELL_BADGE_LABELS.ritual }}
+        </UBadge>
+      </template>
+    </EntityRowBody>
+  </div>
+
+  <div
+    v-else
+    v-bind="$attrs"
+    class="flex items-center gap-2"
+  >
     <UFieldGroup
       size="lg"
       class="group flex min-w-0 flex-1"
@@ -260,7 +280,7 @@
       <!-- Быстрое применение заклинания -->
       <UTooltip
         v-if="showCast"
-        text="Применить"
+        :text="SPELL_MENU_LABELS.cast"
       >
         <UButton
           icon="tabler:wand"
@@ -293,26 +313,26 @@
           <span
             class="min-w-0 flex-1 truncate text-left text-sm font-medium text-highlighted"
           >
-            {{ spellObject.name }}
+            {{ spellObject?.name }}
           </span>
 
           <!-- Бейджи -->
           <UBadge
-            v-if="spellObject.concentration"
+            v-if="spellObject?.concentration"
             color="warning"
             variant="subtle"
             size="xs"
           >
-            К
+            {{ SPELL_BADGE_LABELS.concentration }}
           </UBadge>
 
           <UBadge
-            v-if="spellObject.ritual"
+            v-if="spellObject?.ritual"
             color="info"
             variant="subtle"
             size="xs"
           >
-            Р
+            {{ SPELL_BADGE_LABELS.ritual }}
           </UBadge>
 
           <!-- Урон -->
@@ -342,7 +362,7 @@
 
       <!-- Кнопки редактирования (видны только в режиме редактирования) -->
       <template v-if="isEditMode">
-        <UTooltip text="Редактировать">
+        <UTooltip :text="SHEET_ROW_MENU_LABELS.edit">
           <UButton
             icon="tabler:edit"
             color="neutral"
@@ -361,85 +381,17 @@
     </UFieldGroup>
   </div>
 
-  <!-- Контекстное меню -->
-  <Teleport to="body">
-    <div
-      v-if="isMenuOpen"
-      class="fixed inset-0 z-10000"
-      @click.left.exact.prevent="closeMenu"
-      @contextmenu.prevent="closeMenu"
-    >
-      <div
-        class="absolute min-w-[180px] rounded-lg border border-default bg-default py-1 shadow-xl"
-        :style="{ left: `${menuX}px`, top: `${menuY}px` }"
-        @click.stop
-      >
-        <!-- Применить -->
-        <button
-          v-if="showCast"
-          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-          @click.left.exact.prevent="handleAction('cast')"
-        >
-          <UIcon
-            name="tabler:wand"
-            class="h-4 w-4 text-muted"
-          />
-          Применить
-        </button>
-
-        <!-- Скопировать -->
-        <button
-          v-if="showCopy"
-          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-          @click.left.exact.prevent="handleAction('copy')"
-        >
-          <UIcon
-            name="tabler:copy"
-            class="h-4 w-4 text-muted"
-          />
-          Скопировать
-        </button>
-
-        <!-- Редактировать -->
-        <button
-          v-if="showEdit"
-          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-          @click.left.exact.prevent="handleAction('edit')"
-        >
-          <UIcon
-            name="tabler:edit"
-            class="h-4 w-4 text-muted"
-          />
-          Редактировать
-        </button>
-
-        <!-- Разделитель -->
-        <div
-          v-if="showCopy || showEdit || showCast"
-          class="mx-2 my-1 border-t border-default/50"
-        />
-
-        <!-- Поделиться в чат -->
-        <button
-          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-highlighted transition-colors hover:bg-accented/50"
-          @click.left.exact.prevent="handleAction('share')"
-        >
-          <UIcon
-            name="tabler:message-share"
-            class="h-4 w-4 text-muted"
-          />
-          Поделиться в чат
-        </button>
-
-        <!-- Удалить -->
-        <ContextMenuDangerItem
-          v-if="showDelete"
-          icon="tabler:trash"
-          @click="handleAction('delete')"
-        >
-          Удалить
-        </ContextMenuDangerItem>
-      </div>
-    </div>
-  </Teleport>
+  <ContextMenuOverlay
+    :is-open="isMenuOpen"
+    :pos-x="menuX"
+    :pos-y="menuY"
+    :show-cast="showCast"
+    :show-copy="showCopy"
+    :show-edit="showEdit"
+    :show-add-to-compendium="showAddToCompendium"
+    show-share
+    :show-delete="showDelete"
+    @action="handleAction"
+    @close="closeMenu"
+  />
 </template>

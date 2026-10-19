@@ -1,27 +1,69 @@
 <script setup lang="ts">
   /**
-   * Шаг мастера: Увеличение характеристик (ASI) / Черты.
+   * Шаг мастера: {{ WIZARD_ASI_LABELS.title }} (ASI) / Черты.
    *
-   * Позволяет выбрать между +2 к одной или +1/+1 к двум характеристикам.
-   * Режим «Черта» — placeholder (каталог черт пока не реализован).
+   * Позволяет выбрать между +2 к одной или +1/+1 к двум характеристикам либо
+   * взять черту из компендиума: по правилам 2024 года повышение характеристик
+   * — тоже черта, и пул выбора задаёт само умение класса.
    */
   import type { AbilityType } from '@vtt/shared';
-  import type { DnDAbilityScores } from '@vtt/shared/system/dnd.js';
+  import type {
+    DnDAbilityScores,
+    DnDActor,
+    FeatChoice,
+    Spell,
+  } from '@vtt/shared/system/dnd.js';
 
-  import type { WizardAsiState } from './useClassWizard';
+  import type {
+    CompendiumFeat,
+    WizardAsiState,
+    WizardTakenFeat,
+  } from './useClassWizard';
 
   import { computed } from 'vue';
 
+  import { CLASS_WIZARD_LABELS, WIZARD_ASI_LABELS } from '../../constants';
+  import FeatChoicesFields from '../../feat/FeatChoicesFields.vue';
+  import WizardFeatPicker from '../../feat/WizardFeatPicker.vue';
   import { ABILITY_LABELS } from './constants';
 
   const props = defineProps<{
     currentAbilities: DnDAbilityScores;
     asiState: WizardAsiState;
+    /** Черты компендиума — пул режима «Взять черту» */
+    feats: ReadonlyArray<CompendiumFeat>;
+    /** Лист персонажа: по нему из пула уходят уже взятые черты */
+    actor: DnDActor;
+    /** Выбор черты из даров умения; null — пул по правилу листа */
+    featChoice: FeatChoice | null;
+    /** Взятая черта с её собственными вопросами; null — черта не выбрана */
+    takenFeat: WizardTakenFeat | null;
+    /** Ответы на собственные вопросы взятой черты: ключ выбора → значения */
+    featOwnAnswers: Record<string, string[]>;
+    /** Бонус мастерства: от него зависит количество у части выборов */
+    proficiencyBonus: number;
+    /** Заклинания каталога — пул выбора заклинания */
+    spells?: ReadonlyArray<Spell>;
   }>();
 
   const emit = defineEmits<{
     'update:asiState': [state: WizardAsiState];
+    'update:featOwnAnswers': [
+      answersKey: string,
+      answers: Record<string, string[]>,
+    ];
   }>();
+
+  /**
+   * Записывает ответы взятой черты на её собственные вопросы.
+   *
+   * @param answers - ключ выбора → выбранные значения
+   */
+  function updateFeatOwnAnswers(answers: Record<string, string[]>): void {
+    if (props.takenFeat) {
+      emit('update:featOwnAnswers', props.takenFeat.answersKey, answers);
+    }
+  }
 
   /** Список всех характеристик */
   const ABILITY_KEYS: AbilityType[] = [
@@ -109,12 +151,21 @@
       abilityIncreases: {},
     });
   }
+
+  /**
+   * Записывает черту, взятую вместо повышения характеристик.
+   *
+   * @param featKey - ключ черты компендиума; null — выбор снят
+   */
+  function setFeatKey(featKey: string | null) {
+    emit('update:asiState', { ...props.asiState, featKey });
+  }
 </script>
 
 <template>
   <div class="space-y-3">
     <span class="mb-2 block text-sm font-medium text-toned">
-      Увеличение характеристик
+      {{ WIZARD_ASI_LABELS.title }}
     </span>
 
     <!-- Переключатель ASI / Feat -->
@@ -125,7 +176,7 @@
         :variant="asiState.mode === 'asi' ? 'solid' : 'outline'"
         @click.left.exact.prevent="setMode('asi')"
       >
-        Повысить характеристики
+        {{ WIZARD_ASI_LABELS.raiseAbilities }}
       </UButton>
 
       <UButton
@@ -134,7 +185,7 @@
         :variant="asiState.mode === 'feat' ? 'solid' : 'outline'"
         @click.left.exact.prevent="setMode('feat')"
       >
-        Взять черту
+        {{ WIZARD_ASI_LABELS.takeFeat }}
       </UButton>
     </div>
 
@@ -145,7 +196,7 @@
     >
       <div class="flex items-center justify-between">
         <span class="text-sm text-muted">
-          Распределите 2 очка (+2 к одной или +1 к двум)
+          {{ WIZARD_ASI_LABELS.distributeHint }}
         </span>
 
         <div class="flex items-center gap-2">
@@ -153,7 +204,7 @@
             class="text-sm font-bold"
             :class="pointsRemaining > 0 ? 'text-warning' : 'text-healing'"
           >
-            Осталось: {{ pointsRemaining }}
+            {{ WIZARD_ASI_LABELS.pointsRemainingPrefix }}{{ pointsRemaining }}
           </span>
 
           <UButton
@@ -227,21 +278,44 @@
       </div>
     </div>
 
-    <!-- Режим Feat — placeholder -->
+    <!-- Режим черты: пикер компендиума, пул задан умением класса -->
     <div
       v-else
-      class="rounded-lg border border-gold/30 bg-gold-subtle/10 px-3 py-4 text-center"
+      class="space-y-2"
     >
-      <UIcon
-        name="tabler:hammer"
-        class="mx-auto mb-2 h-8 w-8 text-gold/60"
+      <p class="text-sm text-dimmed">
+        {{ WIZARD_ASI_LABELS.featHint }}
+      </p>
+
+      <WizardFeatPicker
+        :choice="featChoice"
+        :feats="feats"
+        :actor="actor"
+        :model-value="asiState.featKey"
+        @update:model-value="setFeatKey"
       />
 
-      <p class="text-sm text-gold-muted/80">Выбор черты</p>
+      <!-- Собственные вопросы взятой черты — те же, что в окне выбора при
+        перетаскивании её на лист: без ответов «Телекинетик» лёг бы без
+        прибавки и характеристики -->
+      <div
+        v-if="takenFeat?.ownChoices.length"
+        class="flex flex-col gap-2 rounded-md border border-default/50 bg-elevated/30 p-3"
+      >
+        <span class="text-sm font-medium text-toned">
+          {{ CLASS_WIZARD_LABELS.featOwnChoicesPrefix
+          }}{{ takenFeat.feat.name }}
+        </span>
 
-      <p class="mt-1 text-sm text-dimmed">
-        Каталог черт будет доступен в следующем обновлении.
-      </p>
+        <FeatChoicesFields
+          :model-value="featOwnAnswers"
+          :choices="takenFeat.ownChoices"
+          :actor="actor"
+          :proficiency-bonus="proficiencyBonus"
+          :spells="spells"
+          @update:model-value="updateFeatOwnAnswers"
+        />
+      </div>
     </div>
   </div>
 </template>

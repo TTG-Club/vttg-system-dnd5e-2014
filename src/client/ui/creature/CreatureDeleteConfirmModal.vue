@@ -1,6 +1,6 @@
 <script setup lang="ts">
   import type { TypedWebSocketClient } from '@vtt/shared';
-  import type { Creature } from '@vtt/shared/system/dnd.js';
+  import type { DnDCreature } from '@vtt/shared/system/dnd.js';
 
   import { useToast } from '@nuxt/ui/composables';
   import { nextTick } from 'vue';
@@ -9,11 +9,18 @@
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
 
+  import {
+    DELETE_CONFIRM_LABELS,
+    DELETE_CONFIRM_TITLE,
+    MODAL_BUTTON_LABELS,
+    TOAST_TITLES,
+  } from '../actor/constants';
+
   interface Props {
     /** Открыта ли модалка */
     open: boolean;
     /** Существо для удаления */
-    creature: Creature | null;
+    creature: DnDCreature | null;
     /** WebSocket клиент */
     socket: TypedWebSocketClient | null;
   }
@@ -48,7 +55,7 @@
 
       nextTick(() => {
         toast.add({
-          title: 'Существо удалено',
+          title: DELETE_CONFIRM_LABELS.creatureDone,
           description: creatureName,
           color: 'warning',
         });
@@ -57,11 +64,11 @@
       console.error('Failed to delete creature:', error);
 
       toast.add({
-        title: 'Ошибка',
+        title: TOAST_TITLES.error,
         description:
           error instanceof Error
             ? error.message
-            : 'Не удалось удалить существо',
+            : DELETE_CONFIRM_LABELS.creatureError,
         color: 'error',
       });
     }
@@ -78,7 +85,7 @@
 <template>
   <UDraggableModal
     :open="open"
-    title="Подтверждение удаления"
+    :title="DELETE_CONFIRM_TITLE"
     :draggable="false"
     blocking
     :z-index="Z_INDEX.MODAL_ELEVATED"
@@ -98,14 +105,16 @@
         />
 
         <p class="text-toned">
-          Вы уверены, что хотите удалить существо
+          {{ DELETE_CONFIRM_LABELS.creatureQuestion }}
           <span class="font-semibold text-highlighted"
             >"{{ creature.name }}"</span
           >
           ?
           <br />
 
-          <span class="text-xs text-dimmed">Это действие нельзя отменить.</span>
+          <span class="text-xs text-dimmed">{{
+            DELETE_CONFIRM_LABELS.irreversible
+          }}</span>
         </p>
       </div>
     </template>
@@ -117,7 +126,7 @@
           color="neutral"
           @click.left.exact.prevent="closeModal"
         >
-          Отмена
+          {{ MODAL_BUTTON_LABELS.cancel }}
         </UButton>
 
         <UButton
@@ -125,7 +134,7 @@
           icon="tabler:trash"
           @click.left.exact.prevent="executeDelete"
         >
-          Удалить
+          {{ MODAL_BUTTON_LABELS.remove }}
         </UButton>
       </div>
     </template>

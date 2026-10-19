@@ -1,13 +1,131 @@
 <script setup lang="ts">
+  import type { Feature } from '@vtt/shared';
   import type { BackgroundDefinition } from '@vtt/shared/system/dnd.js';
 
-  import { SKILLS_LABELS, TOOLS_LABELS } from '@vtt/shared/system/dnd.js';
+  import type { ChoicePickerOption } from '../ChoicePickerModal.vue';
+
+  import { computed } from 'vue';
 
   import ItemDescriptionRenderer from '@/shared_ui/components/ItemDescriptionRenderer.vue';
+  import { useModalManager } from '@/shared_ui/composables/useModalManager';
+  import {
+    SKILLS_LABELS,
+    toolProficiencyLabel,
+  } from '@vtt/shared/system/dnd.js';
 
-  defineProps<{
+  import ChoicePickerField from '../ChoicePickerField.vue';
+  import { BACKGROUND_WIZARD_LABELS, GRANT_SECTION_LABELS } from '../constants';
+
+  const props = defineProps<{
     backgroundDefinition: BackgroundDefinition;
+    featsData: Feature[];
   }>();
+
+  const selectedFeatId = defineModel<string>('selectedFeatId');
+
+  const { openModal } = useModalManager();
+
+  function openFeatDescription() {
+    const featId =
+      selectedFeatId.value || props.backgroundDefinition.featGrant.featId;
+
+    if (!featId) {
+      return;
+    }
+
+    const feat = props.featsData.find((feat) => feat.id === featId);
+
+    if (!feat) {
+      return;
+    }
+
+    openModal('ActorDescriptionModal', {
+      _modalKey: feat.id,
+      title: feat.name,
+      subtitle: feat.nameEn || '',
+      sourceKey: feat.sourceKey,
+      description: feat.description || '',
+    });
+  }
+
+  /**
+   * Открывает описание умения предыстории (редакция 2014).
+   */
+  function openFeatureDescription() {
+    const { feature } = props.backgroundDefinition;
+
+    if (!feature) {
+      return;
+    }
+
+    openModal('ActorDescriptionModal', {
+      _modalKey: `background-feature:${props.backgroundDefinition.key}`,
+      title: feature.name,
+      subtitle: props.backgroundDefinition.name,
+      sourceKey: props.backgroundDefinition.sourceKey,
+      description: feature.description,
+    });
+  }
+
+  /** Есть ли у предыстории черта: у предысторий 2014 её нет */
+  const hasFeat = computed(() => {
+    const { featGrant } = props.backgroundDefinition;
+
+    return (
+      Boolean(featGrant.featName) || Boolean(featGrant.featChoices?.length)
+    );
+  });
+
+  /**
+   * Строка «сколько инструментов на выбор»: перед числом встаёт связка
+   * перечисления, если выданные инструменты уже перечислены до него. Склейка
+   * строкой, а не шаблоном: хвост начинается с пробела, и разорви форматтер
+   * подстановки переносом — пробелов стало бы два.
+   */
+  const toolChoiceLabel = computed(() => {
+    const { toolGrant } = props.backgroundDefinition;
+
+    const listPrefix =
+      toolGrant.items.length > 0 ? BACKGROUND_WIZARD_LABELS.listAnd : '';
+
+    return (
+      listPrefix
+      + (toolGrant.choices?.count ?? 0)
+      + BACKGROUND_WIZARD_LABELS.toolChoiceSuffix
+    );
+  });
+
+  /**
+   * Черты на выбор для окна выбора. Незагруженная запись показывается своим
+   * ключом: так видно, что выбор есть, а справочник до него не доехал.
+   */
+  const featChoiceOptions = computed<ChoicePickerOption[]>(() =>
+    (props.backgroundDefinition.featGrant.featChoices ?? []).map((id) => {
+      const feat = props.featsData.find((entry) => entry.id === id);
+
+      return {
+        value: id,
+        name: feat?.name ?? id,
+        nameEn: feat?.nameEn,
+        sourceKey: feat?.sourceKey,
+        description: feat?.description,
+      };
+    }),
+  );
+
+  /** Выбранная черта набором отметок — так её ждёт строка выбора */
+  const featChoiceSelected = computed(() =>
+    selectedFeatId.value ? [selectedFeatId.value] : [],
+  );
+
+  /**
+   * Записывает выбранную черту: окно отдаёт набор отметок, а черту берут одну.
+   *
+   * @param values - отмеченные значения
+   */
+  function selectFeat(values: string[]): void {
+    selectedFeatId.value = values[0] ?? undefined;
+  }
 </script>
 
 <template>
@@ -21,8 +139,9 @@
       >
         <span
           class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-          >Навыки</span
         >
+          {{ GRANT_SECTION_LABELS.skills }}
+        </span>
 
         <div class="mt-1.5 flex flex-wrap gap-1.5">
           <UBadge
@@ -42,8 +161,9 @@
       >
         <span
           class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-          >Инструменты</span
         >
+          {{ GRANT_SECTION_LABELS.tools }}
+        </span>
 
         <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
           <UBadge
@@ -53,36 +173,74 @@
             color="neutral"
             size="sm"
           >
-            {{ TOOLS_LABELS[tool] || tool }}
+            {{ toolProficiencyLabel(tool) }}
           </UBadge>
 
           <span
             v-if="backgroundDefinition.toolGrant.choices?.count"
             class="text-sm font-semibold text-highlighted"
           >
-            {{ backgroundDefinition.toolGrant.items.length > 0 ? 'и ' : ''
-            }}{{ backgroundDefinition.toolGrant.choices.count }} на выбор из
-            списка
+            {{ toolChoiceLabel }}
           </span>
         </div>
       </div>
 
       <div
-        class="col-span-2 rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5"
+        v-if="backgroundDefinition.feature?.name"
+        class="col-span-2 flex flex-col gap-2 rounded-lg border border-default/50 bg-elevated/30 p-3"
       >
         <span
           class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-          >Особенность</span
         >
+          {{ BACKGROUND_WIZARD_LABELS.featureTitle }}
+        </span>
 
-        <p class="mt-1 text-sm font-semibold text-highlighted">
+        <button
+          class="self-start text-left text-sm font-medium text-healing hover:text-healing/80 hover:underline"
+          @click.left.exact.prevent="openFeatureDescription"
+        >
           {{ backgroundDefinition.feature.name }}
-        </p>
+        </button>
+      </div>
 
-        <ItemDescriptionRenderer
-          class="mt-1"
-          :content="backgroundDefinition.feature.description"
-        />
+      <div
+        v-if="hasFeat"
+        class="col-span-2 flex flex-col gap-2 rounded-lg border border-default/50 bg-elevated/30 p-3"
+      >
+        <span
+          class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+        >
+          {{ BACKGROUND_WIZARD_LABELS.featTitle }}
+        </span>
+
+        <template v-if="backgroundDefinition.featGrant.featChoices?.length">
+          <ChoicePickerField
+            :label="BACKGROUND_WIZARD_LABELS.featPlaceholder"
+            :options="featChoiceOptions"
+            :selected="featChoiceSelected"
+            :max="1"
+            @update:selected="selectFeat"
+          />
+
+          <UButton
+            v-if="selectedFeatId"
+            variant="link"
+            color="primary"
+            class="h-auto self-start p-0"
+            @click.left.exact.prevent="openFeatDescription"
+          >
+            {{ BACKGROUND_WIZARD_LABELS.featShowDescription }}
+          </UButton>
+        </template>
+
+        <template v-else>
+          <button
+            class="self-start text-left text-sm font-medium text-healing hover:text-healing/80 hover:underline"
+            @click.left.exact.prevent="openFeatDescription"
+          >
+            {{ backgroundDefinition.featGrant.featName }}
+          </button>
+        </template>
       </div>
     </div>
   </div>

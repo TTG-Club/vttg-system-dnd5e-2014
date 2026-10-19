@@ -1,8 +1,23 @@
+import type { UserConfig } from 'vite';
+
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import ui from '@nuxt/ui/vite';
 import vue from '@vitejs/plugin-vue';
-import { defineConfig } from 'vite';
+import { defineConfig, mergeConfig } from 'vite';
+import { z } from 'zod';
+
+import { devHostModules } from './scripts/lib/devHostModules.mjs';
+import {
+  ENGINE_PART,
+  ENGINE_PART_NOTICE,
+  ENGINE_PART_PATHS,
+  SERVER_PART,
+  SERVER_PART_NOTICE,
+  SERVER_PART_PATHS,
+  STALE_PART_EVENT,
+} from './src/client/systemDevConsts';
 
 /**
  * Сборка клиентской части системы ВНЕ приложения VTTG.
@@ -12,17 +27,21 @@ import { defineConfig } from 'vite';
  * помечены EXTERNAL и резолвятся в рантайме из `globalThis.__VTTHost`; `vue` —
  * из `globalThis.Vue`. Так система не задваивает синглтоны приложения.
  *
- * Три настройки ниже обязательны для библиотечной IIFE-сборки (см. комментарии
- * по месту): `define` process.env, `interop: 'esModule'` и отключение
- * авто-импорта компонентов Nuxt UI.
+ * Четыре настройки ниже обязательны для библиотечной IIFE-сборки (см.
+ * комментарии по месту): `define` process.env, `interop: 'esModule'`,
+ * отключение авто-импорта компонентов Nuxt UI и переписывание динамических
+ * `import('@/…')`.
  */
 
 /** Внутренние модули приложения — резолвятся из `globalThis.__VTTHost`. */
 const HOST_MODULE_IDS: string[] = [
   '@/core/actorDragState',
   '@/core/api/chatService',
+  '@/core/api/rollRequestService',
   '@/core/clientHooks',
+  '@/core/compendiumAuthoringClient',
   '@/core/compendiumDataClient',
+  '@/core/entityDragState',
   '@/core/entityUtils',
   '@/core/extensionRegistry',
   '@/core/mimeTypes',
@@ -49,6 +68,7 @@ const HOST_MODULE_IDS: string[] = [
   '@/shared_ui/composables/useModalManager',
   '@/shared_ui/consts',
   '@/shared_ui/utils/componentUtils',
+  '@/shared_ui/utils/diceRollMarkup',
   '@/shared_ui/utils/domUtils',
   '@/stores/actionPromptStore',
   '@/stores/auraStore',
@@ -57,12 +77,12 @@ const HOST_MODULE_IDS: string[] = [
   '@/stores/hotbarStore',
   '@/stores/initiativeStore',
   '@/stores/itemsStore',
-  '@/stores/journalStore',
   '@/stores/projectileStore',
   '@/stores/spellTemplateStore',
   '@/stores/targetStore',
   '@/stores/worldStore',
   '@/system-runtime/activeSocket',
+  '@/system-runtime/sceneSight',
   '@nuxt/ui/composables',
   '@vtt/shared',
   '@vueuse/core',
@@ -71,12 +91,70 @@ const HOST_MODULE_IDS: string[] = [
 
 const EXTERNAL = new Set<string>([...HOST_MODULE_IDS, 'vue']);
 
-export default defineConfig({
-  // ОБЯЗАТЕЛЬНО: в `build.lib` Vite не подставляет NODE_ENV (рассчитывает на
-  // бандлер-потребитель), а `client.js` грузится тегом <script> прямо в браузер,
-  // где `process` не существует → ReferenceError ещё до вызова register().
-  define: {
-    'process.env.NODE_ENV': JSON.stringify('production'),
+/**
+ * Порт dev-сервера системы (`npm run dev:hot`). Тот же порт стоит во флаге запуска
+ * приложения `VTT_SYSTEM_DEV`.
+ */
+const DEV_SERVER_PORT = 5174;
+
+/** Точка входа клиента (от корня проекта). */
+const CLIENT_ENTRY = 'src/client/systemEntry.ts';
+
+/** Что конфигу нужно от манифеста: id системы. */
+const manifestSchema = z.object({ id: z.string().min(1) });
+
+/**
+ * id системы. Записан в одном месте — в манифесте; отсюда он нужен dev-серверу,
+ * который живёт под адресом `/system-dev/<id>/`.
+ */
+const { id: systemId } = manifestSchema.parse(
+  JSON.parse(readFileSync(path.resolve(__dirname, 'system.json'), 'utf-8')),
+);
+
+/**
+ * Берётся ли модуль у приложения во время работы.
+ *
+ * @param id - спецификатор импорта
+ * @returns `true` для `vue` и модулей из `HOST_MODULE_IDS`
+ */
+function isHostModule(id: string): boolean {
+  return EXTERNAL.has(id);
+}
+
+/**
+ * Выражение, которым код системы достаёт модуль приложения.
+ *
+ * @param id - спецификатор импорта
+ * @returns `globalThis.Vue` либо обращение к реестру `__VTTHost`
+ */
+function hostGlobal(id: string): string {
+  return id === 'vue'
+    ? 'globalThis.Vue'
+    : `globalThis.__VTTHost[${JSON.stringify(id)}]`;
+}
+
+const baseConfig: UserConfig = {
+  // ОБЯЗАТЕЛЬНО: фиксирует семантику полей класса (`[[Define]]` против
+  // `[[Set]]`) для клиентского бандла. Раньше строки не было, и Vite подставлял
+  // свой исторический дефолт `false` (он включает `true` только начиная с
+  // `target: ES2022` в tsconfig); `false` здесь — ровно он, записанный явно.
+  //
+  // Явно он нужен потому, что `tsconfig.json` в корне существует ради редактора
+  // и объявляет `target: ESNext`. Без этой строки Vite вывел бы флаг из того
+  // `target` — то есть настройка РЕДАКТОРА меняла бы бандл. Серверная сборка
+  // закрывает то же место своим `tsconfigRaw` в `scripts/build-server.mjs`, но
+  // противоположным значением: esbuild вызывается там напрямую, а его
+  // собственный дефолт — `true`.
+  //
+  // ⚠️ `tsconfigRaw` ЗАМЕЩАЕТ файл целиком для трансформации esbuild. Это
+  // безопасно: разрешение путей делает сам Vite (`resolve.alias`), а цель
+  // выпуска задаёт `build.target`. Проверено сравнением хешей `dist/`.
+  esbuild: {
+    tsconfigRaw: {
+      compilerOptions: {
+        useDefineForClassFields: false,
+      },
+    },
   },
   plugins: [
     // enforce:'pre' — помечаем EXTERNAL ДО алиас-резолва, чтобы ключ остался в
@@ -172,13 +250,11 @@ export default defineConfig({
         find: '@vtt/shared/system/dnd.js',
         replacement: path.resolve(__dirname, './src/engine/index.ts'),
       },
-      // Внутри приложения система ссылалась на СВОИ же файлы через алиас
-      // приложения (`@/systems/dnd5e/…`, 46 мест). Снаружи такого пути нет —
-      // заворачиваем самоссылки на собственные исходники.
-      {
-        find: /^@\/systems\/dnd5e/,
-        replacement: path.resolve(__dirname, './src/client'),
-      },
+      // Алиаса самоссылок (`@/systems/dnd5e/…` → `src/client`) здесь больше
+      // нет: внутри приложения система ссылалась так на свои же файлы, теперь
+      // все такие импорты переписаны на относительные пути. Без алиаса новая
+      // самоссылка не «починится» молча, а упадёт сборкой как неизвестный
+      // модуль хоста — это и нужно, адрес приложения к нашим файлам не ведёт.
     ],
   },
   build: {
@@ -187,9 +263,9 @@ export default defineConfig({
     copyPublicDir: false,
     cssCodeSplit: false,
     lib: {
-      entry: path.resolve(__dirname, './src/client/systemEntry.ts'),
+      entry: path.resolve(__dirname, CLIENT_ENTRY),
       formats: ['iife'],
-      name: '__vttgSystemDnd5e2014',
+      name: '__vttgSystemDnd5e2024',
       fileName: () => 'client.js',
       cssFileName: 'client',
     },
@@ -197,10 +273,7 @@ export default defineConfig({
       external: [...EXTERNAL],
       output: {
         inlineDynamicImports: true,
-        globals: (id: string) =>
-          id === 'vue'
-            ? 'globalThis.Vue'
-            : `globalThis.__VTTHost[${JSON.stringify(id)}]`,
+        globals: hostGlobal,
         // ОБЯЗАТЕЛЬНО: в `__VTTHost`/`globalThis.Vue` лежат ES-неймспейсы, а
         // Rollup по умолчанию трактует external как CJS → при `import X from`
         // подставил бы весь объект вместо `X.default`, и `.vue`-компоненты
@@ -209,4 +282,69 @@ export default defineConfig({
       },
     },
   },
-});
+};
+
+/**
+ * Настройки, которые нужны только сборке.
+ *
+ * ОБЯЗАТЕЛЬНО: в `build.lib` Vite не подставляет NODE_ENV (рассчитывает на
+ * бандлер-потребитель), а `client.js` грузится тегом `script` прямо в браузер,
+ * где `process` не существует → ReferenceError ещё до вызова register().
+ * Dev-серверу подстановка не нужна: он делает её сам и со своим значением.
+ */
+const buildConfig: UserConfig = {
+  define: {
+    'process.env.NODE_ENV': JSON.stringify('production'),
+  },
+};
+
+/**
+ * Настройки режима разработки (`npm run dev:hot`): dev-сервер отдаёт исходники
+ * прямо в приложение, и правки клиента видны без сборки и перезагрузки
+ * страницы. На сборку они не влияют.
+ *
+ * Со стороны приложения режим включает флаг запуска
+ * `VTT_SYSTEM_DEV=<id>=http://localhost:5174/src/client/systemEntry.ts`
+ * (README, § «Разработка: правки видно сразу»).
+ */
+const devServerConfig: UserConfig = {
+  // Приложение отдаёт dev-сервер системы под `/system-dev/<id>/` — сам он
+  // обязан жить под тем же адресом.
+  base: `/system-dev/${systemId}/`,
+  server: {
+    port: DEV_SERVER_PORT,
+    // Занятый порт — это ошибка: молча взятый соседний не совпал бы с флагом
+    // запуска приложения.
+    strictPort: true,
+    // Канал горячей замены страница открывает прямо к dev-серверу системы.
+    hmr: { host: 'localhost', clientPort: DEV_SERVER_PORT },
+  },
+  // Зависимости находим заранее, по точке входа. Без этого dev-сервер
+  // натыкался бы на них по ходу работы и каждый раз перезагружал страницу.
+  optimizeDeps: {
+    entries: [CLIENT_ENTRY],
+  },
+  plugins: [
+    devHostModules({
+      isHostModule,
+      hostGlobal,
+      staleEvent: STALE_PART_EVENT,
+      staleParts: [
+        {
+          name: SERVER_PART,
+          paths: SERVER_PART_PATHS,
+          notice: SERVER_PART_NOTICE,
+        },
+        {
+          name: ENGINE_PART,
+          paths: ENGINE_PART_PATHS,
+          notice: ENGINE_PART_NOTICE,
+        },
+      ],
+    }),
+  ],
+};
+
+export default defineConfig(({ command }) =>
+  mergeConfig(baseConfig, command === 'serve' ? devServerConfig : buildConfig),
+);

@@ -3,7 +3,9 @@
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
-  import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+
+  import { useSystemDataStore } from '../../stores/systemDataStore';
+  import { MODAL_BUTTON_LABELS, PROFICIENCY_MODAL_LABELS } from './constants';
 
   /** Блокирующий модал — фиксированный z-index поверх остальных */
   const MODAL_Z_INDEX = Z_INDEX.MODAL_ELEVATED;
@@ -44,32 +46,32 @@
   const panels = computed(() => [
     {
       key: 'light' as const,
-      title: 'Лёгкая',
-      color: 'text-gold',
+      title: PROFICIENCY_MODAL_LABELS.armorLight,
+      color: 'text-primary',
       items: systemDataStore.armorBaseTypes.filter(
         (bt) => bt.category === 'light',
       ),
     },
     {
       key: 'medium' as const,
-      title: 'Средняя',
-      color: 'text-gold',
+      title: PROFICIENCY_MODAL_LABELS.armorMedium,
+      color: 'text-primary',
       items: systemDataStore.armorBaseTypes.filter(
         (bt) => bt.category === 'medium',
       ),
     },
     {
       key: 'heavy' as const,
-      title: 'Тяжёлая',
-      color: 'text-gold',
+      title: PROFICIENCY_MODAL_LABELS.armorHeavy,
+      color: 'text-primary',
       items: systemDataStore.armorBaseTypes.filter(
         (bt) => bt.category === 'heavy',
       ),
     },
     {
       key: 'shield' as const,
-      title: 'Щиты',
-      color: 'text-gold',
+      title: PROFICIENCY_MODAL_LABELS.armorShields,
+      color: 'text-primary',
       items: systemDataStore.armorBaseTypes.filter(
         (bt) => bt.category === 'shield',
       ),
@@ -150,7 +152,7 @@
     :blocking="true"
     :min-width="600"
     :min-height="350"
-    title="Владение бронёй"
+    :title="PROFICIENCY_MODAL_LABELS.armorTitle"
     :z-index="MODAL_Z_INDEX"
   >
     <template #body>
@@ -176,7 +178,7 @@
             >
               <span />
 
-              <UTooltip text="Владение">
+              <UTooltip :text="PROFICIENCY_MODAL_LABELS.proficient">
                 <UIcon
                   name="tabler:circle-dot"
                   class="mx-auto block h-3.5 w-3.5 text-healing"
@@ -189,7 +191,7 @@
               class="flex items-center gap-2 rounded px-1 py-0.5 transition-colors hover:bg-accented/30"
             >
               <span class="flex-1 text-sm font-semibold text-highlighted">
-                Все {{ panel.title }}
+                {{ PROFICIENCY_MODAL_LABELS.allPrefix }}{{ panel.title }}
               </span>
 
               <UCheckbox
@@ -224,7 +226,7 @@
             size="sm"
             @click.left.exact.prevent="isOpen = false"
           >
-            Отмена
+            {{ MODAL_BUTTON_LABELS.cancel }}
           </UButton>
 
           <UButton
@@ -232,7 +234,7 @@
             size="sm"
             @click.left.exact.prevent="applySelection"
           >
-            Применить
+            {{ MODAL_BUTTON_LABELS.apply }}
           </UButton>
         </div>
       </div>

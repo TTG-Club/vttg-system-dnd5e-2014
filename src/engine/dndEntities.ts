@@ -13,11 +13,14 @@
 import type {
   AbilityType,
   AmmunitionType,
+  BaseActor,
+  BaseCreature,
+  BaseGameItem,
   CompendiumSeparator,
   DamagePart,
   DistanceUnit,
-  EquipmentCategory,
   Feature,
+  SourceDefinition,
   SpellAreaOfEffect,
   SpellCastingTimeUnit,
   SpellComponents,
@@ -34,24 +37,21 @@ import type {
   WeaponProperty,
   WeaponRangeType,
 } from '@vtt/shared';
-import type {
-  BaseActor,
-  BaseCreature,
-  BaseGameItem,
-} from '@vtt/shared';
-import type { ActiveEffect } from './activeEffectTypes.js';
+
+import type { ActiveEffect, EffectUseArea } from './activeEffectTypes.js';
 import type {
   BackgroundEquipmentOption,
+  BackgroundFeatGrant,
   BackgroundFeature,
-  BackgroundPersonality,
   BackgroundSkillGrant,
   BackgroundToolGrant,
 } from './backgroundTypes.js';
 import type { ClassDefinition, ClassKey } from './classTypes.js';
+import type { DND_EQUIPMENT_CATEGORIES } from './consts.js';
 import type { CreatureSystem } from './creatureTypes.js';
 import type { FeatData } from './featTypes.js';
 import type { SpeciesDefinition } from './speciesTypes.js';
-import type { DnDActorSystem } from './types.js';
+import type { DnDActorSystem, DnDCustomBonus } from './types.js';
 
 /**
  * Существо (NPC) D&D 5e — наследует нейтральную базу `BaseCreature` и добавляет
@@ -67,6 +67,15 @@ export interface DnDCreature extends BaseCreature {
    * у каждого заклинания свои заряды `uses` с откатом от отдыха.
    */
   spells?: Spell[];
+  /**
+   * Инвентарь существа. Корневая коллекция — как `spells` и как `equipment`
+   * актёра: движок снаряжения читает оба листа одним кодом.
+   *
+   * Статблок при этом остаётся источником истины боя: надетое НЕ порождает
+   * действие в статблоке и НЕ трогает класс доспеха, пока мастер не выбрал
+   * расчёт КД «от снаряжения» (`system.armorClass.calculation === 'default'`).
+   */
+  equipment?: DnDGameItem[];
   /** Активные эффекты, примененные непосредственно к существу */
   activeEffects?: ActiveEffect[];
 }
@@ -78,6 +87,27 @@ export interface DnDCreature extends BaseCreature {
  */
 export type Creature = DnDCreature;
 /**
+ * Категория снаряжения D&D 2024 — список системы, единственный его источник.
+ *
+ * Ядро категорию не проверяет и хранит строкой: его тип `EquipmentCategory`
+ * открыт для любых ключей (VTTG 0.9.641), а перечисленные там литералы —
+ * подсказки редактора, не контракт. Поэтому список свой
+ * (`DND_EQUIPMENT_CATEGORIES`), и новая категория («Зелье») добавляется без
+ * оглядки на ядро.
+ */
+export type DnDEquipmentCategory = (typeof DND_EQUIPMENT_CATEGORIES)[number];
+
+/**
+ * Кто выдал предмет стартовым снаряжением: класс или предыстория персонажа.
+ * Вид снаряжения не выдаёт.
+ */
+export interface ItemGrantSource {
+  kind: 'class' | 'background';
+  /** Ключ записи-источника: класса или предыстории */
+  key: string;
+}
+
+/**
  * Предмет D&D 5e — наследует нейтральную базу `BaseGameItem` и добавляет
  * D&D-специфичную форму (оружие, снаряжение, черты, инструменты, предыстории,
  * заклинания, виды, классы). Зеркало `DnDActor`/`DnDCreature`. Ядро с этим
@@ -86,21 +116,32 @@ export type Creature = DnDCreature;
  */
 export interface DnDGameItem extends BaseGameItem {
   /**
-   * Активные эффекты предмета в D&D-форме (`changes: EffectChange[]`).
+   * Активные эффекты предмета в D&D-форме.
    *
-   * Сужает нейтральное `BaseGameItem.activeEffects?: BaseActiveEffect[]` —
-   * симметрично `DnDActor` и `DnDCreature`, которые сужали его и раньше. Без
-   * этого эффекты предмета приезжали в компоненты системы как база с
-   * `changes: unknown[]`, и D&D-поля читались вслепую.
+   * Сужение поля базы: ядро хранит эффекты опаково (`BaseActiveEffect` —
+   * `changes: unknown[]`, `flags: string[]`), потому что их содержимое
+   * определяет система. Здесь оно определено, и UI системы читает `changes`
+   * и `flags` напрямую. Без этого сужения любой `item.activeEffects`,
+   * переданный в D&D-компонент, ловил бы `unknown[]` вместо `EffectChange[]`.
+   *
+   * Зеркало такого же сужения у `DnDActor`/`DnDCreature`.
    */
   activeEffects?: ActiveEffect[];
   /** Универсальное оружие держится двумя руками (только для versatile) */
   twoHandedGrip?: boolean;
+  /**
+   * Кем предмет выдан стартовым снаряжением. По этой пометке окно удаления
+   * класса или предыстории предлагает забрать выданное. Поля нет у предметов,
+   * добытых иначе, и у выданных до его появления.
+   */
+  grantedBy?: ItemGrantSource;
   // --- Weapon-specific (только для type === 'weapon') ---
   /** Базовый тип оружия (напр. 'longsword', 'dagger') */
   baseType?: string;
   /** Категория оружия */
   weaponCategory?: WeaponCategory;
+  /** Оружейный приём (weapon mastery) */
+  mastery?: string;
   /** Тип дальности */
   rangeType?: WeaponRangeType;
   /**
@@ -117,15 +158,49 @@ export interface DnDGameItem extends BaseGameItem {
   range?: { normal: number; long?: number };
   /** Особое описание (для свойства special) */
   special?: string;
-  /** Тип боеприпаса (только для оружия со свойством ammunition) */
+  /**
+   * Тип боеприпаса: у оружия со свойством «Боеприпасы» — чем оно стреляет, у
+   * расходуемого предмета — каким оружием им стреляют. Нужен только
+   * автоподбору, пока оружие не заряжено (стрелы из компендиума)
+   */
   ammunitionType?: AmmunitionType;
+  /**
+   * Чем заряжено оружие со свойством «Боеприпасы»: id расходуемого предмета
+   * того же инвентаря. Нет или предмета больше нет — боеприпас подбирается
+   * по типу
+   */
+  loadedAmmunitionId?: string;
+  /**
+   * Магический бонус боеприпаса, которым оружие стреляет. Есть только у оружия
+   * выстрела (`withAmmunition`), в инвентарь не пишется: к атаке и урону идёт
+   * отдельной строкой разбора, не смешиваясь с бонусом самого оружия
+   */
+  ammunitionBonus?: number;
   // --- Поля атаки (бывший Action) ---
-  /** Характеристика для броска атаки */
+  /**
+   * Характеристика для броска атаки. Поля нет — характеристика по правилам:
+   * дальнобойное от Ловкости, рукопашное от Силы, фехтовальное — бо́льшая
+   * из двух.
+   */
   attackAbility?: AbilityType;
   /** Режим учёта бонуса мастерства (auto / always / never) */
   proficiencyMode?: WeaponProficiencyMode;
   /** Дополнительный бонус к атаке */
   attackBonus?: number;
+  /**
+   * Характеристика, чей модификатор идёт в урон. Поля нет — та же, что у атаки
+   * (как по правилам); `none` — урон без прибавки характеристики.
+   */
+  damageAbility?: AbilityType | 'none';
+  /** Дополнительный бонус к урону — пара к {@link attackBonus} */
+  damageBonus?: number;
+  /**
+   * Свои прибавки к броску атаки этим оружием сверх правил (умение, домашнее
+   * правило). Считаются наравне с остальными слагаемыми атаки.
+   */
+  attackCustomBonuses?: DnDCustomBonus[];
+  /** Свои прибавки к урону этим оружием сверх правил */
+  damageCustomBonuses?: DnDCustomBonus[];
   /**
    * Тип спасброска оружия (для оружия, заставляющего цель совершить спасбросок).
    * `none`/undefined — обычная атака с броском попадания.
@@ -137,7 +212,7 @@ export interface DnDGameItem extends BaseGameItem {
   distanceUnit?: DistanceUnit;
   // --- Equipment-specific (только для type === 'equipment') ---
   /** Категория снаряжения (лёгкий доспех, средний, тяжёлый, щит, кольцо, жезл...) */
-  equipmentCategory?: EquipmentCategory;
+  equipmentCategory?: DnDEquipmentCategory;
   /** Базовый класс доспеха (для щита — бонус к КД, напр. 2) */
   baseArmorAC?: number;
   /** Максимальный бонус Ловкости к КД (null = без ограничений) */
@@ -159,7 +234,26 @@ export interface DnDGameItem extends BaseGameItem {
   isAttuned?: boolean;
   /** Магический бонус (+1, +2, +3...) — к атаке/урону для оружия, к КД для брони */
   magicBonus?: number;
+  /**
+   * Заряды предмета (жезл, посох, амулет с ограниченным числом применений).
+   * Отсутствует — предмет применяется без ограничений. См. {@link ItemUses}.
+   */
+  uses?: ItemUses;
+  /**
+   * Расходуемый предмет (зелье, свиток, стрела): применение тратит единицу
+   * количества, на нуле предмет остаётся в инвентаре закончившимся.
+   */
+  consumable?: boolean;
+  /**
+   * Магия предмета работает, пока он просто в инвентаре, без отметки «надет»:
+   * Камень удачи, Клинок удачи. Нет — эффекты включает отметка «надет».
+   */
+  activeWhenCarried?: boolean;
   // --- Feature-specific (только для type === 'feat') ---
+  /** Можно ли выбрать черту повторно */
+  repeatable?: boolean;
+  /** Текст с пояснением условий повторного выбора */
+  repeatableText?: string;
   /**
    * Полные «грант»-данные черты (владения, языки, защиты, повышение
    * характеристик, предусловия, выдаваемые заклинания). Хранится во вложенном
@@ -190,10 +284,10 @@ export interface DnDGameItem extends BaseGameItem {
   skillGrant?: BackgroundSkillGrant;
   /** Владение инструментами от предыстории */
   toolGrant?: BackgroundToolGrant;
-  /** Особенность предыстории */
+  /** Черта, даруемая предысторией */
+  featGrant?: BackgroundFeatGrant;
+  /** Умение предыстории (редакция 2014) — ложится на лист вместо черты */
   feature?: BackgroundFeature;
-  /** Таблицы характера предыстории */
-  personality?: BackgroundPersonality;
   /** Стартовое снаряжение предыстории */
   equipmentOptions?: BackgroundEquipmentOption[];
   // --- Spell-specific (только для type === 'spell') ---
@@ -232,7 +326,7 @@ export type GameItem = DnDGameItem;
  * Элемент данных компедиума — предмет или разделитель секции.
  * Дискриминируется по полю `type`: 'separator' vs 'weapon' и т.д.
  */
-export type CompendiumEntry = GameItem | CompendiumSeparator;
+export type CompendiumEntry = DnDGameItem | CompendiumSeparator;
 /**
  * Тир масштабирования заговора по уровню заклинателя.
  *
@@ -307,6 +401,61 @@ export interface SpellUses {
   /** Способ восстановления зарядов */
   recovery: SpellUsesRecovery;
 }
+/**
+ * Способ восстановления зарядов предмета.
+ *
+ * - `dawn` — «на рассвете»: самая частая формулировка у магических предметов;
+ * - `shortRest` — после короткого отдыха;
+ * - `longRest` — после продолжительного отдыха;
+ * - `manual` — только вручную (заряды не возвращает ни отдых, ни рассвет).
+ *
+ * Рассвет откатывается **вместе с продолжительным отдыхом**: отдельного счётчика
+ * игрового времени в листе нет, а продолжительный отдых — единственное событие,
+ * которое в партии стабильно совпадает с наступлением утра. Предмет, заряды
+ * которого должны вернуться строго по календарю, ставится на `manual`.
+ */
+export type ItemUsesRecovery = 'dawn' | 'shortRest' | 'longRest' | 'manual';
+/**
+ * Заряды магического предмета (жезл на 7 зарядов, амулет на 3 применения).
+ *
+ * Отдельный тип от {@link SpellUses}: у предмета нет режима «по желанию», зато
+ * есть рассвет, возврат броском (`formula`) и расход больше одного заряда за
+ * применение (`cost`).
+ */
+export interface ItemUses {
+  /** Максимум зарядов */
+  max: number;
+  /** Текущее число зарядов */
+  current: number;
+  /** Способ восстановления зарядов */
+  recovery: ItemUsesRecovery;
+  /**
+   * Формула возврата зарядов («1к6+4»). Пусто — восстанавливается до максимума.
+   * Результат броска прибавляется к текущему остатку, но не выше `max`.
+   */
+  formula?: string;
+  /** Сколько зарядов тратит одно применение (по умолчанию 1) */
+  cost?: number;
+}
+/** Что, кроме заклинания, разыгрывается путём заклинания */
+export type SpellRollSource = 'weapon' | 'creatureAction' | 'item' | 'effect';
+
+/** Чем выдано заклинание листу: умением класса, видом, предысторией, чертой */
+export type SpellGrantKind = 'class' | 'species' | 'background' | 'feat';
+
+/**
+ * Отметка «Подготавливать не нужно», которую записи листа дала чужая выдача:
+ * домен выдал заклинание, уже выбранное игроком. Запись остаётся за прежним
+ * источником — иначе откат выдачи унёс бы её с листа, — а отметка помнит, кто
+ * её дал и что вернуть, когда дававших не останется.
+ */
+export interface SpellBorrowedPreparation {
+  /** Названия умений, давших отметку: тем же ключом выдача и снимается */
+  sources: string[];
+  /** Была ли запись подготовлена до отметки — к этому она вернётся */
+  wasPrepared: boolean;
+}
+
 export interface Spell {
   id: string;
   name: string;
@@ -344,11 +493,18 @@ export interface Spell {
   // --- Область воздействия ---
   /** Область воздействия (если null — заклинание одиночной цели) */
   areaOfEffect?: SpellAreaOfEffect;
+  /**
+   * Области вариантов применения по id эффекта — только у псевдо-заклинания
+   * применения (`buildUseSpell`), в данные не пишется. Шаблон ставят по
+   * области ВЫБРАННОГО варианта: у «луча» камня сияния области нет, у
+   * «вспышки» — конус
+   */
+  useEffectAreas?: Record<string, EffectUseArea>;
   // --- Цели ---
   /** Тип цели */
   targetType: SpellTargetType;
   /**
-   * Информационное число целей эффекта (Благословение: 3). Пишется только
+   * Максимальное число разных целей эффекта (Благословение: 3). Пишется только
    * при значении больше 1 и только у заклинаний БЕЗ `projectiles` (у
    * снарядных число целей определяют снаряды и их `targetDistribution`).
    */
@@ -367,7 +523,7 @@ export interface Spell {
    * Снарядный режим: каждый снаряд — отдельный бросок урона (и атаки, если
    * заклинание атакующее), снаряды распределяются по целям. `damageParts`
    * описывают урон одного снаряда. Единственный источник истины снарядности
-   * (`targetCount` — информационное число целей, распределение не включает).
+   * (`targetCount` задаёт число разных целей эффекта, а не снаряды).
    */
   projectiles?: SpellProjectiles;
   /** Тип спасброска (какой спасбросок должна совершить цель) */
@@ -376,8 +532,22 @@ export interface Spell {
   saveEffect?: 'half' | 'none' | 'special';
   /** Характеристика для броска атаки заклинанием */
   attackAbility?: AbilityType;
+  /**
+   * Характеристика записи справочника: у заклинания, которое считается не от
+   * класса, а от своей характеристики (хоумбрю и заклинания от черт), её задаёт
+   * сам компендиум. Слабее {@link attackAbility}: та — переопределение на листе,
+   * и её ставит игрок, а эта приезжает вместе с записью.
+   */
+  spellcastingAbility?: AbilityType;
   /** Дополнительный бонус к атаке заклинанием */
   attackBonus?: number;
+  /**
+   * Своя Сл спасброска заклинания — не зависит от заклинателя: заклинание из
+   * жезла, свитка или предмета («Жезл огненных шаров» — Сл 15). Не задана — Сл
+   * считается от заклинателя. Действует на спасбросок самого заклинания, на Сл 0
+   * его эффектов и на зону на месте шаблона.
+   */
+  saveDC?: number;
   // --- Масштабирование ---
   /** Масштабирование при усилении на высших кругах */
   scaling?: SpellScaling;
@@ -393,6 +563,18 @@ export interface Spell {
   higherLevelDescription?: string;
   /** Активные эффекты, накладываемые заклинанием */
   activeEffects?: ActiveEffect[];
+  /**
+   * Из чего собран бросок, если это не заклинание: удар оружием, действие
+   * существа и применение предмета идут тем же путём псевдо-заклинанием. У
+   * настоящего заклинания поля нет — от этого зависят флаги «против
+   * заклинаний».
+   */
+  rollSource?: SpellRollSource;
+  /**
+   * Удар оружием: атакующий владеет приёмом этого оружия. Читает условие
+   * наложения `source.weaponMastery`.
+   */
+  weaponMastery?: boolean;
   // --- Использование ---
   /**
    * Заряды использования с откатом от отдыха (врождённые/расовые заклинания,
@@ -410,9 +592,29 @@ export interface Spell {
    * и используется для отображения источника и отката при замене источника.
    */
   grantedByFeature?: string;
+  /**
+   * Чем выдано заклинание: умением класса, видом, предысторией или чертой.
+   * Колонки «Заговоры» и «Подг. закл.» таблицы класса — про заклинания самого
+   * класса, поэтому выданное видом, предысторией или чертой места в них не
+   * занимает. Поля нет у заклинаний книги и у выданных до его появления.
+   */
+  grantKind?: SpellGrantKind;
+  /**
+   * Отметка «Подготавливать не нужно» дана чужой выдачей, а не источником самой
+   * записи. Поля нет — отметка своя: от источника записи или поставлена руками.
+   */
+  borrowedPreparation?: SpellBorrowedPreparation;
   // --- Метаданные ---
+  /** Ключ источника-книги — аббревиатура в нижнем регистре (напр. 'phb', 'dmg') */
   sourceKey?: string;
+  /** Название источника, если его нет ни во встроенном справочнике, ни в паке */
+  source?: SourceDefinition;
   isSRD?: boolean;
+  /**
+   * `false` — запись вне SRD скачана без подписки TTG, и источник вырезал её
+   * эффекты (остальное на месте). У полных записей поля нет.
+   */
+  automation?: boolean;
   /** Ключи классов, которым доступно это заклинание */
   classKeys?: ClassKey[];
   /** Тип объекта (для различения Spell от GameItem при сохранении) */
@@ -427,7 +629,7 @@ export interface DnDActor extends BaseActor {
   /** Заклинания */
   spells: Spell[];
   /** Снаряжение */
-  equipment: GameItem[];
+  equipment: DnDGameItem[];
   /** Особенности */
   features: Feature[];
   /** Активные эффекты (комбинация изменений и флагов) */

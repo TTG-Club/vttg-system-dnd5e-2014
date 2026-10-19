@@ -1,20 +1,85 @@
 <script setup lang="ts">
-  import type { DropdownMenuItem } from '@nuxt/ui';
+  // Корневой вход `@nuxt/ui` — это Nuxt-модуль, типы компонентов он не отдаёт
+  // (в Nuxt-приложении их подставляет авто-генерация `#ui`, а мы собираемся
+  // обычным Vite). Берём тип из подпути компонента — он в `exports` пакета.
+  import type { DropdownMenuItem } from '@nuxt/ui/components/DropdownMenu.vue';
+
+  import type { TypedWebSocketClient } from '@vtt/shared';
   import type { GrantedSpellRef } from '@vtt/shared/system/dnd.js';
 
+  import type { PickedCompendiumRef } from './CompendiumRefPickerModal.vue';
   import type { SpellOption } from './grantedSpellsEditorTypes';
 
   import { ref } from 'vue';
 
-  import { useSourceLabels } from '@/systems/dnd5e/composables/useSourceLabel';
+  import { useModalManager } from '@/shared_ui/composables/useModalManager';
 
-  const props = defineProps<{
-    /** Заклинания компендиума по пакам — для подсказок и выбора пака. */
-    availableSpells?: SpellOption[];
-  }>();
+  import { useSourceLabels } from '../../composables/useSourceLabel';
+  import {
+    SPELL_LEVEL_FILTER_ORDER,
+    spellLevelFilterValue,
+  } from './compendiumFilters';
+  import CompendiumRefPickerModal from './CompendiumRefPickerModal.vue';
+  import {
+    GRANTED_SPELLS_LABELS,
+    REF_PICKER_LABELS,
+    REF_PICKER_TITLES,
+  } from './constants';
+
+  const props = withDefaults(
+    defineProps<{
+      /** Заклинания компендиума по пакам — для подсказок и выбора пака. */
+      availableSpells?: SpellOption[];
+      /** WebSocket-клиент: выбор заклинания из компендиума окном */
+      socket?: TypedWebSocketClient | null;
+    }>(),
+    { availableSpells: () => [], socket: null },
+  );
 
   /** Список выдаваемых заклинаний (имя + опц. связь с компендиумом/паком). */
   const spells = defineModel<GrantedSpellRef[]>({ required: true });
+
+  /** Открыто ли окно выбора заклинания из компендиума. */
+  const { getNextZIndex } = useModalManager();
+
+  const isPickerOpen = ref(false);
+
+  /**
+   * Слой окна выбора. Без него окно открылось бы ПОД формой, из которой его
+   * позвали: слои раздаёт менеджер окон, а не порядок в разметке.
+   */
+  const pickerZIndex = ref<number | undefined>(undefined);
+
+  function openPicker(): void {
+    pickerZIndex.value = getNextZIndex();
+    isPickerOpen.value = true;
+  }
+
+  /**
+   * Дописывает выбранные в компендиуме заклинания. Уже выданные пропускаются:
+   * второй раз одно и то же заклинание черта не выдаёт.
+   *
+   * @param picked - выбранные записи компендиума
+   */
+  function addPickedSpells(picked: PickedCompendiumRef[]): void {
+    const taken = new Set(
+      spells.value
+        .map((spell) => spell.spellId)
+        .filter((spellId): spellId is string => Boolean(spellId)),
+    );
+
+    for (const entry of picked) {
+      if (taken.has(entry.url)) {
+        continue;
+      }
+
+      spells.value.push({
+        name: entry.name,
+        spellId: entry.url,
+        packId: entry.packId,
+      });
+    }
+  }
 
   const emit = defineEmits<{
     /** Открыть детальный просмотр заклинания (id + предпочтённый пак). */
@@ -22,9 +87,6 @@
   }>();
 
   const { getSourceLabel } = useSourceLabels();
-
-  /** Ввод названия нового заклинания. */
-  const newSpellName = ref('');
 
   /** Нормализует строку для поиска совпадений (нижний регистр + обрезка). */
   function normalizeForSearch(value: string): string {
@@ -111,7 +173,7 @@
 
   /** Подпись источника записи компендиума (напр. «PHB»; иначе «Компендиум»). */
   function optionSourceLabel(option: SpellOption): string {
-    return getSourceLabel(option.sourceKey) ?? 'Компендиум';
+    return getSourceLabel(option.sourceKey) ?? GRANTED_SPELLS_LABELS.compendium;
   }
 
   /** Выбирает пак для заклинания (фиксирует id + предпочтённый пак). */
@@ -135,39 +197,6 @@
       icon: option.packId === currentPackId ? 'tabler:check' : undefined,
       onSelect: () => choosePack(spell, option),
     }));
-  }
-
-  /** Добавляет заклинание; точное уникальное совпадение сразу связывается. */
-  function addSpell(): void {
-    const spellName = newSpellName.value.trim();
-
-    if (!spellName) {
-      return;
-    }
-
-    const exactId = findExactSpellId(spellName);
-
-    if (!exactId) {
-      spells.value.push({ name: spellName });
-      newSpellName.value = '';
-
-      return;
-    }
-
-    const options = packOptionsForId(exactId);
-    const [firstOption] = options;
-
-    const newEntry: GrantedSpellRef = {
-      name: firstOption?.name ?? spellName,
-      spellId: exactId,
-    };
-
-    if (options.length === 1 && firstOption) {
-      newEntry.packId = firstOption.packId;
-    }
-
-    spells.value.push(newEntry);
-    newSpellName.value = '';
   }
 
   /** Удаляет заклинание по индексу. */
@@ -252,7 +281,7 @@
           variant="link"
           size="sm"
           class="min-w-0 flex-1 justify-start truncate px-0"
-          title="Открыть заклинание"
+          :title="GRANTED_SPELLS_LABELS.open"
           @click.left.exact.prevent="openSpell(spell)"
         />
 
@@ -275,7 +304,7 @@
             icon="tabler:stack-2"
             trailing-icon="tabler:chevron-down"
             :label="packLabelFor(spell)"
-            title="Есть в нескольких компендиумах — выбрать источник"
+            :title="GRANTED_SPELLS_LABELS.choosePack"
           />
         </UDropdownMenu>
 
@@ -296,7 +325,7 @@
           size="sm"
           icon="tabler:alert-triangle"
         >
-          не найдено
+          {{ GRANTED_SPELLS_LABELS.notFound }}
         </UBadge>
 
         <UButton
@@ -304,7 +333,7 @@
           color="error"
           variant="ghost"
           size="xs"
-          aria-label="Удалить заклинание"
+          :aria-label="GRANTED_SPELLS_LABELS.remove"
           @click.left.exact.prevent="removeSpell(spellIndex)"
         />
       </div>
@@ -315,7 +344,9 @@
         v-if="!resolveOption(spell) && spellMatchOptions(spell).length > 0"
         class="flex flex-wrap items-center gap-1"
       >
-        <span class="text-[11px] text-dimmed">Связать:</span>
+        <span class="text-[11px] text-dimmed">{{
+          GRANTED_SPELLS_LABELS.linkPrefix
+        }}</span>
 
         <UButton
           v-for="option in spellMatchOptions(spell)"
@@ -331,29 +362,39 @@
       </div>
     </div>
 
-    <div class="flex items-center gap-2">
-      <UInput
-        v-model="newSpellName"
-        placeholder="Введите заклинание…"
-        class="flex-1"
-        @keydown.enter.prevent="addSpell"
-      />
+    <UButton
+      v-if="props.socket"
+      icon="tabler:books"
+      :label="REF_PICKER_LABELS.open"
+      color="primary"
+      variant="soft"
+      size="sm"
+      class="self-start"
+      @click.left.exact.prevent="openPicker"
+    />
 
-      <UButton
-        icon="tabler:plus"
-        label="Добавить"
-        color="neutral"
-        variant="soft"
-        size="sm"
-        :disabled="!newSpellName.trim()"
-        @click.left.exact.prevent="addSpell"
-      />
-    </div>
+    <p
+      v-else
+      class="text-xs text-dimmed italic"
+    >
+      {{ REF_PICKER_LABELS.noSocket }}
+    </p>
+
+    <CompendiumRefPickerModal
+      v-if="props.socket"
+      v-model:open="isPickerOpen"
+      :socket="props.socket"
+      kind="spell"
+      :title="REF_PICKER_TITLES.spell"
+      :filter-value="spellLevelFilterValue"
+      :filter-label="REF_PICKER_LABELS.filterSpellLevel"
+      :filter-order="SPELL_LEVEL_FILTER_ORDER"
+      :z-index="pickerZIndex"
+      @select="addPickedSpells"
+    />
 
     <p class="text-[11px] text-dimmed">
-      Впишите заклинание. Совпавшее показывает компендиум-источник и выдаётся
-      автоматически; если оно есть в нескольких компендиумах — можно выбрать, из
-      какого брать. Имя-ссылка открывает его.
+      {{ GRANTED_SPELLS_LABELS.hint }}
     </p>
   </div>
 </template>

@@ -1,5 +1,5 @@
 /**
- * Константы системы D&D 5e (PHB 2014)
+ * Константы системы D&D 5e (PHB 2024)
  *
  * Это единственный источник правды для всех D&D-специфичных данных.
  * При переключении на другую систему — замени этот файл.
@@ -10,15 +10,83 @@ import type {
   ActorMovement,
   MovementType,
   SkillType,
+  TokenDispositionSetting,
   ToolCategory,
+  WeaponProperty,
 } from '@vtt/shared';
-import type { EquipmentCategory } from '@vtt/shared';
-import type { ConditionKey } from './conditionKeys.js';
-import type { DnDActor, SpellUsesRecovery } from './dndEntities.js';
+
+import type { ConditionKey, ConditionRef } from './conditionKeys.js';
+import type {
+  DnDActor,
+  DnDEquipmentCategory,
+  SpellUsesRecovery,
+} from './dndEntities.js';
+import type { CreatureSize } from './types.js';
+
+import { DEFAULT_CARRYING_CAPACITY } from './carryingCapacity.js';
+import { BLOODIED_AUTO_APPLY, DEATH_CONDITION_KEY } from './conditionKeys.js';
+import { DEFAULT_PREPARED_LIMIT } from './preparedSpells.js';
+
+/** Общий предел бонусных костей одной d20-проверки; соответствует пределу группы клиентского роллера. */
+export const MAX_ROLL_BONUS_DICE = 1_000;
+
+/** Ограничивает грани бонусной кости и сохраняет безопасную целую сумму при максимальном числе костей. */
+export const MAX_ROLL_BONUS_DIE_SIDES = 1_000_000;
 
 // ============================================================
 // Инструменты
 // ============================================================
+
+// ============================================================
+// Компендиум: адресация записей
+// ============================================================
+
+/**
+ * Псевдо-пак записей самого мира (панель «Предметы»): настоящего пака у них
+ * нет, а отличать их от компендиумных надо — выдача, сужённая до конкретного
+ * пака, их подхватывать не должна, а в окнах выбора они стоят своим списком.
+ *
+ * Значение лежит в данных (`packId` выданных заклинаний), поэтому оно одно на
+ * всё: заклинания, классы, виды, предыстории.
+ */
+export const WORLD_PACK_ID = 'world';
+
+/**
+ * Ссылка на запись компендиума: ключ вместе с паком.
+ *
+ * Одним ключом копии одной записи в разных паках не различить — DEV- и
+ * ПРОД-компендиум, чужой пак и свой — поэтому запись адресуется парой. Пак
+ * необязателен: записи, сохранённые до его появления, и перенос персонажа туда,
+ * где такого пака нет, ищутся по одному ключу.
+ */
+export interface CompendiumRecordRef {
+  key: string;
+  packId?: string;
+}
+
+/**
+ * Годится ли родитель из пака `packId` для подкласса или подвида, помнящего
+ * пак своего родителя. Пак не известен с какой-либо стороны — годится: так
+ * читаются записи, сохранённые до появления поля. Записанного пака больше нет
+ * среди подключённых — тоже годится: иначе подкласс, скопированный из
+ * отключённого потом компендиума, не нашёл бы родителя нигде.
+ *
+ * @param parentPackId - пак родителя, записанный у подкласса или подвида
+ * @param packId - пак, в котором нашёлся родитель
+ * @param knownPackIds - подключённые паки; не заданы — считаются известными все
+ * @returns `true`, если родитель подходит
+ */
+export function matchesParentPack(
+  parentPackId: string | undefined,
+  packId: string | undefined,
+  knownPackIds?: ReadonlySet<string>,
+): boolean {
+  if (!parentPackId || !packId || parentPackId === packId) {
+    return true;
+  }
+
+  return knownPackIds ? !knownPackIds.has(parentPackId) : false;
+}
 
 // ============================================================
 // Базовые параметры (Core Rules)
@@ -27,19 +95,133 @@ import type { DnDActor, SpellUsesRecovery } from './dndEntities.js';
 /** Базовый КД без брони (D&D 5e: 10 + DEX mod) */
 export const BASE_UNARMORED_AC = 10;
 
+/** Базовое слагаемое Сл спасброска от заклинаний (8 + мастерство + мод.) */
+export const SPELL_SAVE_DC_BASE = 8;
+
 // ============================================================
 // Характеристики (Abilities)
 // ============================================================
 
+/** Локализованные названия характеристик (ключ → русский лейбл) */
+export const ABILITY_LABELS: Record<AbilityType, string> = {
+  strength: 'Сила',
+  dexterity: 'Ловкость',
+  constitution: 'Телосложение',
+  intelligence: 'Интеллект',
+  wisdom: 'Мудрость',
+  charisma: 'Харизма',
+};
+
+/** Характеристики в родительном падеже — «спасбросок Телосложения» */
+export const ABILITY_GENITIVE_LABELS: Record<AbilityType, string> = {
+  strength: 'Силы',
+  dexterity: 'Ловкости',
+  constitution: 'Телосложения',
+  intelligence: 'Интеллекта',
+  wisdom: 'Мудрости',
+  charisma: 'Харизмы',
+};
+
+/** Ключи характеристик в порядке листа */
+export const ABILITY_KEYS: readonly AbilityType[] = [
+  'strength',
+  'dexterity',
+  'constitution',
+  'intelligence',
+  'wisdom',
+  'charisma',
+];
+
+/** Множество всех допустимых ключей характеристик для быстрой проверки */
+const ABILITY_KEY_SET: ReadonlySet<string> = new Set(ABILITY_KEYS);
+
+/**
+ * Проверяет, является ли значение допустимым ключом характеристики
+ * (`AbilityType`). Значение приходит из данных мира, поэтому проверяется и его
+ * тип: в записи актёра на месте ключа может оказаться что угодно.
+ *
+ * @param value - произвольное значение для проверки
+ * @returns `true`, если `value` является `AbilityType`
+ */
+export function isAbilityType(value: unknown): value is AbilityType {
+  return typeof value === 'string' && ABILITY_KEY_SET.has(value);
+}
+
 /** Характеристики для выбора в UI-селектах */
-export const ABILITY_OPTIONS = [
-  { value: 'strength' as const, label: 'Сила' },
-  { value: 'dexterity' as const, label: 'Ловкость' },
-  { value: 'constitution' as const, label: 'Телосложение' },
-  { value: 'intelligence' as const, label: 'Интеллект' },
-  { value: 'wisdom' as const, label: 'Мудрость' },
-  { value: 'charisma' as const, label: 'Харизма' },
-] as const;
+export const ABILITY_OPTIONS: ReadonlyArray<{
+  value: AbilityType;
+  label: string;
+}> = ABILITY_KEYS.map((value) => ({ value, label: ABILITY_LABELS[value] }));
+
+/**
+ * Короткие русские подписи @-переменных формул: так формулу читает человек, а
+ * не парсер. Общие для описания эффекта и итога формулы урона, чтобы одна и та
+ * же переменная не называлась в двух местах по-разному.
+ */
+export const FORMULA_VARIABLE_LABELS: Readonly<Record<string, string>> = {
+  '@hitDice.left': 'непотраченные кости хитов',
+  '@hp.temp': 'текущие временные хиты',
+  '@mod.spell': 'мод. закл. характеристики',
+  '@mod.str': 'мод. Силы',
+  '@mod.dex': 'мод. Ловкости',
+  '@mod.con': 'мод. Телосложения',
+  '@mod.int': 'мод. Интеллекта',
+  '@mod.wis': 'мод. Мудрости',
+  '@mod.cha': 'мод. Харизмы',
+  '@str': 'значение Силы',
+  '@dex': 'значение Ловкости',
+  '@con': 'значение Телосложения',
+  '@int': 'значение Интеллекта',
+  '@wis': 'значение Мудрости',
+  '@cha': 'значение Харизмы',
+  '@prof': 'бонус мастерства',
+  '@level': 'уровень',
+  '@classLevel': 'уровень в классе',
+  '@speed.walk': 'скорость ходьбы',
+  '@speed.fly': 'скорость полёта',
+  '@speed.swim': 'скорость плавания',
+  '@speed.climb': 'скорость лазания',
+  '@speed.burrow': 'скорость копания',
+  '@damage': 'урон события',
+  '@spellDc': 'Сл заклинаний',
+  '@castLevel': 'круг ячейки',
+  '@roll': 'сохранённый бросок',
+  // Потраченное ценой ресурсом (`effectPay.ts`)
+  '@paid.slotLevel': 'круг потраченной ячейки',
+  '@paid.hitDice': 'число потраченных костей хитов',
+  '@paid.hitDie': 'грань потраченных костей хитов',
+  '@paid.hitDiceRoll': 'бросок потраченных костей хитов',
+  '@paid.counter': 'потрачено единиц счётчика',
+  '@paid.itemUses': 'потрачено зарядов',
+};
+
+/** Токен формулы: `@prof`, `@mod.wis`, `@paid.slotLevel` */
+const FORMULA_VARIABLE_TOKEN_PATTERN = /@[a-z][\w.]*/gi;
+
+/**
+ * Подпись переменной формулы (`@prof` → «бонус мастерства»).
+ *
+ * @param token - переменная с `@`
+ * @returns подпись; незнакомая переменная отдаётся как есть
+ */
+export function labelFormulaVariable(token: string): string {
+  return FORMULA_VARIABLE_LABELS[token] ?? token;
+}
+
+/**
+ * Формула с подписями вместо токенов: «круг потраченной ячейки», а не сырой
+ * `@paid.slotLevel`. Числа, кости и незнакомые токены остаются как есть.
+ *
+ * @param formula - формула
+ * @param pattern - какие токены заменять; по умолчанию — все
+ * @returns формула словами
+ */
+export function labelFormulaVariables(
+  formula: string,
+  pattern: RegExp = FORMULA_VARIABLE_TOKEN_PATTERN,
+): string {
+  return formula.replaceAll(pattern, labelFormulaVariable);
+}
 
 // ============================================================
 // Навыки → Характеристики (Skills → Abilities)
@@ -67,41 +249,33 @@ export const SKILL_ABILITY_MAP: Record<SkillType, AbilityType> = {
   religion: 'intelligence',
 };
 
-/** Список всех навыков с их локализованными названиями и базовыми характеристиками */
-export const SKILLS_LIST: Array<{
-  key: SkillType;
-  label: string;
-  ability: AbilityType;
-}> = [
-  { key: 'acrobatics', label: 'Акробатика', ability: 'dexterity' },
-  { key: 'investigation', label: 'Анализ', ability: 'intelligence' },
-  { key: 'arcana', label: 'Аркана', ability: 'intelligence' },
-  { key: 'athletics', label: 'Атлетика', ability: 'strength' },
-  { key: 'perception', label: 'Внимательность', ability: 'wisdom' },
-  { key: 'survival', label: 'Выживание', ability: 'wisdom' },
-  { key: 'performance', label: 'Выступление', ability: 'charisma' },
-  { key: 'intimidation', label: 'Запугивание', ability: 'charisma' },
-  { key: 'history', label: 'История', ability: 'intelligence' },
-  { key: 'sleightOfHand', label: 'Ловкость рук', ability: 'dexterity' },
-  { key: 'medicine', label: 'Медицина', ability: 'wisdom' },
-  { key: 'deception', label: 'Обман', ability: 'charisma' },
-  { key: 'nature', label: 'Природа', ability: 'intelligence' },
-  { key: 'insight', label: 'Проницательность', ability: 'wisdom' },
-  { key: 'religion', label: 'Религия', ability: 'intelligence' },
-  { key: 'stealth', label: 'Скрытность', ability: 'dexterity' },
-  { key: 'persuasion', label: 'Убеждение', ability: 'charisma' },
-  { key: 'animalHandling', label: 'Уход за животными', ability: 'wisdom' },
-];
-
-/** Локализованные названия навыков (ключ → русский лейбл) */
-export const SKILLS_LABELS: Record<SkillType, string> = Object.fromEntries(
-  SKILLS_LIST.map((skill) => [skill.key, skill.label]),
-) as Record<SkillType, string>;
+/**
+ * Локализованные названия навыков (ключ → русский лейбл).
+ * Порядок записей — порядок показа навыков в листе (по алфавиту названий).
+ */
+export const SKILLS_LABELS: Record<SkillType, string> = {
+  acrobatics: 'Акробатика',
+  investigation: 'Анализ',
+  arcana: 'Аркана',
+  athletics: 'Атлетика',
+  perception: 'Внимательность',
+  survival: 'Выживание',
+  performance: 'Выступление',
+  intimidation: 'Запугивание',
+  history: 'История',
+  sleightOfHand: 'Ловкость рук',
+  medicine: 'Медицина',
+  deception: 'Обман',
+  nature: 'Природа',
+  insight: 'Проницательность',
+  religion: 'Религия',
+  stealth: 'Скрытность',
+  persuasion: 'Убеждение',
+  animalHandling: 'Уход за животными',
+};
 
 /** Множество всех допустимых ключей навыков для быстрой проверки */
-const SKILL_KEY_SET: ReadonlySet<string> = new Set(
-  SKILLS_LIST.map((skill) => skill.key),
-);
+const SKILL_KEY_SET: ReadonlySet<string> = new Set(Object.keys(SKILLS_LABELS));
 
 /**
  * Проверяет, является ли строка допустимым ключом навыка (`SkillType`).
@@ -113,14 +287,36 @@ export function isSkillType(value: string): value is SkillType {
   return SKILL_KEY_SET.has(value);
 }
 
-/** Локализованные названия характеристик (ключ → русский лейбл) */
-export const ABILITY_LABELS: Record<AbilityType, string> = Object.fromEntries(
-  ABILITY_OPTIONS.map((option) => [option.value, option.label]),
-) as Record<AbilityType, string>;
+/**
+ * Список всех навыков с их локализованными названиями и базовыми
+ * характеристиками — сборка двух справочников выше в порядке показа.
+ *
+ * `Object.keys` отдаёт ключи строками, поэтому каждый прогоняется через
+ * {@link isSkillType}: чужой ключ в список не попадёт.
+ */
+export const SKILLS_LIST: Array<{
+  key: SkillType;
+  label: string;
+  ability: AbilityType;
+}> = Object.keys(SKILLS_LABELS).flatMap((key) =>
+  isSkillType(key)
+    ? [{ key, label: SKILLS_LABELS[key], ability: SKILL_ABILITY_MAP[key] }]
+    : [],
+);
 
 // ============================================================
 // Типы движения (Movement)
 // ============================================================
+
+/**
+ * Единица длины — футы. Расстояния в системе меряются только в них, поэтому
+ * подпись одна на всех: карточку вида, строку вида в компендиуме, блок зрения
+ * листа существа и подписи, которые собирает сам движок (рост вида, зрение).
+ *
+ * Живёт в движке, а не в подписях клиента: клиент импортирует из движка, а
+ * наоборот нельзя — слои так не ходят.
+ */
+export const FEET_UNIT_LABEL = 'фт.';
 
 /** Приоритет типов движения (от высшего к низшему) */
 export const MOVEMENT_PRIORITY: MovementType[] = [
@@ -139,6 +335,30 @@ export const MOVEMENT_LABELS: Record<MovementType, string> = {
   swim: 'Плавание',
   walk: 'Ходьба',
 };
+
+/** Ключи типов движения в порядке показа */
+export const MOVEMENT_KEYS: readonly MovementType[] = [
+  'walk',
+  'swim',
+  'fly',
+  'climb',
+  'burrow',
+];
+
+/** Множество всех допустимых типов движения для быстрой проверки */
+const MOVEMENT_KEY_SET: ReadonlySet<string> = new Set(MOVEMENT_KEYS);
+
+/**
+ * Проверяет, является ли значение допустимым типом движения (`MovementType`).
+ * Значение приходит из данных мира и из ключей эффектов (`movement.fly`),
+ * поэтому проверяется и его тип — на месте ключа может оказаться что угодно.
+ *
+ * @param value - произвольное значение для проверки
+ * @returns `true`, если `value` является `MovementType`
+ */
+export function isMovementType(value: unknown): value is MovementType {
+  return typeof value === 'string' && MOVEMENT_KEY_SET.has(value);
+}
 
 /** Локализованные названия категорий инструментов */
 export const TOOL_CATEGORIES: Record<ToolCategory, string> = {
@@ -244,6 +464,11 @@ export const TOOLS_LIST: Array<{
   { key: 'pan-flute', label: 'Флейта Пана', category: 'musical' },
   { key: 'shawm', label: 'Шалмей', category: 'musical' },
   { key: 'viol', label: 'Виола', category: 'musical' },
+  // Фаэрунские инструменты (FRHoF): в пул «музыкальный инструмент» их кладут
+  // предыстории Забытых Королевств и черта «Музыкант»
+  { key: 'bandore', label: 'Бандора', category: 'musical' },
+  { key: 'cittern', label: 'Цистра', category: 'musical' },
+  { key: 'yarting', label: 'Яртинг', category: 'musical' },
   // Прочие инструменты
   { key: 'disguise-kit', label: 'Набор для маскировки', category: 'other' },
   { key: 'forgery-kit', label: 'Набор для фальсификации', category: 'other' },
@@ -269,9 +494,16 @@ export const TOOLS_LABELS: Record<string, string> = {
 // ============================================================
 // Языки
 // ============================================================
-export const LANGUAGE_TYPES = [
-  // Стандартные языки
+// Группы и порядок — как в таблицах книги игрока 2024. Экзотических языков там
+// больше нет: друидический и язык воров стоят среди редких, а драконий перешёл
+// в стандартные. Язык хранится на листе названием, группа нужна только окну
+// выбора — поэтому перестановка между группами владений не трогает.
+
+/** Стандартные языки */
+export const STANDARD_LANGUAGES = [
   'Общий',
+  'Общий язык жестов',
+  'Драконий',
   'Дварфийский',
   'Эльфийский',
   'Гигантский',
@@ -279,19 +511,23 @@ export const LANGUAGE_TYPES = [
   'Гоблинский',
   'Полуросликовский',
   'Оркский',
-  // Редкие языки
+];
+
+/** Редкие языки */
+export const RARE_LANGUAGES = [
   'Абиссальный',
   'Небесный',
   'Глубинная речь',
-  'Драконий',
+  'Друидический',
   'Инфернальный',
   'Первоязык',
   'Сильван',
-  'Подземный',
-  // Экзотические языки
-  'Друидический',
   'Язык воров',
+  'Подземный',
 ];
+
+/** Все языки справочника: стандартные, затем редкие */
+export const LANGUAGE_TYPES = [...STANDARD_LANGUAGES, ...RARE_LANGUAGES];
 
 // ============================================================
 // Опыт и уровни
@@ -364,8 +600,35 @@ export const RARITY_LABELS: Record<string, string> = Object.fromEntries(
 // Категории экипировки (Equipment Category)
 // ============================================================
 
+/**
+ * Категория снаряжения «Зелье». Своего типа записи у зелья нет: это обычное
+ * снаряжение, которое категория отличает значком и пунктом меню создания.
+ */
+export const POTION_EQUIPMENT_CATEGORY: DnDEquipmentCategory = 'potion';
+
 /** Иконка экипировки по умолчанию (Iconify, формат `tabler:*`) */
 export const DEFAULT_EQUIPMENT_ICON = 'tabler:shirt';
+
+/**
+ * Ключи категорий снаряжения D&D 2024 — единственный список системы: из него
+ * выводится тип {@link DnDEquipmentCategory}, а совпадение со справочником
+ * `equipment-categories.json` стережёт тест.
+ */
+export const DND_EQUIPMENT_CATEGORIES = [
+  'light',
+  'medium',
+  'heavy',
+  'shield',
+  'trinket',
+  'ring',
+  'clothing',
+  'wand',
+  'wondrous',
+  'vehicle-equipment',
+  'food',
+  'adventurer-equipment',
+  'potion',
+] as const;
 
 /**
  * Иконки (Iconify `tabler:*`) для категорий экипировки.
@@ -375,7 +638,7 @@ export const DEFAULT_EQUIPMENT_ICON = 'tabler:shirt';
  * этих ключей здесь намеренно нет.
  */
 export const EQUIPMENT_CATEGORY_ICONS: Partial<
-  Record<EquipmentCategory, string>
+  Record<DnDEquipmentCategory, string>
 > = {
   'shield': 'tabler:shield',
   'wand': 'tabler:wand',
@@ -384,6 +647,9 @@ export const EQUIPMENT_CATEGORY_ICONS: Partial<
   'clothing': 'tabler:shirt',
   'wondrous': 'tabler:sparkles',
   'food': 'tabler:meat',
+  // Круглая колба, а не прямая `tabler:flask`: та — значок применения
+  // предмета, и зелье с эффектами иначе не отличить от свитка или масла
+  'potion': 'tabler:flask-2',
   'adventurer-equipment': 'tabler:backpack',
 };
 
@@ -396,7 +662,7 @@ export const EQUIPMENT_CATEGORY_ICONS: Partial<
  * @returns имя иконки в формате `tabler:*`
  */
 export function getEquipmentCategoryIcon(
-  category: EquipmentCategory | undefined,
+  category: DnDEquipmentCategory | undefined,
   fallback: string = DEFAULT_EQUIPMENT_ICON,
 ): string {
   if (!category) {
@@ -410,6 +676,13 @@ export function getEquipmentCategoryIcon(
 // Значения по умолчанию для актора
 // ============================================================
 
+/**
+ * Отношение фишки персонажа без настройки: персонажи друг другу союзники.
+ * У существа умолчание своё — «враждебный» (`DEFAULT_CREATURE`).
+ */
+export const DEFAULT_ACTOR_TOKEN_DISPOSITION: TokenDispositionSetting =
+  'friendly';
+
 /** Значения по умолчанию для нового актора D&D 5e */
 export const DEFAULT_ACTOR: Omit<DnDActor, 'id'> = {
   entityType: 'actor',
@@ -422,6 +695,7 @@ export const DEFAULT_ACTOR: Omit<DnDActor, 'id'> = {
   token: {
     frameUrl: 'assets/token-frames/0.png',
     showName: false,
+    disposition: DEFAULT_ACTOR_TOKEN_DISPOSITION,
   },
 
   // Системные данные D&D 5e
@@ -472,6 +746,7 @@ export const DEFAULT_ACTOR: Omit<DnDActor, 'id'> = {
       languages: ['Общий'],
       savingThrows: [],
       skills: {},
+      weaponMasteries: [],
     },
 
     currency: {
@@ -481,6 +756,10 @@ export const DEFAULT_ACTOR: Omit<DnDActor, 'id'> = {
       gp: 0,
       pp: 0,
     },
+    carryingCapacity: { ...DEFAULT_CARRYING_CAPACITY },
+    preparedSpells: { ...DEFAULT_PREPARED_LIMIT },
+    preparedCantrips: { ...DEFAULT_PREPARED_LIMIT },
+    cantripsTracked: true,
     spellSlotsUsed: [0, 0, 0, 0, 0, 0, 0, 0, 0],
     pactSlotsUsed: 0,
     classCounters: [],
@@ -494,30 +773,49 @@ export const DEFAULT_ACTOR: Omit<DnDActor, 'id'> = {
 };
 
 // ============================================================
-// Состояния (Conditions) D&D 5e (PHB 2014)
+// Состояния (Conditions) D&D 5e (PHB 2024)
 // ============================================================
 
-/** Ключ состояния D&D 5e (определён в leaf-модуле `conditionKeys`) */
-export type { ConditionKey };
+/** Ключи состояний (определены в leaf-модуле `conditionKeys`) */
+export type { ConditionKey, ConditionRef };
 
-/** Данные одного состояния D&D 5e */
+/**
+ * Данные одного состояния.
+ *
+ * Форма общая для канона PHB и для состояний, заведённых в мире, — поэтому ключ
+ * `ConditionRef`, а не канонный union: в списках, сетках и иммунитетах те и
+ * другие ходят вперемешку.
+ */
 export interface ConditionEntry {
   /** Уникальный ключ состояния */
-  key: ConditionKey;
+  key: ConditionRef;
   /** Название на русском */
   nameRu: string;
   /** Название на английском */
   nameEn: string;
-  /** Иконка из коллекции fluent (как fallback) */
+  /** Иконка из коллекции (как fallback) */
   icon: string;
-  /** Путь к кастомной SVG-иконке в public/assets/status/ (имеет приоритет над icon) */
+  /** Картинка-значок: ассет мира или файл из `public/assets/status/` */
   customImage?: string;
   /** Описание эффектов состояния */
   description: string;
+  /**
+   * Рисовать значок крупно поверх всей фишки, а не ячейкой в сетке статусов
+   * (Ядро читает признак из `getConditions`). Так помечают состояние, которое
+   * описывает существо целиком, а не временную помеху, — «Мёртв».
+   */
+  overlay?: boolean;
+  /**
+   * Правило «вешать автоматически»: строка словаря условий
+   * (`triggerConditions.ts`). Пока правило выполняется, состояние висит на
+   * сущности, перестало — снимается (`autoConditions.ts`). Пустая строка или
+   * нет поля — только руками.
+   */
+  autoApply?: string;
 }
 
 /**
- * Все состояния D&D 5e (PHB 2014)
+ * Все состояния D&D 5e (PHB 2024)
  *
  * Источник: https://new.ttg.club/glossary/condition-phb
  */
@@ -530,6 +828,15 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     customImage: '/assets/status/blinded.svg',
     description:
       'Автоматический провал проверок, требующих зрение. Броски атаки против вас с преимуществом, ваши — с помехой.',
+  },
+  {
+    key: 'bloodied',
+    nameRu: 'Окровавленный',
+    nameEn: 'Bloodied',
+    icon: 'tabler:droplet',
+    description:
+      'Хитов не больше половины максимума. Само по себе ничего не меняет — на него ссылаются умения и урон существ («или 2к8 + 2, если рой окровавлен»).',
+    autoApply: BLOODIED_AUTO_APPLY,
   },
   {
     key: 'charmed',
@@ -555,7 +862,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     icon: 'tabler:battery-off',
     customImage: '/assets/status/exhaustion.svg',
     description:
-      'Накапливается до 6 степеней: 1 — помеха на проверки характеристик; 2 — скорость вдвое; 3 — помеха на атаки и спасброски; 4 — максимум хитов вдвое; 5 — скорость 0; 6 — смерть. Продолжительный отдых снимает 1 степень (при условии еды и питья).',
+      'Накапливается (до 6 степеней, смерть на 6). Тест к20 −2 за степень. Скорость −5 фт за степень. Продолжительный отдых снимает 1 степень.',
   },
   {
     key: 'frightened',
@@ -573,7 +880,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     icon: 'tabler:hand-stop',
     customImage: '/assets/status/grappled.svg',
     description:
-      'Скорость равна 0, бонусы к скорости не действуют. Захват заканчивается, если схвативший становится недееспособен или если эффект уводит вас вне досягаемости.',
+      'Скорость равна 0. Помеха на броски атаки по любой цели, кроме схватившего. Схвативший может тащить существо за собой.',
   },
   {
     key: 'incapacitated',
@@ -581,7 +888,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     nameEn: 'Incapacitated',
     icon: 'tabler:ban',
     description:
-      'Не может совершать действия и реакции.',
+      'Нет действий, бонусных действий и реакций. Нет концентрации. Нельзя говорить. Помеха на инициативу.',
   },
   {
     key: 'invisible',
@@ -589,7 +896,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     nameEn: 'Invisible',
     icon: 'tabler:eye-closed',
     description:
-      'Невозможно увидеть без магии или особого чувства; для укрытия считается сильно заслонённым. Атаки по вам с помехой, ваши атаки — с преимуществом.',
+      'Преимущество на инициативу. Атаки против вас с помехой, ваши — с преимуществом. Не подвержены эффектам, требующим видимость цели.',
   },
   {
     key: 'paralyzed',
@@ -642,7 +949,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     icon: 'tabler:bolt',
     customImage: '/assets/status/stunned.svg',
     description:
-      'Недееспособен, не может двигаться и говорит с запинками. Автопровал спасбросков СИЛ и ЛОВ. Атаки по вам с преимуществом.',
+      'Недееспособен. Автопровал спасбросков СИЛ и ЛОВ. Атаки по вам с преимуществом.',
   },
   {
     key: 'unconscious',
@@ -653,13 +960,29 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     description:
       'Недееспособен + лежащий ничком. Скорость 0. Автопровал СИЛ и ЛОВ. Атаки с преимуществом. Крит в пределах 5 фт. Не осознаёте окружение.',
   },
+  {
+    key: DEATH_CONDITION_KEY,
+    nameRu: 'Мёртв',
+    nameEn: 'Dead',
+    // Своей картинки в наборе хоста (/assets/status/) нет — берём иконку
+    // коллекции, как «Оглохший» и «Недееспособный»
+    icon: 'tabler:skull',
+    description: 'Существо мертво: запас хитов исчерпан.',
+    // Смерть — не помеха на пару ходов, а конец существа: череп рисуется во
+    // весь токен, иначе его теряют среди прочих значков состояний
+    overlay: true,
+  },
 ] as const;
 
-/** Текстовые константы для UI вкладки эффектов */
-export const EffectsTabLabels = {
-  EmptyState: 'Нет активных состояний',
-  SectionTitle: 'Состояния',
-} as const;
+/**
+ * Состояния, которые выбирают руками в интерфейсе системы (тумблеры листа,
+ * списки иммунитетов, выдача от вида и черт).
+ *
+ * «Мёртв» из них исключён: это производная метка, её ставит и снимает запас
+ * хитов существа (`deathState.ts`), и выбор её руками ничего бы не значил.
+ */
+export const SELECTABLE_CONDITIONS: readonly ConditionEntry[] =
+  CONDITIONS.filter((condition) => condition.key !== DEATH_CONDITION_KEY);
 
 // ============================================================
 // Валюты (Currency)
@@ -668,21 +991,92 @@ export const EffectsTabLabels = {
 /** Тип валюты D&D 5e */
 export type CurrencyType = 'cp' | 'sp' | 'ep' | 'gp' | 'pp';
 
-/** Опции валют для выпадающего списка */
+/**
+ * Монеты кошелька — от самой мелкой к самой крупной. Порядок задаёт и порядок
+ * полей в выпадающих списках стоимости, и порядок ячеек в строке валюты листа.
+ */
 export const CURRENCY_OPTIONS: ReadonlyArray<{
   value: CurrencyType;
+  /** Подпись для выпадающего списка стоимости предмета */
   label: string;
+  /** Сокращение для компактных строк («мм», «зм») */
   labelShort: string;
+  /** Полное название монеты — для подсказок и подписей полей */
+  labelFull: string;
 }> = [
-  { value: 'cp', label: 'Медные (мм)', labelShort: 'мм' },
-  { value: 'sp', label: 'Серебряные (см)', labelShort: 'см' },
-  { value: 'ep', label: 'Электрумовые (эм)', labelShort: 'эм' },
-  { value: 'gp', label: 'Золотые (зм)', labelShort: 'зм' },
-  { value: 'pp', label: 'Платиновые (пм)', labelShort: 'пм' },
+  {
+    value: 'cp',
+    label: 'Медные (мм)',
+    labelShort: 'мм',
+    labelFull: 'Медные монеты',
+  },
+  {
+    value: 'sp',
+    label: 'Серебряные (см)',
+    labelShort: 'см',
+    labelFull: 'Серебряные монеты',
+  },
+  {
+    value: 'ep',
+    label: 'Электрумовые (эм)',
+    labelShort: 'эм',
+    labelFull: 'Электрумовые монеты',
+  },
+  {
+    value: 'gp',
+    label: 'Золотые (зм)',
+    labelShort: 'зм',
+    labelFull: 'Золотые монеты',
+  },
+  {
+    value: 'pp',
+    label: 'Платиновые (пм)',
+    labelShort: 'пм',
+    labelFull: 'Платиновые монеты',
+  },
 ] as const;
 
 /** Валюта по умолчанию */
 export const DEFAULT_CURRENCY: CurrencyType = 'gp';
+
+/** Множество всех допустимых видов монет для быстрой проверки */
+const CURRENCY_TYPE_SET: ReadonlySet<string> = new Set(
+  CURRENCY_OPTIONS.map((option) => option.value),
+);
+
+/**
+ * Проверяет, является ли значение видом монеты (`CurrencyType`).
+ * Стоимость записи компендиума приходит объектом `{ value, currency }`, где
+ * `currency` — произвольная строка: чужая монета не должна уехать в кошелёк.
+ *
+ * @param value - произвольное значение для проверки
+ * @returns `true`, если `value` является `CurrencyType`
+ */
+export function isCurrencyType(value: unknown): value is CurrencyType {
+  return typeof value === 'string' && CURRENCY_TYPE_SET.has(value);
+}
+
+/**
+ * Краткая подпись монеты («зм»). Своей константы под неё быть не должно:
+ * подписи монет живут одной таблицей, и вторая копия разошлась бы с ней.
+ *
+ * @param currency - вид монеты; по умолчанию золотые
+ * @returns краткая подпись либо код монеты, если такой в таблице нет
+ */
+export function currencyShortLabel(
+  currency: CurrencyType = DEFAULT_CURRENCY,
+): string {
+  return (
+    CURRENCY_OPTIONS.find((option) => option.value === currency)?.labelShort
+    ?? currency
+  );
+}
+
+/** Минимальное количество монет одного вида в кошельке */
+export const CURRENCY_AMOUNT_MIN = 0;
+
+/** Максимальное количество монет одного вида в кошельке */
+export const CURRENCY_AMOUNT_MAX = 9_999_999;
 
 /**
  * Парсит строку стоимости (напр. "15 зм") в структурированный объект.
@@ -700,7 +1094,9 @@ export function parseCost(
   if (typeof cost === 'object') {
     return {
       value: cost.value ?? 0,
-      currency: (cost.currency as CurrencyType) || DEFAULT_CURRENCY,
+      currency: isCurrencyType(cost.currency)
+        ? cost.currency
+        : DEFAULT_CURRENCY,
     };
   }
 
@@ -718,7 +1114,7 @@ export function parseCost(
     pp: 'pp',
   };
 
-  // eslint-disable-next-line regexp/no-obscure-range
+  // eslint-disable-next-line regexp/no-obscure-range -- диапазон а-я нужен целиком: сокращения валют в цене пишут кириллицей
   const match = cost.trim().match(/^(\d+(?:[.,]\d+)?)\s*([a-zа-яё]+)?$/i);
 
   if (!match) {
@@ -765,6 +1161,7 @@ export const CREATURE_CATEGORIES: Record<
   ooze: 'Слизь',
   plant: 'Растение',
   undead: 'Нежить',
+  swarm: 'Рой',
 };
 
 /** Опции типов существ для UI-селектов */
@@ -772,19 +1169,43 @@ export const CREATURE_CATEGORY_OPTIONS = Object.entries(
   CREATURE_CATEGORIES,
 ).map(([value, label]) => ({ value, label }));
 
+/** Множество всех допустимых типов существ бестиария для быстрой проверки */
+const CREATURE_CATEGORY_SET: ReadonlySet<string> = new Set(
+  Object.keys(CREATURE_CATEGORIES),
+);
+
+/**
+ * Проверяет, что строка — тип существа бестиария (`CreatureCategory`).
+ * Ключ приходит из списков выбора, компендиумов и записей мира строкой.
+ *
+ * @param value - произвольная строка для проверки
+ * @returns `true`, если это известный тип существа
+ */
+export function isCreatureCategory(
+  value: unknown,
+): value is import('./creatureTypes.js').CreatureCategory {
+  return typeof value === 'string' && CREATURE_CATEGORY_SET.has(value);
+}
+
 /**
  * Локализованные названия типов существ для актёров и видов (Species).
  *
- * Включает `swarm`, в отличие от `CREATURE_CATEGORIES` (только бестиарные типы).
+ * Словарь типов один на всю систему ({@link CREATURE_CATEGORIES}) — расходиться
+ * им нельзя: один и тот же тип задают и статблок существа, и вид персонажа, и
+ * гейт урона «по такому-то типу». Отличается только подпись `monstrosity`:
+ * в бестиарии это «Чудовище», у видов исторически «Монстр».
  */
 export const CREATURE_TYPE_LABELS: Record<
   import('./speciesTypes.js').CreatureType,
   string
 > = {
   ...CREATURE_CATEGORIES,
-  swarm: 'Рой',
   monstrosity: 'Монстр',
 };
+
+// Второго множества типов здесь нет намеренно: словарь один
+// (`CREATURE_CATEGORIES`), и проверка у него одна — `isCreatureCategory`.
+// Прежний `isCreatureType` был её точной копией по другому справочнику.
 
 // ============================================================
 // Существа — Мировоззрения (Creature Alignments)
@@ -808,6 +1229,24 @@ export const CREATURE_ALIGNMENTS: Record<
   'any': 'Любое мировоззрение',
 };
 
+/** Множество всех допустимых мировоззрений для быстрой проверки */
+const CREATURE_ALIGNMENT_SET: ReadonlySet<string> = new Set(
+  Object.keys(CREATURE_ALIGNMENTS),
+);
+
+/**
+ * Проверяет, является ли строка мировоззрением существа.
+ * Ключ приходит из компендиумов и записей мира в произвольном виде.
+ *
+ * @param value - произвольная строка для проверки
+ * @returns `true`, если это известное мировоззрение
+ */
+export function isCreatureAlignment(
+  value: string,
+): value is import('./creatureTypes.js').CreatureAlignment {
+  return CREATURE_ALIGNMENT_SET.has(value);
+}
+
 /** Опции мировоззрений для UI-селектов */
 export const CREATURE_ALIGNMENT_OPTIONS = Object.entries(
   CREATURE_ALIGNMENTS,
@@ -824,28 +1263,72 @@ export const CREATURE_ALIGNMENT_OPTIONS = Object.entries(
  * @returns русское название или undefined если ключ неизвестен
  */
 export function getAlignmentLabel(alignment: string): string | undefined {
-  const directMatch =
-    CREATURE_ALIGNMENTS[alignment as keyof typeof CREATURE_ALIGNMENTS];
-
-  if (directMatch) {
-    return directMatch;
+  if (isCreatureAlignment(alignment)) {
+    return CREATURE_ALIGNMENTS[alignment];
   }
 
   // Нормализация: пробелы → дефисы, lowercase
   const normalized = alignment.toLowerCase().replace(/\s+/g, '-');
 
-  return CREATURE_ALIGNMENTS[normalized as keyof typeof CREATURE_ALIGNMENTS];
+  return isCreatureAlignment(normalized)
+    ? CREATURE_ALIGNMENTS[normalized]
+    : undefined;
 }
 
 // ============================================================
 // Существа — Размеры (Creature Sizes)
 // ============================================================
 
+/** Размеры существ D&D 5e — от крошечного к громадному. */
+export const CREATURE_SIZES: readonly CreatureSize[] = [
+  'tiny',
+  'small',
+  'medium',
+  'large',
+  'huge',
+  'gargantuan',
+];
+
+/** Размер существа, когда во внешних данных его нет или он не распознан. */
+export const DEFAULT_CREATURE_SIZE: CreatureSize = 'medium';
+
+/** Множество всех допустимых размеров существ для быстрой проверки */
+const CREATURE_SIZE_SET: ReadonlySet<string> = new Set(CREATURE_SIZES);
+
+/**
+ * Проверяет, что строка — размер существа D&D 5e.
+ *
+ * @param value - произвольная строка для проверки
+ * @returns `true`, если `value` является `CreatureSize`
+ */
+export function isCreatureSize(value: string): value is CreatureSize {
+  return CREATURE_SIZE_SET.has(value);
+}
+
+/**
+ * Приводит размер существа из внешних данных к `CreatureSize`.
+ *
+ * Компендиумы TTG Club и легаси-миры отдают размер как придётся: строкой в
+ * другом регистре (`'Medium'`), пустым значением или вовсе без поля. Разбор
+ * живёт в одном месте, поэтому дальше по системе размер всегда валиден —
+ * таблицам вроде `CREATURE_SIZE_TO_TOKEN_SCALE` не нужны запасные значения
+ * на каждом обращении.
+ *
+ * @param value - размер из внешних данных
+ * @returns распознанный размер или `DEFAULT_CREATURE_SIZE`
+ */
+export function normalizeCreatureSize(value: unknown): CreatureSize {
+  if (typeof value !== 'string') {
+    return DEFAULT_CREATURE_SIZE;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  return isCreatureSize(normalized) ? normalized : DEFAULT_CREATURE_SIZE;
+}
+
 /** Локализованные названия размеров существ */
-export const CREATURE_SIZE_LABELS: Record<
-  import('./types.js').CreatureSize,
-  string
-> = {
+export const CREATURE_SIZE_LABELS: Record<CreatureSize, string> = {
   tiny: 'Крошечный',
   small: 'Маленький',
   medium: 'Средний',
@@ -858,6 +1341,43 @@ export const CREATURE_SIZE_LABELS: Record<
 export const CREATURE_SIZE_OPTIONS = Object.entries(CREATURE_SIZE_LABELS).map(
   ([value, label]) => ({ value, label }),
 );
+
+/**
+ * Размер существа → масштаб его токена (в клетках).
+ *
+ * Размер существа и масштаб токена — одна и та же величина, показанная в двух
+ * местах интерфейса (селект «Размер» в листе и кнопки «Размер токена» в
+ * настройках), поэтому таблица одна на всю систему. Значения совпадают с
+ * `TOKEN_SIZE_OPTIONS` хоста: ядро знает только нейтральные числовые масштабы,
+ * а их перевод в игровые «размеры существа» — правило D&D.
+ */
+export const CREATURE_SIZE_TO_TOKEN_SCALE: Record<CreatureSize, number> = {
+  tiny: 0.5,
+  small: 0.8,
+  medium: 1,
+  large: 2,
+  huge: 3,
+  gargantuan: 4,
+};
+
+/**
+ * Масштаб токена (в клетках) → размер существа.
+ *
+ * Выводится из `CREATURE_SIZE_TO_TOKEN_SCALE`, а не пишется руками: ручная
+ * копия уже расходилась с прямой таблицей (в ней не было `small`), из-за чего
+ * сохранение настроек токена сбрасывало размер существа.
+ *
+ * Произвольный масштаб (токен растянут на сцене вручную) в таблице
+ * отсутствует — обращение к ней даёт `undefined`, и это не ошибка данных.
+ */
+export const TOKEN_SCALE_TO_CREATURE_SIZE: Record<number, CreatureSize> =
+  CREATURE_SIZES.reduce<Record<number, CreatureSize>>(
+    (accumulator, size) => ({
+      ...accumulator,
+      [CREATURE_SIZE_TO_TOKEN_SCALE[size]]: size,
+    }),
+    {},
+  );
 
 // ============================================================
 // Существа — Показатели опасности (Challenge Ratings)
@@ -919,64 +1439,75 @@ export const CR_OPTIONS = CR_TABLE.map((entry) => ({
 // ============================================================
 
 /** Значения по умолчанию для нового существа */
-export const DEFAULT_CREATURE: Omit<import('./dndEntities.js').Creature, 'id'> =
-  {
-    entityType: 'creature',
-    name: 'Новое существо',
-    description: '',
-    autoSaves: true,
-    token: {
-      frameUrl: 'assets/token-frames/0.png',
-      showName: false,
-      hpDisplayMode: 'text',
-      disposition: 'hostile',
+export const DEFAULT_CREATURE: Omit<
+  import('./dndEntities.js').DnDCreature,
+  'id'
+> = {
+  entityType: 'creature',
+  name: 'Новое существо',
+  description: '',
+  autoSaves: true,
+  token: {
+    frameUrl: 'assets/token-frames/0.png',
+    showName: false,
+    hpDisplayMode: 'text',
+    disposition: 'hostile',
+  },
+  activeEffects: [],
+  equipment: [],
+  system: {
+    size: 'medium',
+    type: 'humanoid',
+    subtype: '',
+    alignment: 'unaligned',
+    armorClass: { value: 10, calculation: 'flat', formula: '', flat: 10 },
+    // Средний размер и Телосложение 10: кость к8 без бонуса — ровно то, что
+    // насчитает `buildCreatureHitPoints`, чтобы заготовка не расходилась с правилами
+    hitPoints: {
+      average: 9,
+      formula: '2к8',
+      hitDie: 8,
+      hitDiceCount: 2,
+      bonus: 0,
     },
-    activeEffects: [],
-    system: {
-      size: 'medium',
-      type: 'humanoid',
-      subtype: '',
-      alignment: 'unaligned',
-      armorClass: { value: 10, calculation: 'flat', formula: '', flat: 10 },
-      hitPoints: { average: 10, formula: '2к8 + 2' },
-      movement: {
-        walk: 30,
-        swim: 0,
-        fly: 0,
-        climb: 0,
-        burrow: 0,
-        hover: false,
-        units: 'ft',
-      },
-      abilities: {
-        strength: 10,
-        dexterity: 10,
-        constitution: 10,
-        intelligence: 10,
-        wisdom: 10,
-        charisma: 10,
-      },
-      challengeRating: '0',
-      proficiencyBonus: 2,
-      savingThrows: [],
-      skills: {},
-      defenses: {
-        vulnerabilities: [],
-        resistances: [],
-        immunities: [],
-        conditionImmunities: [],
-      },
-      senses: 'пассивная Внимательность 10',
-      languages: ['Общий'],
-      environments: [],
-      customEnvironments: '',
-      traits: [],
-      actions: [],
-      bonusActions: [],
-      reactions: [],
-      legendary: { count: 0, actions: [] },
+    movement: {
+      walk: 30,
+      swim: 0,
+      fly: 0,
+      climb: 0,
+      burrow: 0,
+      hover: false,
+      units: 'ft',
     },
-  };
+    abilities: {
+      strength: 10,
+      dexterity: 10,
+      constitution: 10,
+      intelligence: 10,
+      wisdom: 10,
+      charisma: 10,
+    },
+    challengeRating: '0',
+    proficiencyBonus: 2,
+    savingThrows: [],
+    skills: {},
+    defenses: {
+      vulnerabilities: [],
+      resistances: [],
+      immunities: [],
+      conditionImmunities: [],
+    },
+    senses: 'пассивная Внимательность 10',
+    languages: ['Общий'],
+    environments: [],
+    customEnvironments: '',
+    traits: [],
+    actions: [],
+    bonusActions: [],
+    reactions: [],
+    legendary: { count: 0, actions: [] },
+  },
+};
 export const CREATURE_ENVIRONMENTS = [
   { key: 'any', label: 'Любая' },
   { key: 'swamp', label: 'Болото' },
@@ -997,21 +1528,28 @@ export const CREATURE_ENVIRONMENTS = [
 // Заряды заклинаний (восстановление от отдыха)
 // ============================================================
 
+/** Карта значение → подпись для способа восстановления зарядов */
+export const SPELL_USES_RECOVERY_LABELS: Record<SpellUsesRecovery, string> = {
+  atWill: 'По желанию',
+  shortRest: 'Короткий отдых',
+  longRest: 'Продолжительный отдых',
+};
+
+/** Способы восстановления зарядов в порядке показа */
+const SPELL_USES_RECOVERY_KEYS: readonly SpellUsesRecovery[] = [
+  'atWill',
+  'shortRest',
+  'longRest',
+];
+
 /** Опции способа восстановления зарядов заклинания (форма, список, макрос) */
 export const SPELL_USES_RECOVERY_OPTIONS: ReadonlyArray<{
   value: SpellUsesRecovery;
   label: string;
-}> = [
-  { value: 'atWill', label: 'По желанию' },
-  { value: 'shortRest', label: 'Короткий отдых' },
-  { value: 'longRest', label: 'Продолжительный отдых' },
-];
-
-/** Карта значение → подпись для способа восстановления зарядов */
-export const SPELL_USES_RECOVERY_LABELS: Record<SpellUsesRecovery, string> =
-  Object.fromEntries(
-    SPELL_USES_RECOVERY_OPTIONS.map((option) => [option.value, option.label]),
-  ) as Record<SpellUsesRecovery, string>;
+}> = SPELL_USES_RECOVERY_KEYS.map((value) => ({
+  value,
+  label: SPELL_USES_RECOVERY_LABELS[value],
+}));
 
 /**
  * Нормализует способ восстановления зарядов к каноническому union из 3 значений.
@@ -1033,3 +1571,12 @@ export function normalizeSpellUsesRecovery(
 
   return 'atWill';
 }
+
+/** Буква кости в записи формулы хитов существа: «2к8» */
+export const HIT_DICE_FORMULA_LETTER = 'к';
+
+/**
+ * Свойство оружия «Метательное»: по нему выбирают вид атаки (ударить или
+ * бросить) и проверяют условие «метательным оружием».
+ */
+export const THROWN_WEAPON_PROPERTY: WeaponProperty = 'thrown';

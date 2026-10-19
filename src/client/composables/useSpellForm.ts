@@ -2,6 +2,7 @@ import type {
   AbilityType,
   DamagePart,
   DistanceUnit,
+  SourceDefinition,
   SpellAreaShape,
   SpellCastingTimeUnit,
   SpellDeliveryType,
@@ -19,6 +20,8 @@ import type {
   SpellUsesRecovery,
 } from '@vtt/shared/system/dnd.js';
 
+import { computed, ref, watch } from 'vue';
+
 import { generateId } from '@vtt/shared';
 import {
   AREA_SHAPE_OPTIONS,
@@ -27,17 +30,18 @@ import {
   damagePartIsHealing,
   DELIVERY_TYPE_OPTIONS,
   DURATION_UNIT_OPTIONS,
+  FALLBACK_SOURCE_KEY,
   getSpellDamageParts,
   PROJECTILE_DISTRIBUTION_OPTIONS,
+  readSpellOwnSaveDC,
   SAVE_EFFECT_OPTIONS,
   SAVE_TYPE_OPTIONS,
   SPELL_LEVEL_OPTIONS,
   SPELL_SCHOOL_OPTIONS,
   TARGET_TYPE_OPTIONS,
 } from '@vtt/shared/system/dnd.js';
-import { computed, ref, watch } from 'vue';
 
-import { useSystemDataStore } from '@/systems/dnd5e/stores/systemDataStore';
+import { useSystemDataStore } from '../stores/systemDataStore';
 
 /**
  * Composable для логики формы заклинания.
@@ -114,6 +118,8 @@ export function useSpellForm(
   const saveEffect = ref<'half' | 'none' | 'special'>('none');
   const attackAbility = ref<AbilityType | ''>('');
   const attackBonus = ref(0);
+  /** Своя Сл заклинания; 0 — от заклинателя */
+  const saveDC = ref(0);
 
   // Снаряды (каждый — отдельный бросок урона и атаки, если заклинание атакующее)
   const hasProjectiles = ref(false);
@@ -148,6 +154,8 @@ export function useSpellForm(
   const hasScaling = ref(false);
   const scalingAdditionalDice = ref('');
   const scalingAdditionalTargets = ref(0);
+  /** Рост области за круг ячейки — живёт в секции области, как цели в своей */
+  const scalingAdditionalAreaSize = ref(0);
   const scalingDescription = ref('');
   /** Поуровневые тиры масштабирования заговора (полный набор частей на уровень) */
   const cantripScalingTiers = ref<CantripScalingTier[]>([]);
@@ -190,7 +198,8 @@ export function useSpellForm(
   const usesMax = ref(1);
   const usesCurrent = ref(1);
   const usesRecovery = ref<SpellUsesRecovery>('longRest');
-  const sourceKey = ref('hb');
+  const sourceKey = ref<string | undefined>(FALLBACK_SOURCE_KEY);
+  const source = ref<SourceDefinition | undefined>(undefined);
   const isSRD = ref(false);
   /** Классы, которым доступно заклинание (видимость в списках по классу) */
   const classKeys = ref<ClassKey[]>([]);
@@ -205,13 +214,6 @@ export function useSpellForm(
     systemDataStore.damageTypes.map((dt) => ({
       label: dt.name,
       value: dt.key,
-    })),
-  );
-
-  const sourceOptions = computed(() =>
-    systemDataStore.sources.map((src) => ({
-      label: `${src.name} (${src.abbreviation})`,
-      value: src.key,
     })),
   );
 
@@ -277,8 +279,14 @@ export function useSpellForm(
         autoHit.value = spell.autoHit ?? false;
         saveType.value = spell.saveType;
         saveEffect.value = spell.saveEffect ?? 'none';
-        attackAbility.value = spell.attackAbility ?? '';
+
+        // Характеристику записи справочника форма показывает как свою: сохранение
+        // собирает заклинание заново, и незаписанное поле потерялось бы
+        attackAbility.value =
+          spell.attackAbility ?? spell.spellcastingAbility ?? '';
+
         attackBonus.value = spell.attackBonus ?? 0;
+        saveDC.value = readSpellOwnSaveDC(spell) ?? 0;
 
         // Явный блок снарядов — единственный источник истины снарядности
         // (targetCount — информационное число целей, распределение не включает).
@@ -305,10 +313,15 @@ export function useSpellForm(
           hasScaling.value = true;
           scalingAdditionalDice.value = spell.scaling.additionalDice ?? '';
           scalingAdditionalTargets.value = spell.scaling.additionalTargets ?? 0;
+
+          scalingAdditionalAreaSize.value =
+            spell.scaling.additionalAreaSize ?? 0;
+
           scalingDescription.value = spell.scaling.description ?? '';
         } else {
           hasScaling.value = false;
           scalingAdditionalTargets.value = 0;
+          scalingAdditionalAreaSize.value = 0;
         }
 
         cantripScalingTiers.value = (spell.cantripScalingTiers ?? []).map(
@@ -327,7 +340,8 @@ export function useSpellForm(
         usesMax.value = spell.uses?.max ?? 1;
         usesCurrent.value = spell.uses?.current ?? spell.uses?.max ?? 1;
         usesRecovery.value = spell.uses?.recovery ?? 'longRest';
-        sourceKey.value = spell.sourceKey ?? 'hb';
+        sourceKey.value = spell.sourceKey ?? FALLBACK_SOURCE_KEY;
+        source.value = spell.source;
         isSRD.value = spell.isSRD ?? false;
         classKeys.value = [...(spell.classKeys ?? [])];
 
@@ -375,6 +389,7 @@ export function useSpellForm(
         saveEffect.value = 'none';
         attackAbility.value = '';
         attackBonus.value = 0;
+        saveDC.value = 0;
 
         hasProjectiles.value = false;
         projectileCount.value = 3;
@@ -385,6 +400,7 @@ export function useSpellForm(
         hasScaling.value = false;
         scalingAdditionalDice.value = '';
         scalingAdditionalTargets.value = 0;
+        scalingAdditionalAreaSize.value = 0;
         scalingDescription.value = '';
         cantripScalingTiers.value = [];
 
@@ -397,7 +413,8 @@ export function useSpellForm(
         usesMax.value = 1;
         usesCurrent.value = 1;
         usesRecovery.value = 'longRest';
-        sourceKey.value = 'hb';
+        sourceKey.value = FALLBACK_SOURCE_KEY;
+        source.value = undefined;
         isSRD.value = false;
         classKeys.value = [];
 
@@ -490,8 +507,9 @@ export function useSpellForm(
   }
 
   /**
-   * Готовит блок масштабирования уровневого заклинания. «Доп. целей за круг»
-   * живёт в секции целей и не зависит от галочки «Усиление» (та отвечает за
+   * Готовит блок масштабирования уровневого заклинания. «Доп. целей за круг» и
+   * «Рост области за круг» живут в секциях целей и области и не зависят от
+   * галочки «Усиление» (та отвечает за
    * кости и описание); у снарядных заклинаний рост целей задаёт
    * `projectiles.perSlotLevel`, поэтому поле подавляется.
    */
@@ -505,6 +523,12 @@ export function useSpellForm(
         ? scalingAdditionalTargets.value
         : undefined;
 
+    // Рост области — только у заклинания с областью, как и сама область
+    const additionalAreaSize =
+      targetType.value === 'area' && scalingAdditionalAreaSize.value > 0
+        ? scalingAdditionalAreaSize.value
+        : undefined;
+
     const additionalDice = hasScaling.value
       ? scalingAdditionalDice.value || undefined
       : undefined;
@@ -516,6 +540,7 @@ export function useSpellForm(
     if (
       additionalDice === undefined
       && additionalTargets === undefined
+      && additionalAreaSize === undefined
       && scalingText === undefined
     ) {
       return undefined;
@@ -524,6 +549,7 @@ export function useSpellForm(
     return {
       additionalDice,
       additionalTargets,
+      additionalAreaSize,
       description: scalingText,
     };
   }
@@ -608,6 +634,7 @@ export function useSpellForm(
       saveEffect: saveType.value !== 'none' ? saveEffect.value : undefined,
       attackAbility: attackAbility.value || undefined,
       attackBonus: attackBonus.value || undefined,
+      saveDC: readSpellOwnSaveDC({ saveDC: saveDC.value }),
 
       scaling: buildScaling(),
       cantripScalingTiers: buildCantripTiers(),
@@ -627,6 +654,7 @@ export function useSpellForm(
       alwaysPrepared: alwaysPrepared.value,
 
       sourceKey: sourceKey.value || undefined,
+      source: source.value,
       isSRD: isSRD.value || undefined,
 
       classKeys: classKeys.value.length > 0 ? classKeys.value : undefined,
@@ -673,6 +701,7 @@ export function useSpellForm(
     saveEffect,
     attackAbility,
     attackBonus,
+    saveDC,
     hasProjectiles,
     projectileCount,
     projectilePerSlotLevel,
@@ -683,6 +712,7 @@ export function useSpellForm(
     hasScaling,
     scalingAdditionalDice,
     scalingAdditionalTargets,
+    scalingAdditionalAreaSize,
     scalingDescription,
     cantripScalingTiers,
     addCantripTier,
@@ -698,6 +728,7 @@ export function useSpellForm(
     usesCurrent,
     usesRecovery,
     sourceKey,
+    source,
     isSRD,
     classKeys,
     activeEffects,
@@ -713,7 +744,6 @@ export function useSpellForm(
     SAVE_EFFECT_OPTIONS,
     SPELL_LEVEL_OPTIONS,
     damageTypeOptions,
-    sourceOptions,
 
     buildSpell,
   };
