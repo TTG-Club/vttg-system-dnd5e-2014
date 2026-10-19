@@ -11,6 +11,7 @@ import type {
   FeatChoice,
   GrantedSpellSource,
   ResolvedGrantedSpell,
+  SpeciesAbilityIncrease,
   SpeciesDefinition,
   SpeciesFeatDataSource,
   SpeciesFeature,
@@ -25,9 +26,11 @@ import {
   appendGrantedSpells,
   applyFeatChoiceSelections,
   applyFeatDataProficiencies,
+  areSpeciesAbilityChoicesComplete,
   buildFeatGrantEffect,
   buildTakenFeat,
   calculateProficiencyBonus,
+  collectSpeciesAbilityIncreases,
   collectSpeciesFeatDataSources,
   collectSpeciesGrantedSpellSources,
   collectSubspecies,
@@ -523,6 +526,16 @@ export function useSpeciesWizard(
   });
 
   /**
+   * Повышения характеристик расы, подрасы и особенностей. В редакции 2014 их
+   * даёт раса, а не предыстория; выбор прибавки спрашивает отдельный шаг
+   * «Характеристики», ответ ложится в ответы блока даров источника — оттуда его
+   * читает эффект даров при применении.
+   */
+  const abilityIncreases = computed<SpeciesAbilityIncrease[]>(() =>
+    collectSpeciesAbilityIncreases(featDataSources.value),
+  );
+
+  /**
    * Выборы черты в дарах вида: «Универсальность» человека просит черту
    * происхождения. Отделены от остальных вопросов — их спрашивает пикер
    * компендиума, а общие поля выбора показали бы пустой список.
@@ -704,6 +717,13 @@ export function useSpeciesWizard(
       });
     }
 
+    if (abilityIncreases.value.length > 0) {
+      result.push({
+        key: 'abilities',
+        title: SPECIES_WIZARD_LABELS.stepAbilities,
+      });
+    }
+
     // Есть ли гранты с выбором?
     const hasGrantChoices = (speciesDef.value.grants ?? []).some((grant) => {
       if (grant.type === 'skillProficiency' && grant.count > 0) {
@@ -778,6 +798,13 @@ export function useSpeciesWizard(
 
     if (stepKey === 'subspecies') {
       return state.value.subspeciesKey !== null;
+    }
+
+    if (stepKey === 'abilities') {
+      return areSpeciesAbilityChoicesComplete(
+        abilityIncreases.value,
+        state.value.featDataChoices,
+      );
     }
 
     if (stepKey === 'grants') {
@@ -1402,6 +1429,7 @@ export function useSpeciesWizard(
     subspeciesOptions,
     selectedSubspecies,
     featDataSources,
+    abilityIncreases,
     featPickChoices,
     grantedFeatQuestions,
     needsCompendiumFeats,

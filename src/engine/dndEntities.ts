@@ -40,7 +40,6 @@ import type {
 
 import type { ActiveEffect, EffectUseArea } from './activeEffectTypes.js';
 import type {
-  BackgroundAbilityGrant,
   BackgroundEquipmentOption,
   BackgroundFeatGrant,
   BackgroundSkillGrant,
@@ -280,8 +279,6 @@ export interface DnDGameItem extends BaseGameItem {
    * английского названия при создании в панели «Предметы».
    */
   key?: string;
-  /** Повышение характеристик от предыстории */
-  abilityGrant?: BackgroundAbilityGrant;
   /** Владение навыками от предыстории */
   skillGrant?: BackgroundSkillGrant;
   /** Владение инструментами от предыстории */

@@ -1,6 +1,6 @@
 import type { Ref } from 'vue';
 
-import type { AbilityType, Feature, TypedWebSocketClient } from '@vtt/shared';
+import type { Feature, TypedWebSocketClient } from '@vtt/shared';
 import type {
   ActorBackgroundEntry,
   AppliedFeatMeta,
@@ -14,7 +14,7 @@ import type {
 
 import { computed, ref, watch } from 'vue';
 
-import { generateId, pushUnique, typedObjectEntries } from '@vtt/shared';
+import { generateId, pushUnique } from '@vtt/shared';
 import {
   appendGrantedSpells,
   applyFeatChoiceSelections,
@@ -47,7 +47,7 @@ import {
 } from './backgroundRollback';
 
 export type BackgroundWizardStep =
-  'overview' | 'featChoices' | 'tools' | 'abilities' | 'equipment';
+  'overview' | 'featChoices' | 'tools' | 'equipment';
 
 /**
  * Имя-источник заклинаний, выданных СОБСТВЕННЫМ `featData` предыстории —
@@ -79,7 +79,7 @@ export function useBackgroundWizard(
 ) {
   /**
    * Определение с достроенными блоками даров: записи компендиума отдают
-   * `toolGrant`/`skillGrant`/`abilityGrant`/`featGrant`/`equipmentOptions`
+   * `toolGrant`/`skillGrant`/`featGrant`/`equipmentOptions`
    * частично (в паках TTG Club `toolGrant` не приходит вовсе), а мастер и его
    * шаги читают их напрямую. Возвращается наружу — шаги должны получать ровно
    * то же определение, с которым работает мастер.
@@ -99,8 +99,6 @@ export function useBackgroundWizard(
     total: 3,
   });
 
-  const selectedScheme = ref<'+2/+1' | '+1/+1/+1'>('+2/+1');
-  const abilityAllocation = ref<Partial<Record<AbilityType, number>>>({});
   /** Выбранное из собственного списка предыстории (`toolGrant.choices`) */
   const toolSelections = ref<string[]>([]);
   /** Ключи, разобранные из текстового владения компендиума (`toolGrant.items`) */
@@ -239,7 +237,7 @@ export function useBackgroundWizard(
     const def = definition.value;
 
     if (!def) {
-      return ['overview', 'abilities', 'equipment'];
+      return ['overview', 'equipment'];
     }
 
     const steps: BackgroundWizardStep[] = ['overview'];
@@ -261,14 +259,14 @@ export function useBackgroundWizard(
       steps.push('tools');
     }
 
-    steps.push('abilities', 'equipment');
+    // Характеристики в редакции 2014 поднимает раса, а не предыстория — шага
+    // распределения повышений у мастера предыстории нет
+    steps.push('equipment');
 
     return steps;
   });
 
   function resetState() {
-    selectedScheme.value = '+2/+1';
-    abilityAllocation.value = {};
     toolSelections.value = [];
     grantedTools.value = [];
     grantComplete.value = true;
@@ -370,33 +368,6 @@ export function useBackgroundWizard(
 
       if (!grantComplete.value) {
         return false;
-      }
-    }
-
-    if (currentStepInfo.value.stepGroup === 'abilities') {
-      const values = Object.values(abilityAllocation.value);
-
-      const totalAllocated = values.reduce(
-        (sum, val) => (sum ?? 0) + (val ?? 0),
-        0,
-      );
-
-      // Для обеих схем в сумме должно быть 3 очка (2+1=3, 1+1+1=3)
-      if (totalAllocated !== 3) {
-        return false;
-      }
-
-      // Проверка структуры: для 2/1 должно быть ровно 2 стата (один 2, другой 1)
-      if (selectedScheme.value === '+2/+1') {
-        const hasTwo = values.includes(2);
-        const hasOne = values.includes(1);
-
-        return hasTwo && hasOne && values.length === 2;
-      }
-
-      // Для 1/1/1 должно быть ровно 3 стата по 1
-      if (selectedScheme.value === '+1/+1/+1') {
-        return values.length === 3 && values.every((value) => value === 1);
       }
     }
 
@@ -568,39 +539,6 @@ export function useBackgroundWizard(
       baseFeatures.push(fallbackFeat);
     }
 
-    // 4. Создаём Active Effect для бонусов характеристик от предыстории
-    const abilityChanges: import('@vtt/shared/system/dnd.js').EffectChange[] =
-      [];
-
-    for (const [abilityKey, bonus] of typedObjectEntries<AbilityType, number>(
-      abilityAllocation.value,
-    )) {
-      if (bonus && bonus > 0) {
-        abilityChanges.push({
-          key: `ability.${abilityKey}`,
-          mode: 'add',
-          value: String(bonus),
-          priority: 10,
-        });
-      }
-    }
-
-    if (abilityChanges.length > 0) {
-      baseEffects.push({
-        id: generateId('eff'),
-        name: `Предыстория: ${def.name}`,
-        description: `Бонусы характеристик от предыстории «${def.name}»`,
-        icon: 'tabler:book',
-        disabled: false,
-        origin: 'feature',
-        originId: `background:${def.key}`,
-        transfer: false,
-        duration: { type: 'permanent' },
-        changes: abilityChanges,
-        flags: [],
-      });
-    }
-
     // 4.5. Применяем СОБСТВЕННЫЕ расширенные дары предыстории (featData):
     // владения, защиты/иммунитеты, тёмное зрение, авторские эффекты — по образцу
     // черты, но с провенансом background:<key> (характеристики и навыки идут
@@ -752,7 +690,6 @@ export function useBackgroundWizard(
       backgroundKey: def.key,
       ...(packIdRef.value ? { packId: packIdRef.value } : {}),
       backgroundName: def.name,
-      abilityChoices: { ...abilityAllocation.value },
       skillChoices: [...def.skillGrant.skills],
       toolChoices: [...toolSelections.value, ...grantedTools.value],
       grantedFeatId,
@@ -850,8 +787,6 @@ export function useBackgroundWizard(
   return {
     definition,
     currentStepInfo,
-    selectedScheme,
-    abilityAllocation,
     toolSelections,
     grantedTools,
     grantComplete,

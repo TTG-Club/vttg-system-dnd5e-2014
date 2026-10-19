@@ -55,10 +55,17 @@ function abilityLabel(ability: string): string {
   return isAbilityType(ability) ? ABILITY_LABELS[ability] : ability;
 }
 
-/** Строка повышения характеристик. */
-function abilityScoreLine(featData: FeatData): string | null {
-  const asi = featData.abilityScoreIncrease;
-
+/**
+ * Повышение характеристик одной строкой: «+2 Телосложение, +1 к 2× любая
+ * характеристика (на выбор)». Общая для сводки даров и карточки расы — в
+ * редакции 2014 повышение даёт раса, и показывать его надо одинаково.
+ *
+ * @param asi - повышение характеристик блока даров
+ * @returns строка либо `null`, если повышать нечего
+ */
+export function formatAbilityScoreIncrease(
+  asi: FeatData['abilityScoreIncrease'],
+): string | null {
   if (!asi) {
     return null;
   }
@@ -88,7 +95,14 @@ function abilityScoreLine(featData: FeatData): string | null {
     parts.push(`не выше ${asi.upto}`);
   }
 
-  return parts.length > 0 ? `- **Характеристики:** ${parts.join(', ')}` : null;
+  return parts.length > 0 ? parts.join(', ') : null;
+}
+
+/** Строка повышения характеристик. */
+function abilityScoreLine(featData: FeatData): string | null {
+  const line = formatAbilityScoreIncrease(featData.abilityScoreIncrease);
+
+  return line ? `- **Характеристики:** ${line}` : null;
 }
 
 /** Строка владений. */

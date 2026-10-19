@@ -14,6 +14,7 @@
   import {
     DAMAGE_DEFENSE_KIND_LABELS,
     DAMAGE_TYPE_LABELS,
+    formatAbilityScoreIncrease,
     formatSpeciesSizeWithHeight,
     getConditionEntry,
   } from '@vtt/shared/system/dnd.js';
@@ -138,6 +139,18 @@
     }
 
     const grants: { title: string; desc: string }[] = [];
+
+    // Повышение характеристик: в редакции 2014 его даёт раса, а не предыстория
+    const abilityIncrease = formatAbilityScoreIncrease(
+      props.speciesDefinition.featData?.abilityScoreIncrease,
+    );
+
+    if (abilityIncrease) {
+      grants.push({
+        title: SPECIES_DETAIL_LABELS.abilityIncrease,
+        desc: abilityIncrease,
+      });
+    }
 
     (props.speciesDefinition.grants ?? []).forEach((grant) => {
       if (grant.type === 'darkvision') {

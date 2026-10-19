@@ -1,8 +1,11 @@
 /**
- * Типы данных предысторий D&D 5e (PHB 2024)
+ * Типы данных предысторий D&D 5e (PHB 2014)
  *
  * Определяет структуру данных предыстории в компендиуме (BackgroundDefinition)
  * и запись на акторе (ActorBackgroundEntry).
+ *
+ * Отличие от редакции 2024: предыстория НЕ повышает характеристики — в 2014 их
+ * поднимают раса и подраса (`featData.abilityScoreIncrease` записи вида).
  */
 
 import type { AbilityType, SkillType, SourceDefinition } from '@vtt/shared';
@@ -13,12 +16,6 @@ import type { StartingEquipmentOption } from './startingEquipment.js';
 
 /** Ключ предыстории (string для поддержки пользовательских предысторий) */
 export type BackgroundKey = string;
-
-/** Грант повышения характеристик предыстории */
-export interface BackgroundAbilityGrant {
-  /** 3 характеристики, между которыми распределяется +2/+1 или +1/+1/+1 */
-  abilities: AbilityType[];
-}
 
 /** Грант навыков предыстории */
 export interface BackgroundSkillGrant {
@@ -94,8 +91,6 @@ export interface BackgroundDefinition {
    */
   automation?: boolean;
 
-  /** Повышение характеристик */
-  abilityGrant: BackgroundAbilityGrant;
   /** Навыки */
   skillGrant: BackgroundSkillGrant;
   /** Владение инструментами */
@@ -128,8 +123,6 @@ export interface ActorBackgroundEntry {
   packId?: string;
   /** Русское название */
   backgroundName: string;
-  /** Выбранное распределение характеристик: { strength: 2, wisdom: 1 } */
-  abilityChoices: Partial<Record<AbilityType, number>>;
   /** Навыки, полученные от предыстории */
   skillChoices: SkillType[];
   /** Выбранные инструменты (если был выбор) */

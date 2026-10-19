@@ -1,6 +1,5 @@
 <script setup lang="ts">
   import type {
-    AbilityType,
     SkillType,
     SourceDefinition,
     TypedWebSocketClient,
@@ -24,7 +23,6 @@
   import { useItemsStore } from '@/stores/itemsStore';
   import { generateId } from '@vtt/shared';
   import {
-    ABILITY_OPTIONS,
     CLASS_KEY_OPTIONS,
     isDnDGameItem,
     resolveBackgroundFeatClassKey,
@@ -109,11 +107,6 @@
   const itemsStore = useItemsStore();
   const { openModal } = useModalManager();
 
-  const abilitiesOptions = ABILITY_OPTIONS.map((ability) => ({
-    value: ability.value,
-    label: ability.label,
-  }));
-
   const skillsOptions = SKILLS_LIST.map((skill) => ({
     value: skill.key,
     label: skill.label,
@@ -141,8 +134,8 @@
   const source = ref<SourceDefinition | undefined>(undefined);
   const isSRD = ref(false);
 
-  // Канонические дары предыстории (2024).
-  const selectedAbilities = ref<AbilityType[]>([]);
+  // Канонические дары предыстории. Повышения характеристик среди них нет: в
+  // редакции 2014 его даёт раса.
   const selectedSkills = ref<SkillType[]>([]);
   const selectedFixedTools = ref<string[]>([]);
   const choicesToolsCount = ref(0);
@@ -305,7 +298,6 @@
     sourceKey.value = undefined;
     source.value = undefined;
     isSRD.value = false;
-    selectedAbilities.value = [];
     selectedSkills.value = [];
     selectedFixedTools.value = [];
     choicesToolsCount.value = 0;
@@ -329,7 +321,6 @@
     source.value = bg.source;
     isSRD.value = bg.isSRD || false;
 
-    selectedAbilities.value = [...(bg.abilityGrant?.abilities ?? [])];
     selectedSkills.value = [...(bg.skillGrant?.skills ?? [])];
 
     // Владение приходит не только ключами: компендиум пишет его текстом, а
@@ -442,9 +433,6 @@
       equipped: false,
       isReadOnly: false,
 
-      abilityGrant: {
-        abilities: [...selectedAbilities.value],
-      },
       skillGrant: {
         skills: [...selectedSkills.value],
       },
@@ -578,41 +566,27 @@
           </div>
         </template>
 
-        <!-- ПАРАМЕТРЫ (канонические дары 2024) -->
+        <!-- ПАРАМЕТРЫ (канонические дары) -->
         <template #params>
           <div class="flex flex-col gap-4">
             <FormSection
-              :title="BACKGROUND_FORM_LABELS.abilitiesTitle"
+              :title="BACKGROUND_FORM_LABELS.skillsTitle"
               icon="tabler:arrow-big-up-lines"
             >
-              <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <UFormField :label="BACKGROUND_FORM_LABELS.abilities">
-                  <USelectMenu
-                    v-model="selectedAbilities"
-                    :items="abilitiesOptions"
-                    value-key="value"
-                    label-key="label"
-                    multiple
-                    class="w-full"
-                    :placeholder="BACKGROUND_FORM_LABELS.abilitiesPlaceholder"
-                  />
-                </UFormField>
-
-                <UFormField :label="BACKGROUND_FORM_LABELS.skills">
-                  <USelectMenu
-                    v-model="selectedSkills"
-                    :items="skillsOptions"
-                    value-key="value"
-                    label-key="label"
-                    multiple
-                    class="w-full"
-                    :placeholder="BACKGROUND_FORM_LABELS.skillsPlaceholder"
-                  />
-                </UFormField>
-              </div>
+              <UFormField :label="BACKGROUND_FORM_LABELS.skills">
+                <USelectMenu
+                  v-model="selectedSkills"
+                  :items="skillsOptions"
+                  value-key="value"
+                  label-key="label"
+                  multiple
+                  class="w-full"
+                  :placeholder="BACKGROUND_FORM_LABELS.skillsPlaceholder"
+                />
+              </UFormField>
 
               <p class="mt-2 text-xs text-dimmed">
-                {{ BACKGROUND_FORM_LABELS.abilitiesHint }}
+                {{ BACKGROUND_FORM_LABELS.skillsHint }}
               </p>
             </FormSection>
 

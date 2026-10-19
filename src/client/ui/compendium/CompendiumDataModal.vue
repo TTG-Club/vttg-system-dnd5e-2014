@@ -1541,8 +1541,13 @@
   function isBackgroundDefinition(
     value: CompendiumDataItem,
   ): value is { key: string; id?: string; [key: string]: unknown } {
+    // Предыстория узнаётся по своему типу: повышения характеристик, по которому
+    // её отличали раньше, в редакции 2014 у неё нет
     return (
-      'key' in value && typeof value.key === 'string' && 'abilityGrant' in value
+      'key' in value
+      && typeof value.key === 'string'
+      && 'type' in value
+      && value.type === 'background'
     );
   }
 

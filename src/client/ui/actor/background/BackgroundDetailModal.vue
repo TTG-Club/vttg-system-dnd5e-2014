@@ -10,7 +10,6 @@
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { useChatStore } from '@/stores/chatStore';
   import {
-    ABILITY_LABELS,
     buildFeatGrantsSummary,
     SKILLS_LABELS,
     toolProficiencyLabel,
@@ -57,17 +56,6 @@
       ? { x: props.positionOffset, y: props.positionOffset }
       : undefined,
   );
-
-  /** Список характеристик с русскими названиями */
-  const abilitiesDisplay = computed(() => {
-    if (!data.value?.abilityGrant?.abilities) {
-      return '';
-    }
-
-    return data.value.abilityGrant.abilities
-      .map((ability) => ABILITY_LABELS[ability] || ability)
-      .join(', ');
-  });
 
   /** Список навыков с русскими названиями */
   const skillsDisplay = computed(() => {
@@ -232,22 +220,7 @@
             <ItemDescriptionRenderer :content="data.description" />
 
             <!-- Основные характеристики в виде сетки -->
-            <div class="grid grid-cols-3 gap-2">
-              <!-- Характеристики -->
-              <div
-                class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"
-              >
-                <span
-                  class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
-                >
-                  {{ BACKGROUND_DETAIL_LABELS.abilities }}
-                </span>
-
-                <p class="mt-0.5 text-sm font-semibold text-highlighted">
-                  {{ abilitiesDisplay }}
-                </p>
-              </div>
-
+            <div class="grid grid-cols-2 gap-2">
               <!-- Навыки -->
               <div
                 class="rounded-lg border border-default/50 bg-elevated/30 px-3 py-2.5 text-center"

@@ -3,7 +3,7 @@
  *
  * Записи компендиума приходят из разных источников (паки TTG Club, паки модулей
  * мира, предметы, созданные в панели «Предметы»), и блоки даров в них
- * НЕОБЯЗАТЕЛЬНЫ: контракт Ядра помечает `abilityGrant`/`skillGrant`/`toolGrant`/
+ * НЕОБЯЗАТЕЛЬНЫ: контракт Ядра помечает `skillGrant`/`toolGrant`/
  * `featGrant`/`equipmentOptions` опциональными (`DnDGameItem`), а отдача TTG Club
  * дополнительно вырезает пустые блоки (`@JsonInclude(NON_NULL)`) и вовсе не
  * отдаёт `toolGrant` — владение инструментами хранится там свободным текстом,
@@ -100,7 +100,6 @@ export function normalizeBackgroundDefinition(
 
   return {
     ...raw,
-    abilityGrant: { abilities: raw.abilityGrant?.abilities ?? [] },
     skillGrant: { skills: raw.skillGrant?.skills ?? [] },
     toolGrant: normalizeToolGrant(raw.toolGrant),
     featGrant: { ...raw.featGrant, featName: raw.featGrant?.featName ?? '' },

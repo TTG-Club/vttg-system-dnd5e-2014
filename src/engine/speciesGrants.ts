@@ -1,4 +1,4 @@
-import type { MovementType } from '@vtt/shared';
+import type { AbilityType, MovementType } from '@vtt/shared';
 
 import type { DnDActor } from './dndEntities.js';
 import type { FeatData } from './featTypes.js';
@@ -10,7 +10,9 @@ import type {
 } from './speciesTypes.js';
 import type { ActorCounterState } from './types.js';
 
+import { ABILITY_OPTIONS, isAbilityType } from './consts.js';
 import { counterIdentity } from './counterIds.js';
+import { ABILITY_INCREASE_CHOICE_KEY } from './featChoices.js';
 import {
   buildFeatCounters,
   isSpeciesCounter,
@@ -490,4 +492,163 @@ export function collectSpeciesGrantedSpellSources(
   }
 
   return sources;
+}
+
+/**
+ * Повышение характеристик одного источника даров вида — расы, подрасы или
+ * особенности.
+ *
+ * В редакции 2014 характеристики поднимает раса, а не предыстория: дварф даёт
+ * +2 Телосложения, горный дварф сверху +2 Силы, полуэльф — +2 Харизмы и по +1
+ * к двум другим на выбор. Хранится повышение в блоке даров записи
+ * (`featData.abilityScoreIncrease`) — той же формы, что у черты, поэтому его
+ * правит общий редактор даров, а применяет общий эффект даров
+ * (`buildFeatGrantEffect`).
+ */
+export interface SpeciesAbilityIncrease {
+  /** Ключ источника — под ним лежат ответы игрока ({@link SpeciesFeatDataSource.sourceKey}) */
+  sourceKey: string;
+  /** Название источника — подпись группы в мастере */
+  sourceName: string;
+  /** Фиксированные прибавки: применяются без вопросов */
+  fixed: Partial<Record<AbilityType, number>>;
+  /** Прибавка на выбор; `null` — выбирать нечего */
+  choice: SpeciesAbilityIncreaseChoice | null;
+}
+
+/** Прибавка характеристик на выбор: `+amount` к `count` характеристикам из `from`. */
+export interface SpeciesAbilityIncreaseChoice {
+  /** Ключ ответа в блоке ответов источника — тот же, что читает эффект даров */
+  key: string;
+  amount: number;
+  count: number;
+  /** Характеристики, из которых выбирают */
+  from: AbilityType[];
+}
+
+/**
+ * Собирает повышения характеристик из источников даров вида.
+ *
+ * Пустой набор `from` у выбора означает «любая, кроме уже поднятых этим же
+ * источником»: так в PHB 2014 записан полуэльф — «две другие характеристики на
+ * ваш выбор». Повышение, привязанное к чужому выбору (`fromChoiceKey`), здесь не
+ * спрашивается: его характеристику называет ответ на тот выбор.
+ *
+ * @param sources - источники даров вида ({@link collectSpeciesFeatDataSources})
+ * @returns повышения источников, у которых они есть
+ */
+export function collectSpeciesAbilityIncreases(
+  sources: ReadonlyArray<SpeciesFeatDataSource>,
+): SpeciesAbilityIncrease[] {
+  const increases: SpeciesAbilityIncrease[] = [];
+
+  for (const source of sources) {
+    const increase = source.featData.abilityScoreIncrease;
+
+    if (!increase) {
+      continue;
+    }
+
+    const fixed: Partial<Record<AbilityType, number>> = {};
+
+    for (const [ability, bonus] of Object.entries(increase.fixed ?? {})) {
+      if (isAbilityType(ability) && typeof bonus === 'number' && bonus !== 0) {
+        fixed[ability] = bonus;
+      }
+    }
+
+    let choice: SpeciesAbilityIncreaseChoice | null = null;
+
+    if (increase.choice && !increase.fromChoiceKey) {
+      const from =
+        increase.choice.from && increase.choice.from.length > 0
+          ? increase.choice.from.filter(isAbilityType)
+          : ABILITY_OPTIONS.map((option) => option.value).filter(
+              (ability) => fixed[ability] === undefined,
+            );
+
+      choice = {
+        key: ABILITY_INCREASE_CHOICE_KEY,
+        amount: increase.choice.amount ?? 1,
+        count: Math.min(
+          increase.choice.count > 0 ? increase.choice.count : 1,
+          from.length,
+        ),
+        from,
+      };
+    }
+
+    if (Object.keys(fixed).length === 0 && !choice) {
+      continue;
+    }
+
+    increases.push({
+      sourceKey: source.sourceKey,
+      sourceName: source.sourceName,
+      fixed,
+      choice,
+    });
+  }
+
+  return increases;
+}
+
+/**
+ * Итоговые прибавки характеристик вида: фиксированные всех источников плюс
+ * выбранные игроком.
+ *
+ * @param increases - повышения источников ({@link collectSpeciesAbilityIncreases})
+ * @param answers - ответы игрока: ключ источника → ответы его блока даров
+ * @returns прибавка по характеристике; характеристик без прибавки в нём нет
+ */
+export function sumSpeciesAbilityIncreases(
+  increases: ReadonlyArray<SpeciesAbilityIncrease>,
+  answers: Record<string, Record<string, string[]>>,
+): Partial<Record<AbilityType, number>> {
+  const totals: Partial<Record<AbilityType, number>> = {};
+
+  const add = (ability: AbilityType, bonus: number): void => {
+    totals[ability] = (totals[ability] ?? 0) + bonus;
+  };
+
+  for (const increase of increases) {
+    for (const [ability, bonus] of Object.entries(increase.fixed)) {
+      if (isAbilityType(ability) && typeof bonus === 'number') {
+        add(ability, bonus);
+      }
+    }
+
+    if (!increase.choice) {
+      continue;
+    }
+
+    const { choice } = increase;
+
+    for (const ability of answers[increase.sourceKey]?.[choice.key] ?? []) {
+      if (isAbilityType(ability) && choice.from.includes(ability)) {
+        add(ability, choice.amount);
+      }
+    }
+  }
+
+  return totals;
+}
+
+/**
+ * Сделаны ли все выборы прибавок: в каждой группе выбрано ровно столько
+ * характеристик, сколько она даёт.
+ *
+ * @param increases - повышения источников ({@link collectSpeciesAbilityIncreases})
+ * @param answers - ответы игрока: ключ источника → ответы его блока даров
+ */
+export function areSpeciesAbilityChoicesComplete(
+  increases: ReadonlyArray<SpeciesAbilityIncrease>,
+  answers: Record<string, Record<string, string[]>>,
+): boolean {
+  return increases.every(
+    (increase) =>
+      !increase.choice
+      || (answers[increase.sourceKey]?.[increase.choice.key] ?? []).length
+        === increase.choice.count,
+  );
 }

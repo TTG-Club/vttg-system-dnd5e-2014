@@ -12,6 +12,7 @@
   import { useGrantedSpellsResolver } from '../../../composables/useGrantedSpellsResolver';
   import { MODAL_BUTTON_LABELS, SPECIES_WIZARD_LABELS } from '../constants';
   import { useSpeciesWizard } from './useSpeciesWizard';
+  import WizardStepAbilities from './WizardStepAbilities.vue';
   import WizardStepFeatures from './WizardStepFeatures.vue';
   import WizardStepGrants from './WizardStepGrants.vue';
   import WizardStepOverview from './WizardStepOverview.vue';
@@ -90,6 +91,7 @@
     grantedSpellSources,
     subspeciesOptions,
     featDataSources,
+    abilityIncreases,
     featPickChoices,
     grantedFeatQuestions,
     needsCompendiumFeats,
@@ -283,6 +285,13 @@
             v-if="activeStepKey === 'subspecies'"
             v-model:state="state"
             :subspecies-options="subspeciesOptions"
+          />
+
+          <WizardStepAbilities
+            v-if="activeStepKey === 'abilities'"
+            v-model:state="state"
+            :increases="abilityIncreases"
+            :current-abilities="actor.system.abilities"
           />
 
           <WizardStepGrants

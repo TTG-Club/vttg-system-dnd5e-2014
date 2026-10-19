@@ -42,7 +42,6 @@
     backgroundSpellSource,
     useBackgroundWizard,
   } from './useBackgroundWizard';
-  import WizardStepAbilities from './WizardStepAbilities.vue';
   import WizardStepEquipment from './WizardStepEquipment.vue';
   import WizardStepOverview from './WizardStepOverview.vue';
   import WizardStepTools from './WizardStepTools.vue';
@@ -83,8 +82,6 @@
   const {
     definition,
     currentStepInfo,
-    selectedScheme,
-    abilityAllocation,
     toolSelections,
     grantedTools,
     grantComplete,
@@ -115,7 +112,6 @@
       overview: BACKGROUND_WIZARD_LABELS.tabOverview,
       featChoices: BACKGROUND_WIZARD_LABELS.tabFeatChoices,
       tools: GRANT_SECTION_LABELS.tools,
-      abilities: BACKGROUND_WIZARD_LABELS.tabAbilities,
       equipment: GRANT_SECTION_LABELS.equipment,
     };
 
@@ -554,16 +550,7 @@
               @update:grant-complete="grantComplete = $event"
             />
 
-            <!-- Шаг 2: Характеристики -->
-            <WizardStepAbilities
-              v-else-if="currentStepInfo.stepGroup === 'abilities'"
-              v-model:selected-scheme="selectedScheme"
-              v-model:ability-allocation="abilityAllocation"
-              :background-definition="definition"
-              :current-abilities="actor.system.abilities"
-            />
-
-            <!-- Шаг 3: Снаряжение -->
+            <!-- Шаг 2: Снаряжение -->
             <WizardStepEquipment
               v-else-if="currentStepInfo.stepGroup === 'equipment'"
               v-model:selected-index="selectedEquipmentIndex"
