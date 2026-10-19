@@ -42,6 +42,7 @@ import type { ActiveEffect, EffectUseArea } from './activeEffectTypes.js';
 import type {
   BackgroundEquipmentOption,
   BackgroundFeatGrant,
+  BackgroundFeature,
   BackgroundSkillGrant,
   BackgroundToolGrant,
 } from './backgroundTypes.js';
@@ -285,6 +286,8 @@ export interface DnDGameItem extends BaseGameItem {
   toolGrant?: BackgroundToolGrant;
   /** Черта, даруемая предысторией */
   featGrant?: BackgroundFeatGrant;
+  /** Умение предыстории (редакция 2014) — ложится на лист вместо черты */
+  feature?: BackgroundFeature;
   /** Стартовое снаряжение предыстории */
   equipmentOptions?: BackgroundEquipmentOption[];
   // --- Spell-specific (только для type === 'spell') ---

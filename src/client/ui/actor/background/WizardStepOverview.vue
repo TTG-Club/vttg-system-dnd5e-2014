@@ -49,6 +49,34 @@
   }
 
   /**
+   * Открывает описание умения предыстории (редакция 2014).
+   */
+  function openFeatureDescription() {
+    const { feature } = props.backgroundDefinition;
+
+    if (!feature) {
+      return;
+    }
+
+    openModal('ActorDescriptionModal', {
+      _modalKey: `background-feature:${props.backgroundDefinition.key}`,
+      title: feature.name,
+      subtitle: props.backgroundDefinition.name,
+      sourceKey: props.backgroundDefinition.sourceKey,
+      description: feature.description,
+    });
+  }
+
+  /** Есть ли у предыстории черта: у предысторий 2014 её нет */
+  const hasFeat = computed(() => {
+    const { featGrant } = props.backgroundDefinition;
+
+    return (
+      Boolean(featGrant.featName) || Boolean(featGrant.featChoices?.length)
+    );
+  });
+
+  /**
    * Строка «сколько инструментов на выбор»: перед числом встаёт связка
    * перечисления, если выданные инструменты уже перечислены до него. Склейка
    * строкой, а не шаблоном: хвост начинается с пробела, и разорви форматтер
@@ -158,6 +186,25 @@
       </div>
 
       <div
+        v-if="backgroundDefinition.feature?.name"
+        class="col-span-2 flex flex-col gap-2 rounded-lg border border-default/50 bg-elevated/30 p-3"
+      >
+        <span
+          class="block text-[10px] font-medium tracking-wider text-dimmed uppercase"
+        >
+          {{ BACKGROUND_WIZARD_LABELS.featureTitle }}
+        </span>
+
+        <button
+          class="self-start text-left text-sm font-medium text-healing hover:text-healing/80 hover:underline"
+          @click.left.exact.prevent="openFeatureDescription"
+        >
+          {{ backgroundDefinition.feature.name }}
+        </button>
+      </div>
+
+      <div
+        v-if="hasFeat"
         class="col-span-2 flex flex-col gap-2 rounded-lg border border-default/50 bg-elevated/30 p-3"
       >
         <span

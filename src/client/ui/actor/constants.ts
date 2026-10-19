@@ -3131,6 +3131,8 @@ export const BACKGROUND_DETAIL_LABELS = {
   /** Хвост строки выбора инструментов — перед ним идёт их число */
   toolChoiceSuffix: ' на выбор из списка',
   featTitle: 'ЧЕРТА',
+  /** Заголовок умения предыстории (редакция 2014): черты у неё нет */
+  featureTitle: 'УМЕНИЕ',
   featChoicePrefix: 'На выбор одна из черт:',
   extraGrantsTitle: 'ДОПОЛНИТЕЛЬНЫЕ ДАРЫ',
   equipmentTitle: 'СНАРЯЖЕНИЕ',
@@ -3976,6 +3978,8 @@ export const BACKGROUND_WIZARD_LABELS = {
   empty: 'Предыстория не выбрана. Перетащите предысторию из справочника.',
   sourcePrefix: 'Источник:',
   featTitle: 'Черта',
+  /** Заголовок умения предыстории (редакция 2014): черты у неё нет */
+  featureTitle: 'Умение',
   featPlaceholder: 'Выберите черту',
   featShowDescription: 'Показать описание черты',
   /** Связка перечисления перед последним пунктом */

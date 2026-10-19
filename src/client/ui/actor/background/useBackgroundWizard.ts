@@ -499,14 +499,23 @@ export function useBackgroundWizard(
       }
     }
 
-    // 3. Добавляем черту
-    const grantedFeatId = generateId('feat');
-
+    // 3. Добавляем черту — либо, у предыстории 2014, её умение. Ни того ни
+    // другого нет — на лист ничего не ложится, и откату снимать нечего.
     const srdFeat = srdFeats.find((feat) => feat.id === selectedFeatId.value);
 
-    let grantedFeatName = def.featGrant.featName;
+    const backgroundFeature = def.feature?.name ? def.feature : null;
 
-    if (srdFeat) {
+    const hasGrantedFeature =
+      Boolean(srdFeat)
+      || Boolean(backgroundFeature)
+      || Boolean(def.featGrant.featName);
+
+    const grantedFeatId = hasGrantedFeature ? generateId('feat') : undefined;
+
+    let grantedFeatName: string | undefined =
+      def.featGrant.featName || undefined;
+
+    if (srdFeat && grantedFeatId) {
       grantedFeatName = srdFeat.name;
 
       // Уровень взятия и сделанные выборы живут на самой особенности: по первому
@@ -525,7 +534,21 @@ export function useBackgroundWizard(
       };
 
       baseFeatures.push(applied);
-    } else {
+    } else if (backgroundFeature && grantedFeatId) {
+      grantedFeatName = backgroundFeature.name;
+
+      const applied: Feature & AppliedFeatMeta = {
+        id: grantedFeatId,
+        name: backgroundFeature.name,
+        description: backgroundFeature.description,
+        featureType: 'background',
+        sourceKey: def.sourceKey,
+        isSRD: !!def.isSRD,
+        grantedByBackgroundKey: def.key,
+      };
+
+      baseFeatures.push(applied);
+    } else if (grantedFeatId) {
       const fallbackFeat: Feature & AppliedFeatMeta = {
         id: grantedFeatId,
         name: def.featGrant.featName,
@@ -634,24 +657,27 @@ export function useBackgroundWizard(
     // черта остаётся чертой, а связь с предысторией держит метка
     // `grantedByBackgroundKey` на самой особенности. По ней замена предыстории
     // снимает и черту, и её эффекты (см. откат выше).
-    const featGrantEffect = buildFeatGrantEffect(
-      grantedFeatId,
-      grantedFeatName,
-      grantedFeat,
-      {},
-      {
-        acquisitionLevel: getTotalLevel(actorRef.value.system.classes),
-        walkSpeed: actorRef.value.system.movement?.walk,
-        chosenDamageDefenses: resolveChosenDamageDefenses(
-          grantedFeat,
-          selectedFeatChoices.value,
-        ),
-        chosenAbilities: resolveChosenAbilities(
-          grantedFeat,
-          selectedFeatChoices.value,
-        ),
-      },
-    );
+    const featGrantEffect =
+      srdFeat && grantedFeatId
+        ? buildFeatGrantEffect(
+            grantedFeatId,
+            grantedFeatName ?? srdFeat.name,
+            grantedFeat,
+            {},
+            {
+              acquisitionLevel: getTotalLevel(actorRef.value.system.classes),
+              walkSpeed: actorRef.value.system.movement?.walk,
+              chosenDamageDefenses: resolveChosenDamageDefenses(
+                grantedFeat,
+                selectedFeatChoices.value,
+              ),
+              chosenAbilities: resolveChosenAbilities(
+                grantedFeat,
+                selectedFeatChoices.value,
+              ),
+            },
+          )
+        : null;
 
     if (featGrantEffect) {
       baseEffects.push(featGrantEffect);
@@ -692,8 +718,8 @@ export function useBackgroundWizard(
       backgroundName: def.name,
       skillChoices: [...def.skillGrant.skills],
       toolChoices: [...toolSelections.value, ...grantedTools.value],
-      grantedFeatId,
-      grantedFeatName,
+      ...(grantedFeatId ? { grantedFeatId } : {}),
+      ...(grantedFeatName ? { grantedFeatName } : {}),
     };
 
     if (extraSkills.length > 0) {

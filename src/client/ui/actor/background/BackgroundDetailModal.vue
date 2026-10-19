@@ -256,9 +256,29 @@
               </div>
             </div>
 
+            <!-- Умение предыстории (редакция 2014) -->
+            <div
+              v-if="data.feature?.name"
+              class="rounded-lg border border-default/50 p-4"
+            >
+              <h3
+                class="mb-3 text-sm font-semibold tracking-wider text-primary"
+              >
+                {{ BACKGROUND_DETAIL_LABELS.featureTitle }}
+              </h3>
+
+              <p class="mb-2 text-sm font-medium text-highlighted">
+                {{ data.feature.name }}
+              </p>
+
+              <ItemDescriptionRenderer :content="data.feature.description" />
+            </div>
+
             <!-- Черта от предыстории -->
             <div
-              v-if="data.featGrant"
+              v-if="
+                data.featGrant?.featName || data.featGrant?.featChoices?.length
+              "
               class="rounded-lg border border-default/50 p-4"
             >
               <h3

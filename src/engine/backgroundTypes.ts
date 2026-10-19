@@ -57,6 +57,19 @@ export interface BackgroundFeatGrant {
 }
 
 /**
+ * Умение предыстории редакции 2014 («Убежище верующих», «Военное звание»).
+ *
+ * В 2014 предыстория даёт не черту, а своё умение. Механики у него нет — это
+ * текст, который ложится на лист особенностью предыстории.
+ */
+export interface BackgroundFeature {
+  /** Название умения */
+  name: string;
+  /** Описание умения (может содержать Markdown и HTML) */
+  description: string;
+}
+
+/**
  * Вариант стартового снаряжения предыстории.
  *
  * Позиции ({@link StartingEquipmentOption.items}) необязательны: без них
@@ -95,8 +108,10 @@ export interface BackgroundDefinition {
   skillGrant: BackgroundSkillGrant;
   /** Владение инструментами */
   toolGrant: BackgroundToolGrant;
-  /** Черта */
+  /** Черта; у предысторий 2014 её нет — пустое название, см. {@link feature} */
   featGrant: BackgroundFeatGrant;
+  /** Умение предыстории (редакция 2014), ложится на лист вместо черты */
+  feature?: BackgroundFeature;
   /** Варианты стартового снаряжения */
   equipmentOptions: BackgroundEquipmentOption[];
 
@@ -127,7 +142,7 @@ export interface ActorBackgroundEntry {
   skillChoices: SkillType[];
   /** Выбранные инструменты (если был выбор) */
   toolChoices: string[];
-  /** ID присвоенной черты на акторе (для удаления при замене) */
+  /** ID присвоенной черты либо умения предыстории на акторе (для удаления при замене) */
   grantedFeatId?: string;
   /** Название присвоенной черты (для отображения на листе) */
   grantedFeatName?: string;
