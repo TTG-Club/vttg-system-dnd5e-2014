@@ -790,7 +790,7 @@ export function findScalingParentFeature(
   const [, parentKey, levelText] = match;
 
   // Уровень ключа обязан совпасть с уровнем записи: иначе умение с числом в
-  // собственном ключе («weapon-mastery-2») сочли бы ступенью чужого роста
+  // собственном ключе («extra-attack-2») сочли бы ступенью чужого роста
   if (Number(levelText) !== feature.level) {
     return undefined;
   }

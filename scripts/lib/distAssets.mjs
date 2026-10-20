@@ -64,7 +64,7 @@ export function copyDataFiles(sourceDir, targetDir) {
 }
 
 /**
- * Кладёт в `dist/` манифест и справочные данные движка.
+ * Кладёт в `dist/` манифест, справочные данные движка и компендиум (если скачан).
  *
  * В манифест вписывается, что бандлы просят у приложения (блок `hostContract`),
  * поэтому вызывать её нужно ПОСЛЕ сборки клиента и сервера — так это и делают
@@ -79,10 +79,20 @@ export function copyManifestAndData(root, dist) {
   cpSync(path.join(root, 'system.json'), path.join(dist, 'system.json'));
   stampHostRequirements(dist);
 
-  // Справочные данные и компендиум лежат внутри исходников движка.
+  // Справочные данные лежат внутри исходников движка.
   const dataSource = path.join(root, 'src', 'engine');
 
-  return existsSync(dataSource)
+  let copied = existsSync(dataSource)
     ? copyDataFiles(dataSource, path.join(dist, 'data'))
     : 0;
+
+  // Компендиум 2014, скачанный с сайта (`npm run compendium`), — бандл-пак
+  // системы: VTTG читает его из `<dataPath>/srd/`.
+  const compendiumSource = path.join(root, 'compendium');
+
+  if (existsSync(compendiumSource)) {
+    copied += copyDataFiles(compendiumSource, path.join(dist, 'data', 'srd'));
+  }
+
+  return copied;
 }

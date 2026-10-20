@@ -1069,7 +1069,7 @@ describe('каталог: оружие', () => {
   // это хозяйство хоста, а не системы
   it.todo('[W09] Призванный объект как центр области');
 
-  it('[W02] Приём «Опрокидывание»: спасбросок Телосложения Сл оружия или «Лежащий ничком»', () => {
+  it('[W02] Опрокидывающий удар: спасбросок Телосложения Сл оружия или «Лежащий ничком»', () => {
     const topple = engine.applyConditionPresetToEffect(
       createEffect('Опрокидывание', {
         effectTarget: 'target',
@@ -1088,7 +1088,7 @@ describe('каталог: оружие', () => {
     assert.equal(stamped.applySave.dc, weaponDc);
   });
 
-  it('[W03] Приём «Ослабление»: помеха на следующую атаку цели, снимается после неё', () => {
+  it('[W03] Ослабляющий удар: помеха на следующую атаку цели, снимается после неё', () => {
     const sap = createEffect('Ослабление', {
       effectTarget: 'target',
       flags: ['attack.disadvantage'],
@@ -1113,7 +1113,7 @@ describe('каталог: оружие', () => {
     );
   });
 
-  it('[W04] Приём «Замедление»: −10 фт скорости до начала своего хода', () => {
+  it('[W04] Замедляющий удар: −10 фт скорости до начала своего хода', () => {
     const fighterId = 'actor_fighter';
 
     const slow = engine.stampTurnDuration(
@@ -1149,7 +1149,7 @@ describe('каталог: оружие', () => {
   });
 
   it.todo(
-    '[W05] Приём «Досада»: преимущество на следующую атаку именно по этой цели — пробел (флаг не знает цель)',
+    '[W05] Удар с преимуществом на следующую атаку именно по этой цели — пробел (флаг не знает цель)',
   );
 
   it('[W06] Отравленный клинок: 1к4 ядом и «Отравленный» при провале Телосложения', () => {
@@ -1399,41 +1399,36 @@ describe('каталог: проверки и заклинания', () => {
 });
 
 describe('каталог: условие наложения и варианты', () => {
-  it('[W08] Приём оружия ложится только у владеющего приёмом', () => {
+  it('[W08] Условие «приём оружия» из записей 2024 не выполняется', () => {
+    // Мастерства оружия в 2014 нет: условие наложения, сохранённое до его
+    // удаления, словарь срабатываний не знает — окно показывает его строкой
+    // как есть, а эффект не ложится даже у персонажа со старыми списками
+    // приёмов в владениях
+    const legacyCondition = 'source.weaponMastery === true';
+
     const topple = engine.applyConditionPresetToEffect(
       createEffect('Опрокидывание', {
         effectTarget: 'target',
-        landingCondition: 'source.weaponMastery === true',
+        landingCondition: legacyCondition,
         applySave: { ability: 'constitution', dc: 0, onSuccess: 'negate' },
       }),
       engine.buildConditionActiveEffect('prone'),
     );
 
-    authoredScenario(topple, 'weapon');
+    assert.deepEqual(engine.readTriggerConditionParts(legacyCondition), [
+      legacyCondition,
+    ]);
 
-    const quarterstaff = { baseType: 'quarterstaff', mastery: 'topple' };
     const fighter = createActor();
-    const target = createCreature();
-
-    const landsFor = (attacker) =>
-      engine.passesLandingCondition(topple, target, {
-        source: attacker,
-        weaponMastery: engine.entityHasWeaponMastery(attacker, quarterstaff),
-      });
-
-    assert.equal(landsFor(fighter), false, 'без владения приёмом — нет');
 
     fighter.system.proficiencies.weaponMasteries = ['quarterstaff'];
-    assert.equal(landsFor(fighter), true, 'приём вида оружия');
-
-    fighter.system.proficiencies.weaponMasteries = [];
     fighter.system.proficiencies.masteryProperties = ['topple'];
-    assert.equal(landsFor(fighter), true, 'сам приём («Тактический мастер»)');
 
     assert.equal(
-      engine.passesLandingCondition(topple, target, { weaponMastery: false }),
+      engine.passesLandingCondition(topple, createCreature(), {
+        source: fighter,
+      }),
       false,
-      'существо статблока приёмами не владеет',
     );
   });
 

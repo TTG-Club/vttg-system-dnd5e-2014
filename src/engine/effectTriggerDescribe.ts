@@ -372,7 +372,6 @@ const TRIGGER_CONDITION_PHRASES: Record<
   selfTagFromSource: (value) => `на носителе отметка «${value}» от наложившего`,
   selfTagFromSourceNot: (value) =>
     `на носителе нет отметки «${value}» от наложившего`,
-  sourceWeaponMastery: () => 'наложивший владеет приёмом оружия',
   selfTempHpZero: () => 'у носителя нет временных хитов',
   selfGrounded: () => 'носитель не летит',
   selfSpecies: (value) => `вид носителя — «${value}»`,

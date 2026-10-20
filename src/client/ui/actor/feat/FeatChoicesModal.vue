@@ -69,7 +69,7 @@
     preparedChoices,
   );
 
-  /** Виды оружия мира — пул выбора оружия и оружейного приёма */
+  /** Виды оружия мира — пул выбора оружия */
   const { weaponOptions } = useFeatChoiceWeapons();
 
   /**

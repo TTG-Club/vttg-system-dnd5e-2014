@@ -65,7 +65,7 @@
   /** Сделанный выбор: ключ выбора → выбранные значения */
   const selections = defineModel<Record<string, string[]>>({ required: true });
 
-  /** Виды оружия мира — пул выбора оружия и оружейного приёма */
+  /** Виды оружия мира — пул выбора оружия */
   const { weaponOptions } = useFeatChoiceWeapons();
 
   /**

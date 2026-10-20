@@ -38,7 +38,6 @@
     resolveEntityMaxHp,
     resolveMaxHitPointsBreakdown,
     resolveSavingThrowRollMode,
-    WEAPON_MASTERY_MAP,
     withExhaustionLevel,
   } from '@vtt/shared/system/dnd.js';
 
@@ -266,30 +265,13 @@
   });
 
   /**
-   * Приёмы, которыми персонаж владеет сам по себе — безотносительно оружия
-   * («Тактический мастер»). Отдельной плашкой от 🏅 у оружия: там приём привязан
-   * к виду оружия, здесь он сам по себе.
-   */
-  const masteryPropertyBadges = computed(() =>
-    (props.actor.system.proficiencies.masteryProperties ?? []).map(
-      (key) => WEAPON_MASTERY_MAP.get(key)?.name.ru ?? key,
-    ),
-  );
-
-  /**
    * Умные бэйджи владения оружием:
-   * - все simple/martial выбраны + все мастерства → «Все простые 🏅»
-   * - все simple/martial выбраны + часть мастерств → «Все простые» + конкретные с 🏅
-   * - частичный выбор → перечисление индивидуальных с пометкой мастерства
+   * - выбрано всё простое/воинское → «Все простые» / «Все воинские»
+   * - частичный выбор → перечисление индивидуальных
    */
   const weaponProfBadges = computed(() => {
     const selected = new Set(props.actor.system.proficiencies.weapons);
-
-    const masteries = new Set(
-      props.actor.system.proficiencies.weaponMasteries ?? [],
-    );
-
-    const badges: Array<{ label: string; hasMastery: boolean }> = [];
+    const badges: string[] = [];
 
     const simpleKeys = systemDataStore.weaponBaseTypes
       .filter((bt) => bt.category === 'simple')
@@ -308,64 +290,21 @@
       && martialKeys.every((weaponKey) => selected.has(weaponKey));
 
     if (allSimple) {
-      const simpleMasteries = simpleKeys.filter((weaponKey) =>
-        masteries.has(weaponKey),
-      );
-
-      const allSimpleMastery = simpleMasteries.length === simpleKeys.length;
-
-      badges.push({
-        label: ACTOR_LEFT_PANEL_LABELS.weaponsAllSimple,
-        hasMastery: allSimpleMastery,
-      });
-
-      // Если мастерство есть, но не на все — добавляем конкретные
-      if (!allSimpleMastery && simpleMasteries.length > 0) {
-        for (const key of simpleMasteries) {
-          badges.push({
-            label: weaponProfNameMap.value.get(key) ?? key,
-            hasMastery: true,
-          });
-        }
-      }
+      badges.push(ACTOR_LEFT_PANEL_LABELS.weaponsAllSimple);
     } else {
       for (const key of simpleKeys) {
         if (selected.has(key)) {
-          badges.push({
-            label: weaponProfNameMap.value.get(key) ?? key,
-            hasMastery: masteries.has(key),
-          });
+          badges.push(weaponProfNameMap.value.get(key) ?? key);
         }
       }
     }
 
     if (allMartial) {
-      const martialMasteries = martialKeys.filter((weaponKey) =>
-        masteries.has(weaponKey),
-      );
-
-      const allMartialMastery = martialMasteries.length === martialKeys.length;
-
-      badges.push({
-        label: ACTOR_LEFT_PANEL_LABELS.weaponsAllMartial,
-        hasMastery: allMartialMastery,
-      });
-
-      if (!allMartialMastery && martialMasteries.length > 0) {
-        for (const key of martialMasteries) {
-          badges.push({
-            label: weaponProfNameMap.value.get(key) ?? key,
-            hasMastery: true,
-          });
-        }
-      }
+      badges.push(ACTOR_LEFT_PANEL_LABELS.weaponsAllMartial);
     } else {
       for (const key of martialKeys) {
         if (selected.has(key)) {
-          badges.push({
-            label: weaponProfNameMap.value.get(key) ?? key,
-            hasMastery: masteries.has(key),
-          });
+          badges.push(weaponProfNameMap.value.get(key) ?? key);
         }
       }
     }
@@ -918,21 +857,15 @@
   }
 
   /**
-   * Применяет выбор владения и мастерства оружием из модалки
+   * Применяет выбор владения оружием из модалки
    */
-  function onWeaponProfApply(
-    weapons: string[],
-    masteries: string[],
-    masteryProperties: string[],
-  ) {
+  function onWeaponProfApply(weapons: string[]) {
     emit('update:actor', {
       system: {
         ...props.actor.system,
         proficiencies: {
           ...props.actor.system.proficiencies,
           weapons,
-          weaponMasteries: masteries,
-          masteryProperties,
         },
       },
     });
@@ -977,7 +910,7 @@
   >
     <!-- Плитки показателей -->
     <div :class="layoutClasses.tiles">
-      <!-- Mastery -->
+      <!-- Бонус мастерства -->
       <FieldsetLabel
         :label="SHEET_TILE_LABELS.proficiency"
         center
@@ -1288,21 +1221,11 @@
         <div class="flex flex-wrap gap-1.5">
           <UBadge
             v-for="badge in weaponProfBadges"
-            :key="badge.label"
-            :label="badge.label"
+            :key="badge"
+            :label="badge"
             color="neutral"
             variant="subtle"
-          >
-            <template
-              v-if="badge.hasMastery"
-              #trailing
-            >
-              <UIcon
-                name="tabler:medal"
-                class="h-3.5 w-3.5 text-healing"
-              />
-            </template>
-          </UBadge>
+          />
 
           <span
             v-if="weaponProfBadges.length === 0"
@@ -1310,31 +1233,6 @@
           >
             {{ ACTOR_LEFT_PANEL_LABELS.empty }}
           </span>
-        </div>
-      </div>
-
-      <!-- Оружейные приёмы: показываются, только когда они есть — у
-        большинства персонажей приём привязан к оружию и живёт плашкой 🏅 -->
-      <div v-if="masteryPropertyBadges.length > 0">
-        <div
-          class="mb-2 flex items-center justify-between rounded-lg bg-elevated/40 px-3 py-2"
-        >
-          <h4
-            class="text-xs font-bold tracking-wider text-highlighted uppercase"
-          >
-            {{ GRANT_SECTION_LABELS.masteryProperties }}
-          </h4>
-        </div>
-
-        <div class="flex flex-wrap gap-1.5">
-          <UBadge
-            v-for="mastery in masteryPropertyBadges"
-            :key="mastery"
-            :label="mastery"
-            color="neutral"
-            variant="subtle"
-            icon="tabler:medal"
-          />
         </div>
       </div>
 
@@ -1459,14 +1357,10 @@
     @apply="onArmorProfApply"
   />
 
-  <!-- Модалка владения и мастерства оружием -->
+  <!-- Модалка владения оружием -->
   <WeaponProficiencyModal
     v-model:open="isWeaponProfOpen"
     :selected-weapons="actor.system.proficiencies.weapons"
-    :selected-masteries="actor.system.proficiencies.weaponMasteries ?? []"
-    :selected-mastery-properties="
-      actor.system.proficiencies.masteryProperties ?? []
-    "
     @apply="onWeaponProfApply"
   />
 

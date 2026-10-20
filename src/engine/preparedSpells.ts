@@ -1,5 +1,5 @@
 /**
- * Пределы подготовки заклинаний и заговоров D&D 5e (PHB 2024).
+ * Пределы подготовки заклинаний и заговоров D&D 5e (PHB 2014).
  *
  * Число берётся из таблицы класса компендиума на уровне персонажа в этом классе
  * (у мультикласса — сумма по всем классам), а лист даёт его поправить: задать
@@ -10,6 +10,8 @@
  *
  * @module system/dnd/preparedSpells
  */
+
+import type { AbilityType } from '@vtt/shared';
 
 import type { ActorClassEntry, ClassDefinition } from './classTypes.js';
 import type { Spell } from './dndEntities.js';
@@ -221,7 +223,7 @@ export const DEFAULT_PREPARED_LIMIT: DnDPreparedLimit = {
  * транслитерацией русской подписи колонки (`zagovory`, `podg-zakl`).
  */
 const PREPARED_COLUMN_KEYS: Record<PreparedKind, string[]> = {
-  spells: ['preparedSpells', 'podg-zakl'],
+  spells: ['preparedSpells', 'podg-zakl', 'spellsKnown'],
   cantrips: ['cantripsKnown', 'knownCantrips', 'zagovory', 'zag'],
 };
 
@@ -252,7 +254,12 @@ function matchesColumnLabel(label: string, kind: PreparedKind): boolean {
     return normalized.startsWith('заговор') || normalized.startsWith('заг.');
   }
 
-  return normalized.startsWith('подг');
+  // Классы 2014, которые заклинания не готовят, а знают (бард, чародей,
+  // колдун, следопыт), задают предел колонкой «Известные заклинания».
+  return (
+    normalized.startsWith('подг')
+    || (normalized.includes('известн') && normalized.includes('заклин'))
+  );
 }
 
 /**
@@ -305,24 +312,48 @@ function parseCellNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/** С какого уровня класса половинный заклинатель готовит заклинания (PHB 2014) */
+const HALF_CASTER_START_LEVEL = 2;
+
+/** Меньше одного заклинания формула подготовки не даёт (PHB 2014) */
+const MIN_FALLBACK_PREPARED = 1;
+
 /**
- * Запасные таблицы подготовленных заклинаний (PHB 2024) — по уровню класса.
+ * Запасной расчёт подготовленных заклинаний по формуле PHB 2014 — для класса,
+ * чья таблица колонки подготовки не содержит (жрец, друид, волшебник, паладин:
+ * в книге 2014 у них не колонка, а формула).
  *
- * Нужны классам, чьё определение в компендиуме колонки подготовки не содержит:
- * без них лист показал бы прочерк там, где число в книге есть. Это именно
- * запасной путь — сначала всегда читается таблица самого класса.
+ * Полный заклинатель готовит модификатор своей характеристики плюс уровень
+ * класса, половинный — модификатор плюс половину уровня с округлением вниз и
+ * только со 2 уровня. Меньше одного заклинания не бывает.
  *
- * Полная взята у волшебника, половинная — у паладина и следопыта (у них она
- * общая). У жреца, друида, барда и чародея числа с 13 уровня чуть ниже
- * волшебничьих, поэтому запасной расчёт может их немного завысить — на этот
- * случай в плитке есть своё число и бонус.
+ * @param entry - класс листа
+ * @param abilityMods - модификаторы характеристик листа; нет — считаются нулём
+ * @returns число подготовленных или null, если формула к классу не относится
  */
-const FALLBACK_PREPARED: Record<'full' | 'half', number[]> = {
-  full: [
-    4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 16, 17, 18, 19, 21, 22, 23, 24, 25,
-  ],
-  half: [2, 3, 4, 5, 6, 6, 7, 7, 9, 9, 10, 10, 11, 11, 12, 12, 14, 14, 15, 15],
-};
+function getFallbackPreparedValue(
+  entry: ActorClassEntry,
+  abilityMods: Partial<Record<AbilityType, number>> | undefined,
+): number | null {
+  if (!entry.spellcastingAbility) {
+    return null;
+  }
+
+  const modifier = abilityMods?.[entry.spellcastingAbility] ?? 0;
+
+  if (entry.casterType === 'full') {
+    return Math.max(MIN_FALLBACK_PREPARED, modifier + entry.level);
+  }
+
+  if (entry.casterType === 'half' && entry.level >= HALF_CASTER_START_LEVEL) {
+    return Math.max(
+      MIN_FALLBACK_PREPARED,
+      modifier + Math.floor(entry.level / 2),
+    );
+  }
+
+  return null;
+}
 
 /**
  * Число из таблицы класса на нужном уровне.
@@ -377,12 +408,15 @@ function getLevelTableValue(
  * @param resolveDefinition - определение класса по записи актора; undefined —
  *   записи нет ни в одном компендиуме
  * @param kind - вид подготовки
+ * @param abilityMods - модификаторы характеристик листа для формулы PHB 2014;
+ *   нет — модификатор считается нулём
  * @returns число из таблиц или null, если его не даёт ни один класс
  */
 export function getClassPreparedValue(
   classes: ActorClassEntry[],
   resolveDefinition: (entry: ActorClassEntry) => ClassDefinition | undefined,
   kind: PreparedKind,
+  abilityMods?: Partial<Record<AbilityType, number>>,
 ): number | null {
   let total: number | null = null;
 
@@ -399,20 +433,14 @@ export function getClassPreparedValue(
       continue;
     }
 
-    // Запасной расчёт — только для заклинаний книги и только у настоящего
-    // заклинателя: у заговоров число в каждом классе своё, общей таблицы, из
-    // которой его можно было бы вывести, в книге нет.
-    if (kind === 'spells' && entry.casterType && entry.spellcastingAbility) {
-      const fallbackTable =
-        entry.casterType === 'full' || entry.casterType === 'half'
-          ? FALLBACK_PREPARED[entry.casterType]
-          : null;
+    // Запасной расчёт — только для заклинаний книги: у заговоров число в
+    // каждом классе своё, общей формулы, из которой его можно было бы вывести,
+    // в книге нет.
+    const fallbackValue =
+      kind === 'spells' ? getFallbackPreparedValue(entry, abilityMods) : null;
 
-      const fallbackValue = fallbackTable?.[entry.level - 1];
-
-      if (fallbackValue !== undefined) {
-        total = (total ?? 0) + fallbackValue;
-      }
+    if (fallbackValue !== null) {
+      total = (total ?? 0) + fallbackValue;
     }
   }
 

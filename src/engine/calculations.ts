@@ -584,11 +584,7 @@ export interface WeaponModifierPart {
 
 /** Подписи слагаемых атаки и урона оружия */
 export const WEAPON_MODIFIER_PART_LABELS = {
-  /**
-   * Бонус мастерства листа. Не «Мастерство» одним словом: в 2024-й редакции так
-   * называется приём оружия (weapon mastery), и в строке оружия эти два
-   * мастерства спутались бы.
-   */
+  /** Бонус мастерства листа */
   proficiency: 'Бонус мастерства',
   /** Свой бонус самого оружия (поле «Бонус атаки» / «Бонус урона») */
   weaponBonus: 'Бонус оружия',
@@ -1264,7 +1260,9 @@ function parseSkillProficiencies(
 }
 
 /**
- * Разбирает владения актёра.
+ * Разбирает владения актёра. Списки оружейных приёмов редакции 2024
+ * (`weaponMasteries`, `masteryProperties`) в старых записях пропускаются: в
+ * 2014 мастерства оружия нет.
  *
  * @param value - сырое значение поля `proficiencies`
  * @returns владения актёра
@@ -1275,8 +1273,6 @@ function parseLegacyProficiencies(value: unknown): DnDProficiencies {
   return {
     armor: parseStringList(source.armor),
     weapons: parseStringList(source.weapons),
-    weaponMasteries: parseStringList(source.weaponMasteries),
-    masteryProperties: parseStringList(source.masteryProperties),
     tools: parseStringList(source.tools),
     // Общий язык — стартовый по правилам: у актёра без списка языков он есть,
     // а вот пустой список в записи — уже осознанный выбор, и его не трогаем

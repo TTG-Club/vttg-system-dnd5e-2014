@@ -122,14 +122,12 @@
     ammunitionType,
     consumable,
     firesAmmunition,
-    mastery,
     categoryOptions,
     damageTypeOptions,
     propertyOptions,
     baseTypeOptions,
     ammunitionTypeOptions,
     proficiencyModeOptions,
-    masteryOptions,
     saveTypeOptions,
     saveEffectOptions,
     toggleProperty,
@@ -498,21 +496,6 @@
                     v-model="weaponCategory"
                     :items="categoryOptions"
                     value-key="value"
-                    class="flex-1"
-                  />
-                </div>
-
-                <!-- Оружейный приём (inline label) -->
-                <div class="flex items-center gap-3">
-                  <span class="min-w-30 shrink-0 text-sm text-muted">
-                    {{ WEAPON_FORM_LABELS.mastery }}
-                  </span>
-
-                  <USelect
-                    v-model="mastery"
-                    :items="masteryOptions"
-                    value-key="value"
-                    :placeholder="WEAPON_FORM_LABELS.masteryPlaceholder"
                     class="flex-1"
                   />
                 </div>

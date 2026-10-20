@@ -3,10 +3,6 @@
 
   import UDraggableModal from '@/shared_ui/components/UDraggableModal.vue';
   import { Z_INDEX } from '@/shared_ui/consts';
-  import {
-    WEAPON_MASTERIES,
-    WEAPON_MASTERY_MAP,
-  } from '@vtt/shared/system/dnd.js';
 
   import { useSystemDataStore } from '../../stores/systemDataStore';
   import { MODAL_BUTTON_LABELS, PROFICIENCY_MODAL_LABELS } from './constants';
@@ -15,25 +11,13 @@
     open: boolean;
     /** Текущие владения оружием (ключи) */
     selectedWeapons: string[];
-    /** Текущие мастерства оружием (ключи) */
-    selectedMasteries: string[];
-    /**
-     * Приёмы, которыми персонаж владеет сам по себе (ключи из `WEAPON_MASTERIES`).
-     * Отдельно от {@link selectedMasteries}: там ключи ОРУЖИЯ, чей приём достался
-     * персонажу, здесь — сами приёмы, безотносительно оружия.
-     */
-    selectedMasteryProperties: string[];
   }
 
   const props = defineProps<Props>();
 
   const emit = defineEmits<{
     'update:open': [value: boolean];
-    'apply': [
-      weapons: string[],
-      masteries: string[],
-      masteryProperties: string[],
-    ];
+    'apply': [weapons: string[]];
   }>();
 
   const isOpen = computed({
@@ -46,12 +30,6 @@
   /** Локальная копия владений */
   const localWeapons = ref<Set<string>>(new Set());
 
-  /** Локальная копия мастерств */
-  const localMasteries = ref<Set<string>>(new Set());
-
-  /** Локальная копия приёмов, которыми персонаж владеет сам по себе */
-  const localMasteryProperties = ref<Set<string>>(new Set());
-
   watch(
     () => props.open,
     (opened) => {
@@ -63,16 +41,6 @@
 
         localWeapons.value = new Set(
           props.selectedWeapons.filter((key) => validKeys.has(key)),
-        );
-
-        localMasteries.value = new Set(
-          props.selectedMasteries.filter((key) => validKeys.has(key)),
-        );
-
-        localMasteryProperties.value = new Set(
-          props.selectedMasteryProperties.filter((key) =>
-            WEAPON_MASTERY_MAP.has(key),
-          ),
         );
       }
     },
@@ -97,37 +65,11 @@
 
     if (set.has(key)) {
       set.delete(key);
-
-      // Снимаем мастерство при снятии владения
-      const masteries = new Set(localMasteries.value);
-
-      masteries.delete(key);
-      localMasteries.value = masteries;
     } else {
       set.add(key);
     }
 
     localWeapons.value = set;
-  }
-
-  /**
-   * Переключает мастерство конкретным оружием (только если владеет)
-   * @param key - ключ оружия
-   */
-  function toggleMastery(key: string): void {
-    if (!localWeapons.value.has(key)) {
-      return;
-    }
-
-    const set = new Set(localMasteries.value);
-
-    if (set.has(key)) {
-      set.delete(key);
-    } else {
-      set.add(key);
-    }
-
-    localMasteries.value = set;
   }
 
   /**
@@ -144,15 +86,11 @@
 
     if (allSelected) {
       // Убрать все
-      const masteries = new Set(localMasteries.value);
-
       for (const key of allKeys) {
         set.delete(key);
-        masteries.delete(key);
       }
 
       localWeapons.value = set;
-      localMasteries.value = masteries;
     } else {
       // Добавить все
       for (const key of allKeys) {
@@ -174,32 +112,10 @@
   }
 
   /**
-   * Переключает владение самим приёмом — без привязки к оружию.
-   *
-   * @param key - ключ приёма
-   */
-  function toggleMasteryProperty(key: string): void {
-    const set = new Set(localMasteryProperties.value);
-
-    if (set.has(key)) {
-      set.delete(key);
-    } else {
-      set.add(key);
-    }
-
-    localMasteryProperties.value = set;
-  }
-
-  /**
-   * Применяет выбранные владения, мастерства и приёмы
+   * Применяет выбранные владения
    */
   function applySelection(): void {
-    emit(
-      'apply',
-      [...localWeapons.value],
-      [...localMasteries.value],
-      [...localMasteryProperties.value],
-    );
+    emit('apply', [...localWeapons.value]);
 
     isOpen.value = false;
   }
@@ -231,20 +147,13 @@
             <!-- Заголовок столбцов -->
             <div
               class="mb-1 grid items-center px-1"
-              style="grid-template-columns: 1fr 24px 16px; gap: 4px"
+              style="grid-template-columns: 1fr 16px; gap: 8px"
             >
               <span />
 
               <UTooltip :text="PROFICIENCY_MODAL_LABELS.proficient">
                 <UIcon
                   name="tabler:circle-dot"
-                  class="mx-auto block h-3.5 w-3.5 text-healing"
-                />
-              </UTooltip>
-
-              <UTooltip :text="PROFICIENCY_MODAL_LABELS.mastery">
-                <UIcon
-                  name="tabler:medal"
                   class="mx-auto block h-3.5 w-3.5 text-healing"
                 />
               </UTooltip>
@@ -263,8 +172,6 @@
                 :model-value="isAllCategorySelected('simple')"
                 @update:model-value="toggleAllCategory('simple')"
               />
-
-              <span class="h-4 w-4" />
             </div>
 
             <!-- Список -->
@@ -281,12 +188,6 @@
                 :model-value="localWeapons.has(weapon.key)"
                 @update:model-value="toggleWeapon(weapon.key)"
               />
-
-              <UCheckbox
-                :model-value="localMasteries.has(weapon.key)"
-                :disabled="!localWeapons.has(weapon.key)"
-                @update:model-value="toggleMastery(weapon.key)"
-              />
             </div>
           </div>
 
@@ -301,20 +202,13 @@
             <!-- Заголовок столбцов -->
             <div
               class="mb-1 grid items-center px-1"
-              style="grid-template-columns: 1fr 24px 16px; gap: 4px"
+              style="grid-template-columns: 1fr 16px; gap: 8px"
             >
               <span />
 
               <UTooltip :text="PROFICIENCY_MODAL_LABELS.proficient">
                 <UIcon
                   name="tabler:circle-dot"
-                  class="mx-auto block h-3.5 w-3.5 text-healing"
-                />
-              </UTooltip>
-
-              <UTooltip :text="PROFICIENCY_MODAL_LABELS.mastery">
-                <UIcon
-                  name="tabler:medal"
                   class="mx-auto block h-3.5 w-3.5 text-healing"
                 />
               </UTooltip>
@@ -333,8 +227,6 @@
                 :model-value="isAllCategorySelected('martial')"
                 @update:model-value="toggleAllCategory('martial')"
               />
-
-              <span class="h-4 w-4" />
             </div>
 
             <!-- Список -->
@@ -351,34 +243,7 @@
                 :model-value="localWeapons.has(weapon.key)"
                 @update:model-value="toggleWeapon(weapon.key)"
               />
-
-              <UCheckbox
-                :model-value="localMasteries.has(weapon.key)"
-                :disabled="!localWeapons.has(weapon.key)"
-                @update:model-value="toggleMastery(weapon.key)"
-              />
             </div>
-          </div>
-        </div>
-
-        <!-- Приёмы сами по себе: их даёт «Тактический мастер» и подобные
-          умения, где приём не привязан к виду оружия -->
-        <div class="rounded-lg border border-default/50 bg-elevated/30 p-2">
-          <div
-            class="mb-2 border-b border-default/50 pb-2 text-center text-xs font-bold tracking-wider text-primary uppercase"
-          >
-            {{ PROFICIENCY_MODAL_LABELS.masteryProperties }}
-          </div>
-
-          <div class="grid grid-cols-4 gap-1">
-            <UCheckbox
-              v-for="mastery in WEAPON_MASTERIES"
-              :key="mastery.key"
-              :model-value="localMasteryProperties.has(mastery.key)"
-              :label="mastery.name.ru"
-              size="sm"
-              @update:model-value="toggleMasteryProperty(mastery.key)"
-            />
           </div>
         </div>
 

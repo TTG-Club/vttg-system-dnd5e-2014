@@ -463,7 +463,6 @@ export const EFFECT_TRIGGER_CONDITION_KIND_LABELS: Record<
   selfTagCountAtLeast: 'Отметок на носителе (счётчик)',
   selfTagFromSource: 'На носителе отметка от наложившего',
   selfTagFromSourceNot: 'На носителе нет отметки от наложившего',
-  sourceWeaponMastery: 'Атакующий владеет приёмом этого оружия',
   selfTempHpZero: 'У носителя нет временных хитов',
   selfGrounded: 'Носитель не летит',
   selfSpecies: 'Вид носителя (или подтип; список через запятую)',

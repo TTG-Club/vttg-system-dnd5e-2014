@@ -51,8 +51,20 @@ export const CLASS_FEATURE_NAMES: Record<FeatClassFeatureRequirement, string> =
     spellcasting: 'Использование заклинаний',
     pactMagic: 'Магия договора',
     fightingStyle: 'Боевой стиль',
-    weaponMastery: 'Оружейные приёмы',
   };
+
+/**
+ * Известно ли системе классовое умение из требования черты. Записи редакции
+ * 2024 могут требовать «Оружейных приёмов» (`weaponMastery`) — в 2014 такого
+ * умения нет, и требование пропускается, а не роняет проверку.
+ *
+ * @param value - требование из сохранённой записи
+ */
+export function isFeatClassFeatureRequirement(
+  value: string,
+): value is FeatClassFeatureRequirement {
+  return Object.hasOwn(CLASS_FEATURE_NAMES, value);
+}
 
 /** Подписи требований для списка невыполненных. */
 const UNMET_LABELS = {
@@ -369,7 +381,9 @@ export function checkFeatPrerequisites(
     unmet.push(UNMET_LABELS.spellcasting);
   }
 
-  const classFeatures = prerequisite.classFeatures ?? [];
+  const classFeatures = (prerequisite.classFeatures ?? []).filter(
+    isFeatClassFeatureRequirement,
+  );
 
   if (
     classFeatures.length > 0

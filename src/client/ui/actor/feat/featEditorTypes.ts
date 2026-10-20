@@ -44,10 +44,12 @@ import {
   CANTRIP_SPELL_LEVEL,
   CLASS_FEATURE_NAMES,
   classKeyFromUrl,
+  dropRetiredFeatChoiceTypes,
   FEAT_CHOICE_TYPE_LABELS,
   getFeatChoiceDefaultPool,
   isAbilityType,
   isDefensibleDamageType,
+  isFeatClassFeatureRequirement,
   isSkillType,
   listFeatDamageDefenseChoices,
   resolveFeatChoiceTypes,
@@ -80,8 +82,6 @@ export type GrantRowKind = Extract<
   | 'savingThrow'
   | 'armor'
   | 'weapon'
-  | 'weaponMastery'
-  | 'masteryProperty'
   | 'tool'
   | 'language'
   | 'ability'
@@ -98,8 +98,6 @@ const GRANT_ROW_KINDS: readonly GrantRowKind[] = [
   'language',
   'armor',
   'weapon',
-  'weaponMastery',
-  'masteryProperty',
   'ability',
   'damageType',
   'option',
@@ -124,7 +122,7 @@ export function isGrantRowKind(type: FeatChoiceType): type is GrantRowKind {
  * справочниками правил, поэтому выбранное раскладывается по принадлежности:
  * `sleightOfHand` — навык, `thieves-tools` — инструмент.
  *
- * Оружие, приёмы, черта и «вариант» сюда не входят: их значения приходят из
+ * Оружие, черта и «вариант» сюда не входят: их значения приходят из
  * данных мира, компендиума и самой черты, и разобрать их по справочнику нечем.
  */
 const MIXABLE_KINDS: ReadonlySet<GrantRowKind> = new Set([
@@ -788,11 +786,6 @@ export const GRANT_ROW_KIND_OPTIONS: {
   { value: 'language', label: FEAT_CHOICE_TYPE_LABELS.language },
   { value: 'armor', label: FEAT_GRANTS_LABELS.kindArmor },
   { value: 'weapon', label: FEAT_CHOICE_TYPE_LABELS.weapon },
-  { value: 'weaponMastery', label: FEAT_CHOICE_TYPE_LABELS.weaponMastery },
-  {
-    value: 'masteryProperty',
-    label: FEAT_CHOICE_TYPE_LABELS.masteryProperty,
-  },
   { value: 'ability', label: FEAT_CHOICE_TYPE_LABELS.ability },
   { value: 'damageType', label: FEAT_CHOICE_TYPE_LABELS.damageType },
   { value: 'option', label: FEAT_CHOICE_TYPE_LABELS.option },
@@ -1455,8 +1448,14 @@ function prerequisiteRows(
     push('spellcasting');
   }
 
-  if (prerequisite.classFeatures?.length) {
-    push('classFeature', { classFeatures: [...prerequisite.classFeatures] });
+  // Требование «Оружейные приёмы» из записей 2024 отбрасывается: в 2014 такого
+  // умения нет, и при сохранении оно из записи уходит
+  const classFeatures = (prerequisite.classFeatures ?? []).filter(
+    isFeatClassFeatureRequirement,
+  );
+
+  if (classFeatures.length > 0) {
+    push('classFeature', { classFeatures });
   }
 
   if (prerequisite.armorProficiency?.length) {
@@ -1503,8 +1502,6 @@ export function featDataToGrants(
     ['savingThrow', featData.savingThrowProficiencies],
     ['armor', featData.armorProficiencies],
     ['weapon', featData.weaponProficiencies],
-    ['weaponMastery', featData.weaponMasteries],
-    ['masteryProperty', featData.masteryProperties],
     ['tool', featData.toolProficiencies],
     ['language', featData.languages],
   ];
@@ -1573,7 +1570,9 @@ export function featDataToGrants(
 
   grants.modifiers = modifierRowList;
 
-  for (const choice of featData.choices ?? []) {
+  // Выборы оружейных приёмов из записей 2024 строкой не становятся и при
+  // сохранении из записи уходят
+  for (const choice of dropRetiredFeatChoiceTypes(featData.choices)) {
     if (
       SPELL_CHOICE_TYPES.includes(choice.type)
       || defenseChoiceKeys.has(choice.key)
@@ -2390,8 +2389,6 @@ function buildAbilityScoreIncrease(
 const FIXED_GRANT_FIELDS = {
   armor: 'armorProficiencies',
   weapon: 'weaponProficiencies',
-  weaponMastery: 'weaponMasteries',
-  masteryProperty: 'masteryProperties',
   tool: 'toolProficiencies',
   language: 'languages',
 } as const;

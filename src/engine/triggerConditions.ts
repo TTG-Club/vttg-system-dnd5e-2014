@@ -173,8 +173,6 @@ export interface TriggerEventData {
    * лишь для самого наложившего
    */
   otherAlliedToSource?: boolean;
-  /** Наложение ударом оружия: атакующий владеет его приёмом */
-  weaponMastery?: boolean;
   /** Ключи состояний, снятых этим снимком — у события «состояние снялось» */
   lostConditions?: readonly string[];
   /** Вид атаки и её характеристика — у событий с атакой */
@@ -232,7 +230,6 @@ export const TRIGGER_CONDITION_KINDS = [
   'selfTagCountAtLeast',
   'selfTagFromSource',
   'selfTagFromSourceNot',
-  'sourceWeaponMastery',
   'selfTempHpZero',
   'selfGrounded',
   'selfSpecies',
@@ -286,8 +283,6 @@ export const TRIGGER_CONDITION_KINDS = [
  * - `selfTagCountAtLeast` — отметок с ключом на носителе не меньше N (счётчик);
  * - `selfTagFromSource` / `selfTagFromSourceNot` — есть / нет отметки,
  *   поставленной тем же, кто наложил эффект («невосприимчив к этому источнику»);
- * - `sourceWeaponMastery` — наложение ударом оружия, приёмом которого атакующий
- *   владеет;
  * - `selfTempHpZero` — у носителя нет временных хитов;
  * - `selfGrounded` — носитель стоит на земле (не летит);
  * - `selfSpecies` — вид носителя по названию записи;
@@ -387,7 +382,6 @@ const KIND_EVENTS: Record<
   selfTagCountAtLeast: undefined,
   selfTagFromSource: undefined,
   selfTagFromSourceNot: undefined,
-  sourceWeaponMastery: ['applied'],
   selfTempHpZero: undefined,
   selfGrounded: undefined,
   selfSpecies: undefined,
@@ -576,7 +570,6 @@ const FIXED_PARTS: Partial<Record<TriggerConditionKind, string>> = {
   rollAdvantage: 'roll.hasAdvantage === true',
   rollDisadvantage: 'roll.hasDisadvantage === true',
   otherMarkedBySelf: MARKED_BY_SELF_CONDITION,
-  sourceWeaponMastery: 'source.weaponMastery === true',
   selfTempHpZero: 'self.hp.temp === 0',
   selfGrounded: 'self.grounded === true',
   otherIsSource: 'target.isSource === true',
@@ -1080,8 +1073,6 @@ function isConditionPartMet(
         part.value ?? '',
         eventData.sourceId,
       );
-    case 'sourceWeaponMastery':
-      return eventData.weaponMastery === true;
     case 'selfTempHpZero':
       return resolveEntityTempHp(entity) === 0;
     case 'selfGrounded':
@@ -1269,8 +1260,6 @@ export function withCombatRound(
 export interface EffectLandingContext {
   /** Кто накладывает */
   source?: DnDSceneEntity;
-  /** Наложение ударом оружия, приёмом которого атакующий владеет */
-  weaponMastery?: boolean;
   /** Номер идущего раунда: условие «на раунде N» */
   combatRound?: number;
   /** Видимость и свет сцены: условие «цель видит наложившего», «в темноте» */
@@ -1298,7 +1287,6 @@ export function passesLandingCondition(
         {
           other: landing.source,
           sourceId: landing.source?.id ?? effect.sourceActorId,
-          weaponMastery: landing.weaponMastery,
         },
         landing.combatRound,
       ),
