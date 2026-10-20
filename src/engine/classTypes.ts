@@ -1105,10 +1105,10 @@ export function calculateMaxHP(
   return Math.max(1, baseHP + constitutionMod * totalLevel);
 }
 
-// ── Мультикласс (PHB 2024) ───────────────────────────────────
+// ── Мультикласс (PHB 2014) ───────────────────────────────────
 
 /**
- * Владения, получаемые при мультиклассе (PHB 2024).
+ * Владения, получаемые при мультиклассе (PHB 2014).
  *
  * Когда персонаж берёт первый уровень нового класса (не первый класс),
  * он получает только этот сокращённый набор, а НЕ полные стартовые владения.
@@ -1128,7 +1128,7 @@ export interface MulticlassProficiencies {
   skillChoices: number;
 }
 
-/** Таблица мультиклассовых владений (PHB 2024, глава «Мультикласс») */
+/** Таблица мультиклассовых владений (PHB 2014, глава «Мультиклассирование») */
 export const MULTICLASS_PROFICIENCIES: Record<
   ClassKey,
   MulticlassProficiencies
@@ -1158,7 +1158,13 @@ export const MULTICLASS_PROFICIENCIES: Record<
     tools: [],
     skillChoices: 0,
   },
-  monk: { armor: [], weapons: ['simple'], tools: [], skillChoices: 0 },
+  // Монах 2014 вместе с простым оружием получает и короткие мечи
+  monk: {
+    armor: [],
+    weapons: ['simple', 'shortsword'],
+    tools: [],
+    skillChoices: 0,
+  },
   paladin: {
     armor: ['light', 'medium', 'shield'],
     weapons: ['simple', 'martial'],

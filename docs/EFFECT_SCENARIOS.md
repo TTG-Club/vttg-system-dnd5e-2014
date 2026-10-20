@@ -181,7 +181,7 @@
 | F06 | Движение без доспехов | `feature` → носитель | `changes`: `movement.walk 10` при `self.armor === "none" && self.armor === "noShield"` | ✅ |
 | F07 | Скрытая атака | `feature` → носитель | `changes`: `damage.melee 3d6` при `roll.hasAdvantage === true` | ≈ без «союзник рядом» и «раз в ход» — F07b |
 | F07b | Скрытая атака: «или» в условии и раз в ход | — | — | ⛔ |
-| F08 | Увёртливость | `feature` → носитель | `flags`: `save.evasion.dexterity` — спасбросок Ловкости «половина при успехе»: успех — без урона, провал — половина; недееспособному не помогает | ✅ |
+| F08 | Увёртливость | `feature` → носитель | `flags`: `save.evasion.dexterity` — спасбросок Ловкости «половина при успехе»: успех — без урона, провал — половина; действует и на недееспособного (PHB 2014) | ✅ |
 | F09 | Бдительный | `feature` → носитель | `changes`: `initiative @prof` | ✅ |
 | F10 | Крепкий | `feature` → носитель | `changes`: `hitPoints.max 2 * @level` | ✅ |
 | F11 | Подвижный | `feature` → носитель | `changes`: `movement.walk 10` | ✅ |
