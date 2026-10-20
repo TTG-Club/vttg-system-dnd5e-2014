@@ -7,6 +7,7 @@
   "scripts": {
     "prepare": "node scripts/install-git-hooks.mjs",
     "build": "node scripts/build.mjs",
+    "compendium": "node scripts/fetch-compendium.mjs",
     "dev": "node scripts/dev.mjs",
     "dev:hot": "vite",
     "build:client": "vite build",

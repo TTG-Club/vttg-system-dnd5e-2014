@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# Компендиум 2014: скачивается с сайта при релизе (npm run compendium)
+compendium/
 *.zip
 *.log
 .DS_Store
