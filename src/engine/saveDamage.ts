@@ -13,7 +13,6 @@ import type { AbilityType } from '@vtt/shared';
 import type { Spell } from './dndEntities.js';
 
 import { buildSaveEvasionFlag } from './activeEffectTypes.js';
-import { INCAPACITATED_CONDITION_KEY } from './conditionKeys.js';
 
 /** Доля урона при успешном спасброске «половина урона» */
 export const HALF_DAMAGE_SCALE = 0.5;
@@ -46,11 +45,11 @@ export function resolveHalfDamageScale(
   passed: boolean,
   defense?: SaveDamageDefense,
 ): number {
+  // В PHB 2014 «Увёртливость» действует и на недееспособного: оговорка о
+  // недееспособности появилась только в 2024
   const hasEvasion =
     defense !== undefined
-    && defense.flags.has(buildSaveEvasionFlag(defense.ability))
-    // Недееспособный не пользуется «Увёртливостью» (PHB 2024)
-    && !defense.flags.has(INCAPACITATED_CONDITION_KEY);
+    && defense.flags.has(buildSaveEvasionFlag(defense.ability));
 
   if (!passed) {
     return hasEvasion ? HALF_DAMAGE_SCALE : 1;
