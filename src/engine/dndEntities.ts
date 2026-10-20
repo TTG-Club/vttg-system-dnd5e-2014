@@ -140,8 +140,6 @@ export interface DnDGameItem extends BaseGameItem {
   baseType?: string;
   /** Категория оружия */
   weaponCategory?: WeaponCategory;
-  /** Оружейный приём (weapon mastery) */
-  mastery?: string;
   /** Тип дальности */
   rangeType?: WeaponRangeType;
   /**
@@ -570,11 +568,6 @@ export interface Spell {
    * заклинаний».
    */
   rollSource?: SpellRollSource;
-  /**
-   * Удар оружием: атакующий владеет приёмом этого оружия. Читает условие
-   * наложения `source.weaponMastery`.
-   */
-  weaponMastery?: boolean;
   // --- Использование ---
   /**
    * Заряды использования с откатом от отдыха (врождённые/расовые заклинания,

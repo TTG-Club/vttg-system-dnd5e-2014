@@ -506,8 +506,6 @@ function cloneWizardProficiencies(
   return {
     armor: [...(proficiencies?.armor ?? [])],
     weapons: [...(proficiencies?.weapons ?? [])],
-    weaponMasteries: [...(proficiencies?.weaponMasteries ?? [])],
-    masteryProperties: [...(proficiencies?.masteryProperties ?? [])],
     tools: [...(proficiencies?.tools ?? [])],
     languages: [...(proficiencies?.languages ?? [])],
     savingThrows: [...(proficiencies?.savingThrows ?? [])],
@@ -555,13 +553,6 @@ function applyLevelFeatData(
     }
 
     pushUniqueValues(result.weapons, data.weaponProficiencies ?? []);
-    pushUniqueValues(result.weaponMasteries, data.weaponMasteries ?? []);
-
-    pushUniqueValues(
-      (result.masteryProperties ??= []),
-      data.masteryProperties ?? [],
-    );
-
     pushUniqueValues(result.armor, data.armorProficiencies ?? []);
     pushUniqueValues(result.tools, data.toolProficiencies ?? []);
     pushUniqueValues(result.languages, data.languages ?? []);
@@ -576,13 +567,6 @@ function applyLevelFeatData(
     }
 
     pushUniqueValues(result.weapons, chosen.weapons);
-    pushUniqueValues(result.weaponMasteries, chosen.weaponMasteries);
-
-    pushUniqueValues(
-      (result.masteryProperties ??= []),
-      chosen.masteryProperties,
-    );
-
     pushUniqueValues(result.armor, chosen.armor);
     pushUniqueValues(result.tools, chosen.tools);
     pushUniqueValues(result.languages, chosen.languages);
@@ -840,7 +824,7 @@ export function useClassWizard(
 ) {
   // ── Контекст ──────────────────────────────────────────────
 
-  /** Виды оружия мира — пул выбора оружия и оружейного приёма */
+  /** Виды оружия мира — пул выбора оружия */
   const { weaponOptions } = useFeatChoiceWeapons();
 
   /** Это первый класс персонажа (нет ни одного класса) */
@@ -2975,8 +2959,6 @@ export function useClassWizard(
       const proficiencies = {
         armor: [...(existingProf?.armor ?? [])],
         weapons: [...(existingProf?.weapons ?? [])],
-        weaponMasteries: [...(existingProf?.weaponMasteries ?? [])],
-        masteryProperties: [...(existingProf?.masteryProperties ?? [])],
         tools: [...(existingProf?.tools ?? [])],
         languages: [...(existingProf?.languages ?? [])],
         savingThrows: [...(existingProf?.savingThrows ?? [])],
@@ -3072,7 +3054,6 @@ export function useClassWizard(
           ?? existingProf ?? {
             armor: [],
             weapons: [],
-            weaponMasteries: [],
             tools: [],
             languages: [],
             savingThrows: [],

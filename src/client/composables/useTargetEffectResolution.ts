@@ -125,7 +125,6 @@ function resolveLandingSource(
 function buildLandingContext(input: TargetEffectsInput): EffectLandingContext {
   return {
     source: resolveLandingSource(input.casterId),
-    weaponMastery: input.spell.weaponMastery,
     combatRound: resolveCombatRound(),
     sight: resolveClientSceneSight(),
   };

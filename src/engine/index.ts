@@ -171,5 +171,4 @@ export * from './triggerPrompt.js';
 export * from './turnEffects.js';
 export * from './types.js';
 export * from './visionUtils.js';
-export * from './weaponMasteries.js';
 export * from './weaponOverrides.js';

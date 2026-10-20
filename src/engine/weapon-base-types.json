@@ -5,8 +5,7 @@
     "nameEn": "Club",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "ttg:club",
-    "mastery": "slow"
+    "icon": "ttg:club"
   },
   {
     "key": "dagger",
@@ -14,8 +13,7 @@
     "nameEn": "Dagger",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "tabler:slice",
-    "mastery": "nick"
+    "icon": "tabler:slice"
   },
   {
     "key": "greatclub",
@@ -23,8 +21,7 @@
     "nameEn": "Greatclub",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "ttg:club",
-    "mastery": "push"
+    "icon": "ttg:club"
   },
   {
     "key": "handaxe",
@@ -32,8 +29,7 @@
     "nameEn": "Handaxe",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "tabler:axe",
-    "mastery": "vex"
+    "icon": "tabler:axe"
   },
   {
     "key": "javelin",
@@ -41,8 +37,7 @@
     "nameEn": "Javelin",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "ttg:spear",
-    "mastery": "slow"
+    "icon": "ttg:spear"
   },
   {
     "key": "light-hammer",
@@ -50,8 +45,7 @@
     "nameEn": "Light hammer",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "tabler:hammer",
-    "mastery": "nick"
+    "icon": "tabler:hammer"
   },
   {
     "key": "mace",
@@ -59,8 +53,7 @@
     "nameEn": "Mace",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "ttg:mace",
-    "mastery": "sap"
+    "icon": "ttg:mace"
   },
   {
     "key": "quarterstaff",
@@ -68,8 +61,7 @@
     "nameEn": "Quarterstaff",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "ttg:stick",
-    "mastery": "topple"
+    "icon": "ttg:stick"
   },
   {
     "key": "sickle",
@@ -77,8 +69,7 @@
     "nameEn": "Sickle",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "ttg:sickle",
-    "mastery": "nick"
+    "icon": "ttg:sickle"
   },
   {
     "key": "spear",
@@ -86,8 +77,7 @@
     "nameEn": "Spear",
     "category": "simple",
     "rangeType": "melee",
-    "icon": "ttg:spear",
-    "mastery": "sap"
+    "icon": "ttg:spear"
   },
   {
     "key": "dart",
@@ -95,8 +85,7 @@
     "nameEn": "Dart",
     "category": "simple",
     "rangeType": "ranged",
-    "icon": "tabler:target-arrow",
-    "mastery": "vex"
+    "icon": "tabler:target-arrow"
   },
   {
     "key": "shortbow",
@@ -104,8 +93,7 @@
     "nameEn": "Shortbow",
     "category": "simple",
     "rangeType": "ranged",
-    "icon": "tabler:bow",
-    "mastery": "vex"
+    "icon": "tabler:bow"
   },
   {
     "key": "light-crossbow",
@@ -113,8 +101,7 @@
     "nameEn": "Light crossbow",
     "category": "simple",
     "rangeType": "ranged",
-    "icon": "tabler:bow",
-    "mastery": "slow"
+    "icon": "tabler:bow"
   },
   {
     "key": "sling",
@@ -122,8 +109,7 @@
     "nameEn": "Sling",
     "category": "simple",
     "rangeType": "ranged",
-    "icon": "tabler:target-arrow",
-    "mastery": "slow"
+    "icon": "tabler:target-arrow"
   },
   {
     "key": "battleaxe",
@@ -131,8 +117,7 @@
     "nameEn": "Battleaxe",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:axe",
-    "mastery": "topple"
+    "icon": "tabler:axe"
   },
   {
     "key": "flail",
@@ -140,8 +125,7 @@
     "nameEn": "Flail",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:hammer",
-    "mastery": "sap"
+    "icon": "tabler:hammer"
   },
   {
     "key": "glaive",
@@ -149,8 +133,7 @@
     "nameEn": "Glaive",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:trident",
-    "mastery": "graze"
+    "icon": "tabler:trident"
   },
   {
     "key": "greataxe",
@@ -158,8 +141,7 @@
     "nameEn": "Greataxe",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:axe",
-    "mastery": "cleave"
+    "icon": "tabler:axe"
   },
   {
     "key": "greatsword",
@@ -167,8 +149,7 @@
     "nameEn": "Greatsword",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:sword",
-    "mastery": "graze"
+    "icon": "tabler:sword"
   },
   {
     "key": "halberd",
@@ -176,8 +157,7 @@
     "nameEn": "Halberd",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:trident",
-    "mastery": "cleave"
+    "icon": "tabler:trident"
   },
   {
     "key": "lance",
@@ -185,8 +165,7 @@
     "nameEn": "Lance",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "ttg:spear",
-    "mastery": "topple"
+    "icon": "ttg:spear"
   },
   {
     "key": "longsword",
@@ -194,8 +173,7 @@
     "nameEn": "Longsword",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:sword",
-    "mastery": "sap"
+    "icon": "tabler:sword"
   },
   {
     "key": "maul",
@@ -203,8 +181,7 @@
     "nameEn": "Maul",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:hammer",
-    "mastery": "topple"
+    "icon": "tabler:hammer"
   },
   {
     "key": "morningstar",
@@ -212,8 +189,7 @@
     "nameEn": "Morningstar",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:hammer",
-    "mastery": "sap"
+    "icon": "tabler:hammer"
   },
   {
     "key": "pike",
@@ -221,8 +197,7 @@
     "nameEn": "Pike",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:trident",
-    "mastery": "push"
+    "icon": "tabler:trident"
   },
   {
     "key": "rapier",
@@ -230,8 +205,7 @@
     "nameEn": "Rapier",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:sword",
-    "mastery": "vex"
+    "icon": "tabler:sword"
   },
   {
     "key": "scimitar",
@@ -239,8 +213,7 @@
     "nameEn": "Scimitar",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:sword",
-    "mastery": "nick"
+    "icon": "tabler:sword"
   },
   {
     "key": "shortsword",
@@ -248,8 +221,7 @@
     "nameEn": "Shortsword",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:sword",
-    "mastery": "vex"
+    "icon": "tabler:sword"
   },
   {
     "key": "trident",
@@ -257,8 +229,7 @@
     "nameEn": "Trident",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:trident",
-    "mastery": "topple"
+    "icon": "tabler:trident"
   },
   {
     "key": "war-pick",
@@ -266,8 +237,7 @@
     "nameEn": "War pick",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:hammer",
-    "mastery": "sap"
+    "icon": "tabler:hammer"
   },
   {
     "key": "warhammer",
@@ -275,8 +245,7 @@
     "nameEn": "Warhammer",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:hammer",
-    "mastery": "push"
+    "icon": "tabler:hammer"
   },
   {
     "key": "whip",
@@ -284,8 +253,7 @@
     "nameEn": "Whip",
     "category": "martial",
     "rangeType": "melee",
-    "icon": "tabler:lasso",
-    "mastery": "slow"
+    "icon": "tabler:lasso"
   },
   {
     "key": "blowgun",
@@ -293,8 +261,7 @@
     "nameEn": "Blowgun",
     "category": "martial",
     "rangeType": "ranged",
-    "icon": "tabler:target-arrow",
-    "mastery": "vex"
+    "icon": "tabler:target-arrow"
   },
   {
     "key": "hand-crossbow",
@@ -302,8 +269,7 @@
     "nameEn": "Hand crossbow",
     "category": "martial",
     "rangeType": "ranged",
-    "icon": "tabler:bow",
-    "mastery": "vex"
+    "icon": "tabler:bow"
   },
   {
     "key": "heavy-crossbow",
@@ -311,8 +277,7 @@
     "nameEn": "Heavy crossbow",
     "category": "martial",
     "rangeType": "ranged",
-    "icon": "tabler:bow",
-    "mastery": "push"
+    "icon": "tabler:bow"
   },
   {
     "key": "longbow",
@@ -320,8 +285,7 @@
     "nameEn": "Longbow",
     "category": "martial",
     "rangeType": "ranged",
-    "icon": "tabler:bow",
-    "mastery": "slow"
+    "icon": "tabler:bow"
   },
   {
     "key": "musket",
@@ -329,8 +293,7 @@
     "nameEn": "Musket",
     "category": "martial",
     "rangeType": "ranged",
-    "icon": "tabler:target-arrow",
-    "mastery": "slow"
+    "icon": "tabler:target-arrow"
   },
   {
     "key": "pistol",
@@ -338,7 +301,6 @@
     "nameEn": "Pistol",
     "category": "martial",
     "rangeType": "ranged",
-    "icon": "tabler:target-arrow",
-    "mastery": "vex"
+    "icon": "tabler:target-arrow"
   }
 ]
