@@ -32,9 +32,11 @@ import {
   DAMAGE_TYPE_LABELS,
 } from './damageConstants.js';
 import { listFeatDamageDefenseChoices } from './featChoices.js';
-import { CLASS_FEATURE_NAMES } from './featPrerequisites.js';
+import {
+  CLASS_FEATURE_NAMES,
+  isFeatClassFeatureRequirement,
+} from './featPrerequisites.js';
 import { toolProficiencyLabel } from './toolProficiency.js';
-import { WEAPON_MASTERY_MAP } from './weaponMasteries.js';
 
 /** Подписи владения доспехами (нет в shared — компактно дублируем). */
 const ARMOR_LABELS: Record<string, string> = {
@@ -138,22 +140,6 @@ function proficiencyLine(featData: FeatData): string | null {
       featData.weaponProficiencies
         .map((weapon) => WEAPON_LABELS[weapon] ?? weapon)
         .join(', '),
-    );
-  }
-
-  if (featData.weaponMasteries?.length) {
-    parts.push(
-      `приёмы оружия: ${featData.weaponMasteries
-        .map((weapon) => WEAPON_LABELS[weapon] ?? weapon)
-        .join(', ')}`,
-    );
-  }
-
-  if (featData.masteryProperties?.length) {
-    parts.push(
-      `приёмы: ${featData.masteryProperties
-        .map((key) => WEAPON_MASTERY_MAP.get(key)?.name.ru ?? key)
-        .join(', ')}`,
     );
   }
 
@@ -467,7 +453,9 @@ function prerequisiteLine(featData: FeatData): string | null {
   }
 
   for (const feature of prerequisite.classFeatures ?? []) {
-    parts.push(CLASS_FEATURE_NAMES[feature] ?? feature);
+    if (isFeatClassFeatureRequirement(feature)) {
+      parts.push(CLASS_FEATURE_NAMES[feature]);
+    }
   }
 
   const references: Array<[string, string | null]> = [

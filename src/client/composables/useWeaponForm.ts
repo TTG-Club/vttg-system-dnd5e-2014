@@ -32,7 +32,6 @@ import {
   SAVE_EFFECT_OPTIONS,
   SAVE_TYPE_OPTIONS,
   toStoredCustomBonus,
-  WEAPON_MASTERIES,
 } from '@vtt/shared/system/dnd.js';
 
 import { useSystemDataStore } from '../stores/systemDataStore';
@@ -103,7 +102,6 @@ export function useWeaponForm(
   const special = ref('');
   const ammunitionType = ref<AmmunitionType | ''>('');
   const consumable = ref(false);
-  const mastery = ref<string>(NO_SELECTION);
   const distanceUnit = ref<DistanceUnit>('ft');
   const sourceKey = ref<string | undefined>(FALLBACK_SOURCE_KEY);
   const source = ref<SourceDefinition | undefined>(undefined);
@@ -196,16 +194,6 @@ export function useWeaponForm(
     { label: 'Не учитывать', value: 'never' as const },
   ];
 
-  /** Опции оружейных приёмов (с пунктом «Без приёма») */
-  const masteryOptions = computed(() => [
-    { label: 'Без приёма', value: NO_SELECTION, description: '' },
-    ...WEAPON_MASTERIES.map((masteryEntry) => ({
-      label: `${masteryEntry.name.ru} (${masteryEntry.name.en})`,
-      value: masteryEntry.key,
-      description: masteryEntry.description.ru,
-    })),
-  ]);
-
   // --- Заполнение формы при открытии ---
   watch(
     getIsOpen,
@@ -263,7 +251,6 @@ export function useWeaponForm(
         special.value = weapon.special ?? '';
         ammunitionType.value = weapon.ammunitionType ?? '';
         consumable.value = weapon.consumable ?? false;
-        mastery.value = weapon.mastery ?? NO_SELECTION;
         distanceUnit.value = weapon.distanceUnit ?? 'ft';
         sourceKey.value = weapon.sourceKey ?? FALLBACK_SOURCE_KEY;
         source.value = weapon.source;
@@ -325,7 +312,6 @@ export function useWeaponForm(
         special.value = '';
         ammunitionType.value = '';
         consumable.value = false;
-        mastery.value = NO_SELECTION;
         distanceUnit.value = 'ft';
         sourceKey.value = FALLBACK_SOURCE_KEY;
         source.value = undefined;
@@ -477,7 +463,6 @@ export function useWeaponForm(
       rangeType: rangeType.value,
       baseType: baseType.value !== NO_SELECTION ? baseType.value : undefined,
       reach: reach.value !== 5 ? reach.value : undefined,
-      mastery: mastery.value !== NO_SELECTION ? mastery.value : undefined,
       damageParts: buildDamageParts(),
       weaponProperties: selectedProperties.value,
       range:
@@ -560,7 +545,6 @@ export function useWeaponForm(
     ammunitionType,
     consumable,
     firesAmmunition,
-    mastery,
     distanceUnit,
     sourceKey,
     source,
@@ -583,7 +567,6 @@ export function useWeaponForm(
     baseTypeOptions,
     ammunitionTypeOptions,
     proficiencyModeOptions,
-    masteryOptions,
     saveTypeOptions: SAVE_TYPE_OPTIONS,
     saveEffectOptions: SAVE_EFFECT_OPTIONS,
 

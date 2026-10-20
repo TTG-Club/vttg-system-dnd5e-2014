@@ -214,7 +214,7 @@ export function useBackgroundWizard(
     { immediate: true },
   );
 
-  /** Виды оружия мира — пул выбора оружия и оружейного приёма */
+  /** Виды оружия мира — пул выбора оружия */
   const { weaponOptions } = useFeatChoiceWeapons();
 
   /**
@@ -622,7 +622,6 @@ export function useBackgroundWizard(
         languages: baseLanguages,
         weapons: baseWeapons,
         armor: baseArmor,
-        weaponMasteries: [],
       },
       grantedFeat,
       selectedFeatChoices.value,

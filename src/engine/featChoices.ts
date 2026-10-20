@@ -24,7 +24,6 @@ import type {
   FeatChoiceOption,
   FeatChoiceSpellFilter,
   FeatChoiceType,
-  FeatChoiceWeaponOption,
   FeatDamageDefenseChoice,
   FeatData,
 } from './featTypes.js';
@@ -45,7 +44,6 @@ import {
   isDefensibleDamageType,
 } from './damageConstants.js';
 import { RITUAL_CASTING_TIME } from './spellTypes.js';
-import { WEAPON_MASTERIES, weaponMasteryName } from './weaponMasteries.js';
 
 /** Владения актора — то, что выбор правит. */
 type ActorProficiencies = DnDActor['system']['proficiencies'];
@@ -57,10 +55,6 @@ export interface FeatChoiceProficiencies {
   tools: string[];
   languages: string[];
   weapons: string[];
-  /** Оружейные приёмы (2024) — свой список на листе, не подмножество владений */
-  weaponMasteries: string[];
-  /** Сами приёмы (`cleave`, …) — ещё один список, не пересекающийся с оружием */
-  masteryProperties: string[];
   armor: string[];
 }
 
@@ -78,8 +72,6 @@ const APPLIED_CHOICE_TYPES: ReadonlySet<FeatChoiceType> = new Set([
   'tool',
   'language',
   'weapon',
-  'weaponMastery',
-  'masteryProperty',
   'armor',
   'skillOrTool',
   'damageType',
@@ -102,8 +94,6 @@ export const FEAT_CHOICE_TYPE_LABELS: Record<FeatChoiceType, string> = {
   spellList: 'Список заклинаний',
   spellcastingAbility: 'Заклинательная характеристика',
   weapon: 'Оружие',
-  weaponMastery: 'Оружие с приёмом',
-  masteryProperty: 'Оружейный приём',
   armor: 'Доспехи',
   skillOrTool: 'Навык или инструмент',
   option: 'Вариант',
@@ -201,9 +191,6 @@ const ARMOR_CATEGORY_OPTIONS: FeatChoiceOption[] = [
   { value: 'shield', name: 'Щиты' },
 ];
 
-/** Чем подпись оружия отделена от названия его приёма. */
-const WEAPON_MASTERY_NAME_SEPARATOR = ' — ';
-
 /** Заклинательной характеристикой черты бывают только эти три. */
 const SPELLCASTING_ABILITIES: readonly AbilityType[] = [
   'intelligence',
@@ -220,12 +207,12 @@ const SPELLCASTING_ABILITIES: readonly AbilityType[] = [
  *
  * @param type - тип выбора черты
  * @param weapons - виды оружия мира: справочника оружия у движка нет, и без
- * него выбор оружия и оружейного приёма остаётся без вариантов
+ * него выбор оружия остаётся без вариантов
  * @returns варианты в порядке показа; пусто у типов без общего справочника
  */
 export function getFeatChoiceDefaultPool(
   type: FeatChoiceType,
-  weapons: ReadonlyArray<FeatChoiceWeaponOption> = [],
+  weapons: ReadonlyArray<FeatChoiceOption> = [],
 ): FeatChoiceOption[] {
   switch (type) {
     case 'skill':
@@ -262,31 +249,8 @@ export function getFeatChoiceDefaultPool(
         value,
         name: DAMAGE_TYPE_LABELS[value],
       }));
-    case 'masteryProperty':
-      // Приёмов ровно восемь, и это правило, а не данные мира: в отличие от
-      // оружия, их справочник у движка свой
-      return WEAPON_MASTERIES.map((mastery) => ({
-        value: mastery.key,
-        name: mastery.name.ru,
-      }));
     case 'weapon':
-      // Ключ приёма наружу не идёт: вариант выбора — это ключ и подпись
       return weapons.map(({ value, name }) => ({ value, name }));
-    case 'weaponMastery':
-      // Приём есть не у всякого оружия: дубину выбирать незачем. Подпись
-      // приёмом — чтобы игрок видел, что именно достаётся вместе с оружием
-      return weapons.flatMap((weapon) => {
-        const mastery = weaponMasteryName(weapon.mastery);
-
-        return mastery
-          ? [
-              {
-                value: weapon.value,
-                name: `${weapon.name ?? weapon.value}${WEAPON_MASTERY_NAME_SEPARATOR}${mastery}`,
-              },
-            ]
-          : [];
-      });
     default:
       // Заклинания, черты и «варианты» перечисляет сама черта либо компендиум:
       // общего справочника, из которого их можно взять, у движка нет
@@ -323,10 +287,6 @@ function isProficient(
       return Boolean(proficiencies?.languages?.includes(value));
     case 'weapon':
       return Boolean(proficiencies?.weapons?.includes(value));
-    case 'weaponMastery':
-      return Boolean(proficiencies?.weaponMasteries?.includes(value));
-    case 'masteryProperty':
-      return Boolean(proficiencies?.masteryProperties?.includes(value));
     case 'armor':
       return Boolean(proficiencies?.armor?.includes(value));
     default:
@@ -361,11 +321,11 @@ export interface FeatChoicePoolContext {
    */
   namedClassKeys?: ReadonlyArray<string>;
   /**
-   * Виды оружия мира — из них собирается пул выбора оружия и оружейного приёма.
+   * Виды оружия мира — из них собирается пул выбора оружия.
    * Справочника оружия у движка нет: виды живут в данных мира, а не в правилах,
    * поэтому список приходит снаружи. Пусто — выбирать нечего.
    */
-  weapons?: ReadonlyArray<FeatChoiceWeaponOption>;
+  weapons?: ReadonlyArray<FeatChoiceOption>;
 }
 
 /**
@@ -789,6 +749,43 @@ function orderSpellChoices(choices: ReadonlyArray<FeatChoice>): FeatChoice[] {
 }
 
 /**
+ * Типы выбора редакции 2024, которых в 2014 нет: оружие с приёмом
+ * (`weaponMastery`) и сам оружейный приём (`masteryProperty`). Записи,
+ * сохранённые до удаления мастерства оружия, ещё могут их содержать.
+ */
+const RETIRED_CHOICE_TYPES: ReadonlySet<string> = new Set([
+  'weaponMastery',
+  'masteryProperty',
+]);
+
+/**
+ * Выборы без типов, которых в системе больше нет.
+ *
+ * Выбор, у которого не осталось ни одного известного типа, отбрасывается
+ * целиком: игроку его не задают, и ничего он не проставляет. У смешанного
+ * набора отбрасываются только устаревшие типы.
+ *
+ * @param choices - выборы из сохранённой записи
+ * @returns выборы только известных типов
+ */
+export function dropRetiredFeatChoiceTypes(
+  choices: ReadonlyArray<FeatChoice> | undefined,
+): FeatChoice[] {
+  return (choices ?? []).flatMap((choice) => {
+    const types = resolveFeatChoiceTypes(choice);
+    const kept = types.filter((type) => !RETIRED_CHOICE_TYPES.has(type));
+
+    if (kept.length === types.length) {
+      return [choice];
+    }
+
+    const [first] = kept;
+
+    return first ? [{ ...choice, type: first, types: kept }] : [];
+  });
+}
+
+/**
  * Выборы черты в том виде, в каком их задают игроку: с вопросом про класс у старых
  * записей и в правильном порядке (класс → заклинания → характеристика).
  *
@@ -801,14 +798,16 @@ function orderSpellChoices(choices: ReadonlyArray<FeatChoice>): FeatChoice[] {
 export function prepareFeatChoices(
   choices: ReadonlyArray<FeatChoice> | undefined,
 ): FeatChoice[] {
-  return orderSpellChoices(withSpellClassChoice(choices ?? []));
+  return orderSpellChoices(
+    withSpellClassChoice(dropRetiredFeatChoiceTypes(choices)),
+  );
 }
 
 /**
  * Выбор со ступенями роста — по одному выбору на ступень, с ПРИБАВКОЙ вместо итога.
  *
  * Ступень называет, сколько всего выбрано к её уровню, а спрашивать нужно разницу с
- * предыдущей: оружейных приёмов у воина три с 1 уровня и четыре с 4, то есть на четвёртом
+ * предыдущей: заговоров у волшебника три с 1 уровня и четыре с 4, то есть на четвёртом
  * игрок выбирает один новый, а не четыре заново. Уровень ступени становится уровнем
  * открытия выбора, и дальше его отбирают те же правила, что и выбор, заданный уровнем
  * вручную.
@@ -821,7 +820,7 @@ export function prepareFeatChoices(
 export function expandChoiceScaling(
   choices: ReadonlyArray<FeatChoice> | undefined,
 ): FeatChoice[] {
-  return (choices ?? []).flatMap((choice) => {
+  return dropRetiredFeatChoiceTypes(choices).flatMap((choice) => {
     const steps = Object.entries(choice.scaling ?? {})
       .map(([level, count]) => ({ level: Number(level), count }))
       .filter((step) => Number.isFinite(step.level) && step.count > 0)
@@ -969,7 +968,7 @@ export function clearSpellChoicesOfClass(
 function withDictionaryLabels(
   choice: Pick<FeatChoice, 'type' | 'types'>,
   options: ReadonlyArray<FeatChoiceOption>,
-  weapons: ReadonlyArray<FeatChoiceWeaponOption> = [],
+  weapons: ReadonlyArray<FeatChoiceOption> = [],
 ): FeatChoiceOption[] {
   const labels = new Map(
     resolveFeatChoiceTypes(choice)
@@ -1089,14 +1088,6 @@ export function applyFeatChoiceSelections(
           addUnique(proficiencies.weapons, value);
 
           break;
-        case 'weaponMastery':
-          addUnique(proficiencies.weaponMasteries, value);
-
-          break;
-        case 'masteryProperty':
-          addUnique((proficiencies.masteryProperties ??= []), value);
-
-          break;
         case 'armor':
           addUnique(proficiencies.armor, value);
 
@@ -1129,8 +1120,6 @@ export function collectFeatChoiceProficiencies(
     tools: [],
     languages: [],
     weapons: [],
-    weaponMasteries: [],
-    masteryProperties: [],
     armor: [],
   };
 
@@ -1163,14 +1152,6 @@ export function collectFeatChoiceProficiencies(
           break;
         case 'weapon':
           result.weapons.push(value);
-
-          break;
-        case 'weaponMastery':
-          result.weaponMasteries.push(value);
-
-          break;
-        case 'masteryProperty':
-          result.masteryProperties.push(value);
 
           break;
         case 'armor':
@@ -1225,14 +1206,6 @@ export function removeFeatChoiceSelections(
           break;
         case 'weapon':
           removeValue(proficiencies.weapons, value);
-
-          break;
-        case 'weaponMastery':
-          removeValue(proficiencies.weaponMasteries, value);
-
-          break;
-        case 'masteryProperty':
-          removeValue(proficiencies.masteryProperties ?? [], value);
 
           break;
         case 'armor':

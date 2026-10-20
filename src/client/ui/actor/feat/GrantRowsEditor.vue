@@ -19,8 +19,6 @@
     SKILL_ABILITY_MAP,
     TOOL_CATEGORIES,
     TOOLS_LIST,
-    WEAPON_MASTERIES,
-    weaponMasteryName,
   } from '@vtt/shared/system/dnd.js';
 
   import { useSystemDataStore } from '../../../stores/systemDataStore';
@@ -128,21 +126,6 @@
     })),
   );
 
-  /**
-   * То же оружие, но подписанное своим приёмом: строка выдаёт приём вместе с
-   * оружием, и без подписи автор не видит, что именно достаётся персонажу.
-   */
-  const weaponWithMasteryOptions = computed<FeatChoiceOption[]>(() =>
-    systemDataStore.weaponBaseTypes.map((baseType) => {
-      const mastery = weaponMasteryName(baseType.mastery);
-
-      return {
-        value: baseType.key,
-        name: mastery ? `${baseType.name} — ${mastery}` : baseType.name,
-      };
-    }),
-  );
-
   /** Категории оружия («простое», «воинское») — ими задают владение оптом. */
   const weaponCategoryOptions: FeatChoiceOption[] = [
     { value: 'simple', name: WEAPON_PROF_LABELS.simple },
@@ -166,10 +149,6 @@
 
     if (kind === 'weapon') {
       return [...weaponCategoryOptions, ...weaponOptions.value];
-    }
-
-    if (kind === 'weaponMastery') {
-      return weaponWithMasteryOptions.value;
     }
 
     // Черты приезжают из компендиума — их выбирают окном, а не селектом
@@ -223,8 +202,6 @@
     'tool',
     'language',
     'weapon',
-    'weaponMastery',
-    'masteryProperty',
     'armor',
   ]);
 
@@ -285,16 +262,6 @@
           ];
     }
 
-    if (kind === 'weaponMastery') {
-      return (
-        weaponMasteryName(
-          systemDataStore.weaponBaseTypes.find(
-            (baseType) => baseType.key === value,
-          )?.mastery,
-        ) ?? undefined
-      );
-    }
-
     if (kind === 'skill') {
       return isSkillType(value)
         ? ABILITY_LABELS[SKILL_ABILITY_MAP[value]]
@@ -311,7 +278,6 @@
   /** Подпись панели фильтра по основному виду строки; пусто — фильтра нет. */
   const FILTER_LABEL_BY_KIND: Partial<Record<GrantRowKind, string>> = {
     weapon: FEAT_GRANTS_LABELS.filterWeaponCategory,
-    weaponMastery: FEAT_GRANTS_LABELS.filterMastery,
     skill: FEAT_GRANTS_LABELS.filterAbility,
     tool: FEAT_GRANTS_LABELS.filterToolCategory,
   };
@@ -319,7 +285,6 @@
   /** Порядок значений фильтра по основному виду; пусто — по алфавиту. */
   const FILTER_ORDER_BY_KIND: Partial<Record<GrantRowKind, string[]>> = {
     weapon: [WEAPON_PROF_LABELS.simple, WEAPON_PROF_LABELS.martial],
-    weaponMastery: WEAPON_MASTERIES.map((mastery) => mastery.name.ru),
     skill: Object.values(ABILITY_LABELS),
     tool: Object.values(TOOL_CATEGORIES),
   };
@@ -811,17 +776,6 @@
             >
               {{ FEAT_GRANTS_LABELS.kindSingleHint }}
             </p>
-
-            <!-- Два приёмных вида путают чаще всего: один называет оружие,
-              другой сам приём -->
-            <p
-              v-if="
-                hasKind(row, 'weaponMastery') || hasKind(row, 'masteryProperty')
-              "
-              class="text-xs text-dimmed"
-            >
-              {{ FEAT_GRANTS_LABELS.kindMasteryHint }}
-            </p>
           </div>
 
           <!-- Категории черт: ими пул сужается ещё до перечня -->
@@ -992,7 +946,7 @@
               </UFormField>
             </div>
 
-            <!-- Рост по уровням: оружейных приёмов у воина три с 1 уровня,
+            <!-- Рост по уровням: заговоров у волшебника три с 1 уровня,
               четыре с 4, пять с 10. Ступень называет, сколько всего выбрано к
               этому уровню, а не сколько добавилось -->
             <ChoiceScalingRows

@@ -32,7 +32,6 @@ function holdingsOf(holdings) {
 const fighterSheet = {
   armor: ['leather', 'chain-mail', 'shield'],
   weapons: ['longsword', 'dagger'],
-  weaponMasteries: ['longsword'],
   tools: ['gaming-set'],
   languages: ['common'],
   savingThrows: ['strength', 'constitution'],
@@ -74,7 +73,6 @@ it('удаление последнего класса оставляет вла
   assert.deepEqual(result.armor, []);
   assert.deepEqual(result.savingThrows, []);
   assert.deepEqual(result.languages, ['common']);
-  assert.deepEqual(result.weaponMasteries, ['longsword']);
 });
 
 it('навык класса остаётся, если им владеет и другой источник', () => {

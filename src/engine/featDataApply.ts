@@ -49,13 +49,6 @@ export function applyFeatDataProficiencies(
   }
 
   pushUnique(proficiencies.weapons, featData?.weaponProficiencies ?? []);
-  pushUnique(proficiencies.weaponMasteries, featData?.weaponMasteries ?? []);
-
-  pushUnique(
-    (proficiencies.masteryProperties ??= []),
-    featData?.masteryProperties ?? [],
-  );
-
   pushUnique(proficiencies.armor, featData?.armorProficiencies ?? []);
   pushUnique(proficiencies.tools, featData?.toolProficiencies ?? []);
   pushUnique(proficiencies.languages, featData?.languages ?? []);
@@ -82,13 +75,6 @@ export function removeFeatDataProficiencies(
   }
 
   removeItems(proficiencies.weapons, featData?.weaponProficiencies ?? []);
-  removeItems(proficiencies.weaponMasteries, featData?.weaponMasteries ?? []);
-
-  removeItems(
-    proficiencies.masteryProperties ?? [],
-    featData?.masteryProperties ?? [],
-  );
-
   removeItems(proficiencies.armor, featData?.armorProficiencies ?? []);
   removeItems(proficiencies.tools, featData?.toolProficiencies ?? []);
   removeItems(proficiencies.languages, featData?.languages ?? []);

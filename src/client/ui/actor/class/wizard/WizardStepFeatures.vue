@@ -52,7 +52,7 @@
 
   const { isExpanded, toggle } = useExpandedRows();
 
-  /** Виды оружия мира — их просит пул выбора оружия и оружейного приёма */
+  /** Виды оружия мира — их просит пул выбора оружия */
   const { weaponOptions } = useFeatChoiceWeapons();
 
   const props = defineProps<{

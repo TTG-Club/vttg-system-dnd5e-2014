@@ -13,7 +13,6 @@
     formatDiceLetters,
     getWeaponDamageParts,
     sumWeaponModifierParts,
-    WEAPON_MASTERY_MAP,
     withLoadedAmmunition,
   } from '@vtt/shared/system/dnd.js';
 
@@ -23,7 +22,6 @@
     COPY_TO_ITEMS_LABEL,
     FORM_FIELD_LABELS,
     WEAPON_DETAIL_LABELS,
-    WEAPON_FORM_LABELS,
   } from './constants';
   import DamagePartsSummary from './DamagePartsSummary.vue';
   import ItemCostWeightRarity from './ItemCostWeightRarity.vue';
@@ -184,17 +182,6 @@
 
     return map;
   });
-
-  /** Детали оружейного приёма текущего оружия */
-  const masteryDetail = computed(() => {
-    const key = props.item?.mastery;
-
-    if (!key) {
-      return undefined;
-    }
-
-    return WEAPON_MASTERY_MAP.get(key);
-  });
 </script>
 
 <template>
@@ -331,33 +318,6 @@
                       ?? item.ammunitionType
                     }}
                   </p>
-                </div>
-
-                <!-- {{ WEAPON_FORM_LABELS.mastery }} -->
-                <div v-if="item.mastery && masteryDetail">
-                  <span class="block text-xs text-dimmed">{{
-                    WEAPON_FORM_LABELS.mastery
-                  }}</span>
-
-                  <UPopover
-                    mode="hover"
-                    :ui="{ content: 'max-w-xs p-3' }"
-                  >
-                    <UBadge
-                      color="warning"
-                      variant="subtle"
-                      size="sm"
-                      class="mt-1 cursor-help"
-                    >
-                      {{ masteryDetail.name.ru }} ({{ masteryDetail.name.en }})
-                    </UBadge>
-
-                    <template #content>
-                      <p class="text-xs leading-relaxed text-toned">
-                        {{ masteryDetail.description.ru }}
-                      </p>
-                    </template>
-                  </UPopover>
                 </div>
               </div>
             </div>
