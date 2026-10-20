@@ -32,6 +32,11 @@ jobs:
       - name: Проставить версию и ссылки в манифест
         run: node scripts/stamp-manifest.mjs "${{ github.ref_name }}" "${{ github.repository }}"
 
+      # Компендиум 2014 едет внутри системы: его забирают со старого сайта перед
+      # сборкой, и он попадает в архив как бандл-пак (data/srd).
+      - name: Скачать компендиум 2014 с сайта
+        run: npm run compendium
+
       - name: Собрать систему
         run: npm run build
 
@@ -41,6 +46,7 @@ jobs:
           test -f dist/client.js
           test -f dist/index.js
           test -d dist/data
+          test -f dist/data/srd/manifest.json
 
       # Архивируем СОДЕРЖИМОЕ dist (system.json в корне архива — этого ждёт
       # установщик VTTG).
