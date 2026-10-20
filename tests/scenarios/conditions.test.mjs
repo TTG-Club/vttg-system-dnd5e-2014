@@ -108,7 +108,7 @@ describe('каталог: состояния', () => {
     assert.equal(engine.resolveInitiativeRollMode(invisible), 'advantage');
   });
 
-  it('[CD05] Истощение 3: −6 к d20-тестам и −15 фт скорости', () => {
+  it('[CD05] Истощение 3 (PHB 2014): помехи на проверки, атаки и спасброски, скорость вдвое', () => {
     const hero = createActor();
     const baseline = engine.resolveActorStats(hero);
 
@@ -116,13 +116,51 @@ describe('каталог: состояния', () => {
 
     const stats = engine.resolveActorStats(hero);
 
-    assert.equal(stats.saves.wisdom - baseline.saves.wisdom, -6);
-    assert.equal(stats.attackBonuses.melee - baseline.attackBonuses.melee, -6);
-    assert.equal(stats.initiative - baseline.initiative, -6);
-    assert.equal(stats.movement.walk, baseline.movement.walk - 15);
+    // Числа не меняются: в 2014 истощение даёт помехи, а не штрафы
+    assert.equal(stats.saves.wisdom, baseline.saves.wisdom);
+    assert.equal(stats.attackBonuses.melee, baseline.attackBonuses.melee);
+    assert.equal(stats.initiative, baseline.initiative);
+    assert.equal(stats.hitPointsMax, baseline.hitPointsMax);
+
+    assert.equal(stats.movement.walk, Math.floor(baseline.movement.walk / 2));
+
+    assert.equal(
+      attackModes(stats.activeFlags, NO_FLAGS).melee,
+      'disadvantage',
+    );
+
+    assert.ok(stats.activeFlags.has('save.disadvantage'));
+
+    assert.equal(
+      engine.resolveAbilityCheckRollMode({
+        flags: stats.activeFlags,
+        ability: 'wisdom',
+        skill: 'perception',
+      }),
+      'disadvantage',
+    );
 
     hero.activeEffects = engine.withExhaustionLevel(hero.activeEffects, 0);
     assert.deepEqual(hero.activeEffects, []);
+  });
+
+  it('[CD05b] Истощение 4–5 (PHB 2014): максимум хитов вдвое, затем скорость 0', () => {
+    const hero = createActor();
+    const baseline = engine.resolveActorStats(hero);
+
+    hero.activeEffects = engine.withExhaustionLevel([], 4);
+
+    const fourth = engine.resolveActorStats(hero);
+
+    assert.equal(fourth.hitPointsMax, baseline.hitPointsMax / 2);
+    assert.equal(fourth.movement.walk, Math.floor(baseline.movement.walk / 2));
+
+    hero.activeEffects = engine.withExhaustionLevel(hero.activeEffects, 5);
+
+    const fifth = engine.resolveActorStats(hero);
+
+    assert.equal(fifth.movement.walk, 0);
+    assert.equal(fifth.hitPointsMax, baseline.hitPointsMax / 2);
   });
 
   it('[CD06] Окаменевший: сопротивление всему урону и иммунитет к Отравлению', () => {

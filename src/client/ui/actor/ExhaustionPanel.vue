@@ -1,5 +1,5 @@
 <!--
-  Блок Истощения листа (PHB 2024).
+  Блок Истощения листа (PHB 2014).
 
   Шкала из шести делений: нажатие ставит степень, повторное нажатие по текущей —
   снимает её (степень уходит на единицу ниже). Подсказка деления рассказывает,
@@ -17,11 +17,7 @@
     getExhaustionEffects,
   } from '@vtt/shared/system/dnd.js';
 
-  import {
-    EXHAUSTION_BLOCK_LABELS,
-    EXHAUSTION_RULES,
-    FEET_UNIT_LABEL,
-  } from './constants';
+  import { EXHAUSTION_BLOCK_LABELS, EXHAUSTION_RULES } from './constants';
   import { getSheetBlockClass } from './utils/sheetBlockClass';
 
   interface Props {
@@ -40,7 +36,7 @@
 
   /**
    * Описание степени: нулевая — истощения нет, смертельная — смерть, остальные
-   * — штраф к тестам к20 и снижение скорости.
+   * — набранные эффекты степеней по правилам 2014.
    *
    * @param level - степень истощения
    * @returns строка описания
@@ -56,10 +52,19 @@
       return EXHAUSTION_BLOCK_LABELS.death;
     }
 
-    return [
-      `−${effects.d20Penalty} ${EXHAUSTION_BLOCK_LABELS.d20Effect}`,
-      `${EXHAUSTION_BLOCK_LABELS.speedEffect} −${effects.speedPenalty} ${FEET_UNIT_LABEL}`,
-    ].join(', ');
+    // Скорость 0 перекрывает «вдвое»: показывать оба нет смысла
+    const parts = [
+      effects.checkDisadvantage && EXHAUSTION_BLOCK_LABELS.checkDisadvantage,
+      effects.halfSpeed
+        && !effects.zeroSpeed
+        && EXHAUSTION_BLOCK_LABELS.halfSpeed,
+      effects.attackSaveDisadvantage
+        && EXHAUSTION_BLOCK_LABELS.attackSaveDisadvantage,
+      effects.halfHitPoints && EXHAUSTION_BLOCK_LABELS.halfHitPoints,
+      effects.zeroSpeed && EXHAUSTION_BLOCK_LABELS.zeroSpeed,
+    ];
+
+    return parts.filter((part) => typeof part === 'string').join(', ');
   }
 
   const currentLevel = computed(() => getExhaustionEffects(props.level).level);

@@ -3670,13 +3670,16 @@ export function prepareDerivedData(
   }
 
   // 10. Скорость не бывает отрицательной: флаг `speed.zero` обнуляет её целиком,
-  // а штрафы (Истощение даёт −5 фт за степень) зажимаются нулём снизу
+  // `speed.half` делит итог пополам (Истощение 2 степени) с округлением вниз —
+  // уже после всех прибавок, а штрафы зажимаются нулём снизу
   const hasZeroSpeed = derivedStats.activeFlags.has('speed.zero');
+  const hasHalfSpeed = derivedStats.activeFlags.has('speed.half');
 
   for (const movementKey of MOVEMENT_KEYS) {
-    derivedStats.movement[movementKey] = hasZeroSpeed
-      ? 0
-      : Math.max(0, derivedStats.movement[movementKey]);
+    const speed = Math.max(0, derivedStats.movement[movementKey]);
+    const halvedSpeed = hasHalfSpeed ? Math.floor(speed / 2) : speed;
+
+    derivedStats.movement[movementKey] = hasZeroSpeed ? 0 : halvedSpeed;
   }
 
   // 11. Защиты от урона (статические + от флагов активных эффектов)
