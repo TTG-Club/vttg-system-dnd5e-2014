@@ -454,6 +454,7 @@ function classPreparedValue(
     ),
     () => classDef,
     'spells',
+    getActorAbilityModifiers(sheet),
   );
 }
 
@@ -2368,6 +2369,7 @@ export function useClassWizard(
         (entry) =>
           entry.classKey === classDef.key ? classDef : resolveOtherClass(entry),
         'spells',
+        getActorAbilityModifiers(pending),
       ),
       pending.system.preparedSpells,
       {

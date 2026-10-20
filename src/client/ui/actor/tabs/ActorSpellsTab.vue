@@ -290,6 +290,7 @@
         props.actor.system?.classes ?? [],
         classDefinitionOf,
         'spells',
+        spellcastingBonusContext.value.abilityMods,
       ),
       props.actor.system?.preparedSpells,
       spellcastingBonusContext.value,
