@@ -996,13 +996,13 @@ describe('каталог: классы и черты', () => {
 
     assert.equal(engine.resolveSaveEffectScale('none', false, defense), 1);
 
-    // Недееспособный Увёртливостью не пользуется
+    // В PHB 2014 недееспособный Увёртливостью пользуется
     assert.equal(
       engine.resolveSaveEffectScale('half', true, {
         ...defense,
         flags: new Set([...activeFlags, 'incapacitated']),
       }),
-      0.5,
+      0,
     );
 
     // Тот же исход у эффекта со своим спасбросоком «половина урона»
