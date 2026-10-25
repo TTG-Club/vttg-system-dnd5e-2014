@@ -1408,6 +1408,7 @@ export type EffectFlagKey =
   | 'save.autoFail.wisdom'
   | 'save.autoFail.charisma'
   | 'speed.zero'
+  | 'speed.half'
   | 'terrain.ignoreDifficult'
   | 'mark.bySource'
   | 'incapacitated'
@@ -1557,6 +1558,7 @@ const BASE_EFFECT_FLAG_LABELS: Record<
 
   // Прочее
   'speed.zero': 'Скорость равна нулю',
+  'speed.half': 'Скорость уменьшена вдвое',
   'terrain.ignoreDifficult':
     'Игнорирует труднопроходимую местность (клетки зон стоят как обычные)',
   'mark.bySource':
@@ -3170,10 +3172,8 @@ export const MAX_EFFECTS_PER_ACTOR = 50;
 /**
  * Максимальное количество changes на один эффект.
  *
- * Поднято с 20: Истощение (PHB 2024) накладывает −2 ко ВСЕМ d20-тестам, что в
- * нашей модели разворачивается в отдельные числовые changes для атак (3),
- * спасбросков (6), навыков (18) и видов скорости (5) — до 32 на эффект (см.
- * `buildExhaustionChanges`). 40 оставляет запас и для ручных эффектов.
+ * Поднято с 20 ради ручных эффектов, которые разворачивают одно правило в
+ * отдельные changes по всем навыкам, спасброскам и видам скорости.
  */
 export const MAX_CHANGES_PER_EFFECT = 40;
 
