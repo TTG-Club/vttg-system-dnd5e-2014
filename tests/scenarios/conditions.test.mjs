@@ -105,7 +105,12 @@ describe('каталог: состояния', () => {
 
     assert.equal(attackModes(invisible, blinded).melee, 'advantage');
     assert.equal(attackModes(blinded, invisible).melee, 'disadvantage');
-    assert.equal(engine.resolveInitiativeRollMode(invisible), 'advantage');
+
+    assert.equal(
+      engine.resolveInitiativeRollMode(invisible),
+      'normal',
+      'преимущество на инициативу невидимому дал только 2024',
+    );
   });
 
   it('[CD05] Истощение 3 (PHB 2014): помехи на проверки, атаки и спасброски, скорость вдвое', () => {
@@ -206,13 +211,25 @@ describe('каталог: состояния', () => {
     assert.equal(hero.activeEffects.length, 2);
   });
 
-  it('[CD09] Недееспособный: флаг и помеха на инициативу', () => {
+  it('[CD09] Недееспособный: флаг без помехи на инициативу', () => {
     const flags = statsWithConditions(createActor(), [
       'incapacitated',
     ]).activeFlags;
 
     assert.ok(flags.has('incapacitated'));
-    assert.equal(engine.resolveInitiativeRollMode(flags), 'disadvantage');
+
+    assert.equal(
+      engine.resolveInitiativeRollMode(flags),
+      'normal',
+      'помеху на инициативу недееспособному дал только 2024',
+    );
+  });
+
+  it('[CD13] Ошеломлённый: недееспособен и не может перемещаться', () => {
+    const stats = statsWithConditions(createActor(), ['stunned']);
+
+    assert.ok(stats.activeFlags.has('incapacitated'));
+    assert.equal(engine.resolveTotalMovementSpeed(stats), 0);
   });
 
   it('[CD10] Преимущество и помеха гасят друг друга: отравленный атакует лежащего рукопашной', () => {

@@ -879,7 +879,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     icon: 'tabler:hand-stop',
     customImage: '/assets/status/grappled.svg',
     description:
-      'Скорость равна 0. Помеха на броски атаки по любой цели, кроме схватившего. Схвативший может тащить существо за собой.',
+      'Скорость равна 0 и не может увеличиться. Состояние оканчивается, если схвативший недееспособен или существо уносит из его досягаемости.',
   },
   {
     key: 'incapacitated',
@@ -887,7 +887,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     nameEn: 'Incapacitated',
     icon: 'tabler:ban',
     description:
-      'Нет действий, бонусных действий и реакций. Нет концентрации. Нельзя говорить. Помеха на инициативу.',
+      'Нельзя совершать действия и реакции. Концентрация прерывается.',
   },
   {
     key: 'invisible',
@@ -895,7 +895,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     nameEn: 'Invisible',
     icon: 'tabler:eye-closed',
     description:
-      'Преимущество на инициативу. Атаки против вас с помехой, ваши — с преимуществом. Не подвержены эффектам, требующим видимость цели.',
+      'Вас невозможно увидеть без магии или особого чувства; для скрытности вы в сильно заслонённой местности. Атаки против вас с помехой, ваши — с преимуществом.',
   },
   {
     key: 'paralyzed',
@@ -948,7 +948,7 @@ export const CONDITIONS: readonly ConditionEntry[] = [
     icon: 'tabler:bolt',
     customImage: '/assets/status/stunned.svg',
     description:
-      'Недееспособен. Автопровал спасбросков СИЛ и ЛОВ. Атаки по вам с преимуществом.',
+      'Недееспособен, не может перемещаться, говорит запинаясь. Автопровал спасбросков СИЛ и ЛОВ. Атаки по вам с преимуществом.',
   },
   {
     key: 'unconscious',
