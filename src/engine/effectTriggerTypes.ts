@@ -965,7 +965,7 @@ export interface EffectTriggerDispelAction {
   on?: EffectTriggerActionGate;
 }
 
-/** Дать получателю героическое вдохновение */
+/** Дать получателю вдохновение */
 export interface EffectTriggerGrantInspirationAction {
   type: 'grantInspiration';
   on?: EffectTriggerActionGate;

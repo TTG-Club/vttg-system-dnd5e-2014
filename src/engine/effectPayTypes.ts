@@ -36,7 +36,7 @@ export const EFFECT_PRICE_KINDS = [
 
 /**
  * Вид цены: счётчик листа, кости хитов, ячейка заклинания, заряды предмета или
- * героическое вдохновение.
+ * вдохновение.
  */
 export type EffectPriceKind = (typeof EFFECT_PRICE_KINDS)[number];
 
@@ -282,7 +282,7 @@ export const EFFECT_PRICE_LABELS = {
   slotUpTo: ' до ',
   hitDiceForms: ['кость хитов', 'кости хитов', 'костей хитов'],
   itemUsesForms: ['заряд', 'заряда', 'зарядов'],
-  inspiration: 'героическое вдохновение',
+  inspiration: 'вдохновение',
   payJoiner: ' и ',
   paidJoiner: '; ',
   payTitle: 'цена: ',

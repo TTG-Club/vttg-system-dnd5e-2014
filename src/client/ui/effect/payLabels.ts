@@ -39,7 +39,7 @@ export const EFFECT_PRICE_KIND_LABELS: Record<EffectPriceKind, string> = {
   hitDice: 'Кости хитов',
   spellSlot: 'Ячейка заклинания',
   itemUses: 'Заряды предмета',
-  inspiration: 'Героическое вдохновение',
+  inspiration: 'Вдохновение',
 } as const;
 
 /** Виды цены — вариантами выбора в окне эффекта */
@@ -81,7 +81,7 @@ export const EFFECT_PAY_FIELD_LABELS = {
   pact: 'Только ячейка договора',
   itemUsesHint:
     'Заряды предмета, с которого пришёл эффект. Заменяет обычный расход применения: 0 — свойство зарядов не тратит.',
-  inspirationHint: 'Тратит героическое вдохновение.',
+  inspirationHint: 'Тратит вдохновение.',
 } as const;
 
 /** Пояснение к виду цены без своих полей: что и откуда спишется */
