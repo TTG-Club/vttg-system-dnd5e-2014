@@ -4,7 +4,7 @@ import type { GrantRemovalGroup } from './grantRemovalPlan';
 /** Заголовок окна удаления — свой у класса, вида и предыстории */
 export const GRANT_REMOVAL_TITLES: Record<MissingSheetSectionKey, string> = {
   class: 'Что убрать вместе с классом',
-  species: 'Что убрать вместе с видом',
+  species: 'Что убрать вместе с расой',
   background: 'Что убрать вместе с предысторией',
 };
 

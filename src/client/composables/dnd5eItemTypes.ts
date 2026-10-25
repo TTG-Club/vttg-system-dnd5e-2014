@@ -56,7 +56,7 @@ const ITEM_TYPE_CONFIG: Record<string, ItemTypeConfig> = {
     modalPrefix: 'Background',
     label: 'Предыстории',
   },
-  species: { icon: 'tabler:user', modalPrefix: 'Species', label: 'Виды' },
+  species: { icon: 'tabler:user', modalPrefix: 'Species', label: 'Расы' },
   class: {
     icon: 'tabler:users-group',
     modalPrefix: 'Class',
